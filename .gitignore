@@ -1,0 +1,13 @@
+# Organizer-distributed materials (not for redistribution)
+docs/
+reference/
+
+# Temporary / large files
+archive/
+logs/
+*.bin
+*.svg
+
+# Python
+__pycache__/
+*.pyc
