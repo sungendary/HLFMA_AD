@@ -72,6 +72,9 @@ class Recorder:
         self.count += 1
         if self.count % 50 == 0:
             self._fh.flush()
+    def close(self) -> None:
+        self._fh.flush()
+        self._fh.close()
 
 
 def main() -> None:

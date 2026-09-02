@@ -19,6 +19,7 @@ import math
 import socket
 import struct
 import time
+from collections import deque
 from dataclasses import dataclass, field
 
 EGO = struct.Struct('<6f')          # 24 B
@@ -171,35 +172,57 @@ class Client:
 class SpeedEstimator:
     """egoSpeed가 전송되지 않으므로 위치 차분으로 추정한다.
 
-    20Hz에서 30km/h면 프레임당 약 0.42m 이동. 노이즈가 있어 저역통과를 건다.
-    리스폰으로 위치가 순간이동하면 속도 추정을 초기화한다.
+    한 프레임 차분을 저역통과로 거르면 프레임당 이동거리가 작아서(20Hz에서
+    10km/h면 0.14m) 수신 시각 지터와 위치 양자화가 그대로 속도로 증폭된다.
+    그래서 최근 window 프레임의 누적 이동거리를 그 구간의 실제 경과시간으로
+    나눈다. 지터는 구간이 길어진 만큼 상대적으로 작아지고, 한 프레임의 튐도
+    window 개로 나뉜다.
+
+    경과시간은 수신 시각을 그대로 쓰지 않는다. VTD는 20.0Hz 고정 스텝으로
+    보내는데 수신 시각에는 OS 스케줄링 지터가 섞이고(실측 루프 주기 평균
+    51.5ms / 최대 65.5ms), 이 지터가 속도에 그대로 비례 증폭된다. 창 안의
+    구간 수는 정확히 아니까 측정 경과시간이 공칭값 근처면 공칭값으로 대체하고,
+    루프가 크게 밀렸을 때만 측정값으로 되돌아간다.
+
+    리스폰으로 위치가 순간이동하면 창을 비우고 0에서 다시 쌓는다.
     """
 
-    def __init__(self, alpha: float = 0.3):
-        self.alpha = alpha
+    def __init__(self, window: int = 5, frame_dt: float = 0.05):
+        self.window = max(2, window)
+        self.frame_dt = frame_dt
         self.speed = 0.0
-        self._prev = None
-        self._prev_t = None
+        # (x, y, t). 구간이 window 개가 되도록 점은 window+1 개까지 담는다
+        self._hist: deque[tuple[float, float, float]] = deque(maxlen=self.window + 1)
+
+    def reset(self) -> None:
+        self.speed = 0.0
+        self._hist.clear()
 
     def update(self, x: float, y: float, now: float | None = None) -> float:
         now = now if now is not None else time.monotonic()
-        if self._prev is None:
-            self._prev, self._prev_t = (x, y), now
+
+        if self._hist:
+            px, py, _ = self._hist[-1]
+            if math.hypot(x - px, y - py) > RESPAWN_JUMP_M:   # 리스폰
+                self.reset()
+
+        self._hist.append((x, y, now))
+        if len(self._hist) < 2:
             return 0.0
 
-        dt = now - self._prev_t
+        dt = self._hist[-1][2] - self._hist[0][2]
+        # 창 안의 구간 수는 정확히 알고 있고(TCP라 프레임이 유실되지 않는다)
+        # VTD는 20.0Hz 고정 스텝으로 보낸다. 그러니 측정 경과시간이 공칭값
+        # 근처면 공칭값을 쓰고, 루프가 크게 밀렸을 때만 측정값으로 되돌아간다.
+        nominal = (len(self._hist) - 1) * self.frame_dt
+        if abs(dt - nominal) < 0.4 * self.frame_dt:
+            dt = nominal
         if dt <= 1e-4:
             return self.speed
 
-        d = math.hypot(x - self._prev[0], y - self._prev[1])
-        self._prev, self._prev_t = (x, y), now
-
-        if d > RESPAWN_JUMP_M:            # 리스폰 — 추정 초기화
-            self.speed = 0.0
-            return 0.0
-
-        raw = d / dt
-        self.speed += self.alpha * (raw - self.speed)
+        dist = sum(math.hypot(b[0] - a[0], b[1] - a[1])
+                   for a, b in zip(self._hist, list(self._hist)[1:]))
+        self.speed = dist / dt
         return self.speed
 
     @property
