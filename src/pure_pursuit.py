@@ -30,6 +30,7 @@ from hlvtd_client import (
     Client, SpeedEstimator, detect_respawn,
     TURN_OFF, STEER_LIMIT, ACCEL_MAX, ACCEL_MIN,
 )
+from session_log import SessionLog, default_dir
 
 WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 값
 LD_MIN, LD_MAX = 4.0, 10.0  # m, lookahead 범위
@@ -189,35 +190,6 @@ def steering_for(ego_x: float, ego_y: float, heading: float,
     return max(-STEER_LIMIT, min(STEER_LIMIT, delta)), alpha
 
 
-class FrameLog:
-    """수신 프레임과 송신 명령을 CSV로 남긴다 (사후 분석용)."""
-
-    def __init__(self, path: str | None):
-        self._fh = None
-        if not path:
-            return
-        os.makedirs(os.path.dirname(path) or '.', exist_ok=True)
-        self._fh = open(path, 'w', newline='', encoding='utf-8')
-        self._w = csv.writer(self._fh)
-        self._w.writerow(['t', 'ego_x', 'ego_y', 'heading', 'speed',
-                          'seg', 'idx', 'tgt_x', 'tgt_y', 'ld', 'steer',
-                          'accel', 'tl_id', 'tl_state'])
-        self._n = 0
-
-    def add(self, *row) -> None:
-        if self._fh is None:
-            return
-        self._w.writerow([f'{v:.4f}' if isinstance(v, float) else v for v in row])
-        self._n += 1
-        if self._n % 20 == 0:
-            self._fh.flush()
-
-    def close(self) -> None:
-        if self._fh:
-            self._fh.close()
-            self._fh = None
-
-
 def run(args) -> None:
     path, bounds = load_path(args.waypoints, args.segments)
     end_heading = path.end_heading()
@@ -240,12 +212,26 @@ def run(args) -> None:
             print(f'[pp]      이음매 {bounds[k - 1][0]} → {name}: {gap:.2f}m{warn}')
 
     target_speed = args.speed / 3.6                 # km/h -> m/s
-    client = Client(args.host, args.port)
+
+    # 세션 로그를 먼저 연다. 원본 프레임을 파싱 전에 받아야 하므로
+    # raw_sink를 Client에 물려서 연결한다.
+    log = SessionLog(args.session, mode='pp', meta={
+        'host': args.host, 'port': args.port,
+        'waypoints': args.waypoints, 'segments': args.segments,
+        'speed_kmh': args.speed, 'wheelbase': args.wheelbase,
+        'route': args.route or '',
+        'path_points': len(path.pts),
+        'path_length_m': round(path.length, 2),
+    })
+    log.copy_input(args.waypoints, 'waypoints.csv')
+    log.copy_input(args.route, 'route.csv')   # 현장에서 받은 원본은 반드시 보존
+
+    client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[pp] {args.host}:{args.port} 연결 시도...')
     client.connect()
     print('[pp] 연결됨. Ctrl+C로 종료\n')
+    log.event('connect', f'{args.host}:{args.port}')
 
-    log = FrameLog(args.log)
     speed_est = SpeedEstimator()
     prev_frame = None
     idx: int | None = None                          # None = 재탐색 필요
@@ -259,17 +245,21 @@ def run(args) -> None:
             frame = client.recv_frame()
             if frame is None:
                 print('\n[pp] 연결 끊김. 재연결...')
+                log.event('disconnect', '수신 실패')
                 client.connect()
+                log.event('connect', '재연결')
                 prev_frame, idx = None, None
                 speed_est = SpeedEstimator()
                 continue
 
             n += 1
+            t = time.monotonic() - t0
             try:
                 v = speed_est.update(frame.ego_x, frame.ego_y)
 
                 if detect_respawn(frame, prev_frame):
                     print('\n[pp] *** 리스폰 감지 — 경로 인덱스 재탐색 ***')
+                    log.respawn(frame, prev_frame, v, t=t)
                     idx = None
                     finished = False
                 prev_frame = frame
@@ -325,6 +315,8 @@ def run(args) -> None:
                 last_cmd = (steer, accel)
             except Exception as exc:                # 계산 실패해도 루프는 유지
                 print(f'\n[pp] 계산 오류: {exc!r} — 마지막 명령 유지')
+                log.event('error', repr(exc), t=t,
+                          ego_x=frame.ego_x, ego_y=frame.ego_y)
                 steer, accel = last_cmd
                 tx = ty = float('nan')
                 v, v_cmd, ld = speed_est.speed, 0.0, LD_MIN
@@ -332,14 +324,16 @@ def run(args) -> None:
 
             if not client.send_control(steer, accel, TURN_OFF):
                 print('\n[pp] 송신 실패. 재연결...')
+                log.event('disconnect', '송신 실패', t=t,
+                          ego_x=frame.ego_x, ego_y=frame.ego_y, speed=v)
                 client.connect()
+                log.event('connect', '재연결')
                 prev_frame, idx = None, None
                 continue
 
             seg = seg_at(idx)
-            log.add(time.monotonic() - t0, frame.ego_x, frame.ego_y,
-                    frame.ego_heading, v, seg, idx, tx, ty, ld, steer, accel,
-                    frame.tl_id, frame.tl_state)
+            log.add_frame(frame, v, t=t, seg=seg, idx=idx,
+                          tgt_x=tx, tgt_y=ty, ld=ld, steer=steer, accel=accel)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -352,21 +346,22 @@ def run(args) -> None:
 
             if finished:
                 print('\n[pp] 경로 끝 도달 — 정지 완료')
+                log.event('finish', f'{path.length:.1f}m 주행 {n}프레임', t=t,
+                          ego_x=frame.ego_x, ego_y=frame.ego_y, speed=v)
                 break
     except KeyboardInterrupt:
         print('\n[pp] 사용자 종료')
+        log.event('note', '사용자 종료(Ctrl+C)')
     finally:
         client.close()                              # close()가 감속 명령을 보낸다
         log.close()
-        if args.log:
-            print(f'[pp] 로그 저장: {args.log}')
+        if args.session:
+            print(f'[pp] 세션 로그: {args.session}')
 
 
 def main() -> None:
     here = os.path.dirname(os.path.abspath(__file__))
     default_csv = os.path.join(here, '..', 'data', 'waypoints_v2.csv')
-    default_log = os.path.join(here, '..', 'logs',
-                               time.strftime('pp_%Y%m%d_%H%M%S.csv'))
 
     ap = argparse.ArgumentParser(description='Pure Pursuit 경로 추종')
     ap.add_argument('--host', default='127.0.0.1')
@@ -378,8 +373,12 @@ def main() -> None:
     ap.add_argument('--waypoints', default=os.path.normpath(default_csv))
     ap.add_argument('--speed', type=float, default=10.0, help='목표속도 [km/h]')
     ap.add_argument('--wheelbase', type=float, default=WHEELBASE, help='축거 [m]')
-    ap.add_argument('--log', default=os.path.normpath(default_log),
-                    help='프레임 로그 CSV 경로 (빈 문자열이면 기록 안 함)')
+    ap.add_argument('--route', help='현장에서 받은 route CSV. 세션에 원본을 복사해 둔다')
+    # --log 는 옛 이름. 이제 파일이 아니라 세션 디렉터리를 가리킨다.
+    # --log '' 로 끄던 습관은 그대로 통한다.
+    ap.add_argument('--session', '--log', dest='session',
+                    default=default_dir('pp'),
+                    help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')
 
     args = ap.parse_args()
     args.segments = [s.strip() for s in args.segments.split(',') if s.strip()]

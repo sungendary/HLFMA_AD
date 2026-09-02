@@ -20,6 +20,7 @@ import socket
 import struct
 import time
 from collections import deque
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 EGO = struct.Struct('<6f')          # 24 B
@@ -113,11 +114,17 @@ def pack_control(steering: float, accel: float, turn_signal: int = TURN_OFF) -> 
 
 
 class Client:
-    """9910 연결. 프레임 단위 수신과 제어 송신을 담당한다."""
+    """9910 연결. 프레임 단위 수신과 제어 송신을 담당한다.
 
-    def __init__(self, host: str = '127.0.0.1', port: int = 9910):
+    raw_sink를 주면 한 프레임의 원본 바이트를 파싱하기 전에 넘긴다.
+    파싱 실패한 프레임도 남으므로 사후 분석에서 무엇이든 복원할 수 있다.
+    """
+
+    def __init__(self, host: str = '127.0.0.1', port: int = 9910,
+                 raw_sink: Callable[[bytes], None] | None = None):
         self.host = host
         self.port = port
+        self.raw_sink = raw_sink
         self.sock: socket.socket | None = None
         self._buf = bytearray()
 
@@ -149,6 +156,8 @@ class Client:
 
         raw = bytes(self._buf[:FRAME_SIZE])
         del self._buf[:FRAME_SIZE]
+        if self.raw_sink is not None:
+            self.raw_sink(raw)          # 파싱 전에 남긴다
         return parse_frame(raw)
 
     def send_control(self, steering: float, accel: float,

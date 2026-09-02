@@ -1,6 +1,9 @@
 # Organizer-distributed materials (not for redistribution)
 docs/
 reference/
+# data/ 자체는 추적한다 (waypoint CSV는 재수집이 어렵다).
+# xodr만 8.2MB 배포물이라 제외한다.
+data/*.xodr
 
 # Temporary / large files
 archive/

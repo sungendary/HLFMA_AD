@@ -30,6 +30,7 @@ from hlvtd_client import (
     Client, SpeedEstimator, detect_respawn,
     TURN_OFF, TURN_LEFT, TURN_RIGHT, STEER_LIMIT, ACCEL_MAX, ACCEL_MIN,
 )
+from session_log import SessionLog, default_dir
 
 STEER_RATE = 0.45           # rad/s, 키를 누르고 있을 때 조향 증가율
 STEER_RETURN = 0.8          # rad/s, 키를 뗐을 때 복원율
@@ -84,18 +85,34 @@ def main() -> None:
     ap.add_argument('--segment', default='seg01', help='이번에 녹화할 구간 이름')
     ap.add_argument('--out', default='waypoints.csv')
     ap.add_argument('--rate', type=float, default=20.0)
+    ap.add_argument('--session', '--log', dest='session',
+                    default=default_dir('drive'),
+                    help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')
     args = ap.parse_args()
 
-    client = Client(args.host, args.port)
+    # 수동 주행도 통째로 남긴다. 현장 탐색 주행이 오히려 정보가 많다.
+    log = SessionLog(args.session, mode='drive', meta={
+        'host': args.host, 'port': args.port,
+        'segment': args.segment, 'out': args.out, 'rate': args.rate,
+    })
+
+    client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[drive] {args.host}:{args.port} 연결 시도...')
     client.connect()
     print('[drive] 연결됨')
+    log.event('connect', f'{args.host}:{args.port}')
 
     recorder = Recorder(args.out, args.segment)
     speed = SpeedEstimator()
 
     state = {'frame': None, 'respawn': 0, 'alive': True}
     lock = threading.Lock()
+
+    pressed: set[str] = set()
+    # accel도 담는다. 수신 스레드가 "그때 무엇을 명령했는지"를 함께 기록한다.
+    ctrl = {'steer': 0.0, 'accel': 0.0, 'signal': TURN_OFF,
+            'last_tick': time.monotonic()}
+    interval_ms = max(16, int(1000.0 / args.rate))
 
     def receiver() -> None:
         prev = None
@@ -104,24 +121,26 @@ def main() -> None:
             if frame is None:
                 if state['alive']:
                     print('[drive] 연결 끊김. 재연결...')
+                    log.event('disconnect', '수신 실패')
                     try:
                         client.connect()
                     except OSError:
                         break
+                    log.event('connect', '재연결')
                     prev = None
                 continue
-            speed.update(frame.ego_x, frame.ego_y)
+            v = speed.update(frame.ego_x, frame.ego_y)
             with lock:
                 if detect_respawn(frame, prev):
                     state['respawn'] += 1
+                    log.respawn(frame, prev, v)
                 state['frame'] = frame
+            # idx 자리에 녹화된 점 수를 넣어 로그만 봐도 녹화 진척이 보이게 한다
+            log.add_frame(frame, v, seg=args.segment, idx=recorder.count,
+                          steer=ctrl['steer'], accel=ctrl['accel'])
             prev = frame
 
     threading.Thread(target=receiver, daemon=True).start()
-
-    pressed: set[str] = set()
-    ctrl = {'steer': 0.0, 'signal': TURN_OFF, 'last_tick': time.monotonic()}
-    interval_ms = max(16, int(1000.0 / args.rate))
 
     root = tk.Tk()
     root.title('HLVTD Drive & Record')
@@ -141,8 +160,12 @@ def main() -> None:
         state['alive'] = False
         client.close()
         recorder.close()
+        log.event('finish', f'{args.segment} {recorder.count}점 녹화')
+        log.close()
         print(f'[drive] 저장 완료: {args.out}  '
               f'구간={args.segment}  점={recorder.count}개')
+        if args.session:
+            print(f'[drive] 세션 로그: {args.session}')
         root.destroy()
 
     def on_press(event) -> None:
@@ -154,6 +177,8 @@ def main() -> None:
             return
         if key == 'r' and 'r' not in pressed:
             recorder.enabled = not recorder.enabled
+            log.event('note', f'녹화 {"시작" if recorder.enabled else "중지"} '
+                              f'({args.segment}, {recorder.count}점)')
         elif key == 'q' and 'q' not in pressed:
             ctrl['signal'] = TURN_OFF if ctrl['signal'] == TURN_LEFT else TURN_LEFT
         elif key == 'e' and 'e' not in pressed:
@@ -190,6 +215,7 @@ def main() -> None:
         elif steer < 0:
             steer = min(0.0, steer + STEER_RETURN * dt)
         ctrl['steer'] = max(-STEER_LIMIT, min(STEER_LIMIT, steer))
+        ctrl['accel'] = accel
 
         if not client.send_control(ctrl['steer'], accel, ctrl['signal']):
             print('[drive] 송신 실패')
