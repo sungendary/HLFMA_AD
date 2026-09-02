@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import importlib
 import math
 import os
 import socket
@@ -57,11 +58,15 @@ def check_env(rep: Report, here: str) -> None:
     else:
         rep.bad(f'Python {v.major}.{v.minor} — 3.10 이상이 필요하다 '
                 f'(union 타입 문법). conda activate hlfma 를 했나?')
-    try:
-        import numpy
-        rep.ok(f'numpy {numpy.__version__}')
-    except ImportError:
-        rep.warn_('numpy 없음 — 현재 제어 경로는 표준 라이브러리만 쓰므로 주행은 된다')
+    # numpy는 확인하지 않는다. 이 PC에서는 앱 제어 정책에 차단돼 있고
+    # (import는 통과해도 numpy.linalg에서 DLL 로드 실패), 우리 코드는
+    # 표준 라이브러리만 쓴다. 대신 우리 모듈이 실제로 import되는지를 본다.
+    for mod in ('hlvtd_client', 'session_log', 'pure_pursuit'):
+        try:
+            importlib.import_module(mod)
+            rep.ok(f'{mod}.py import')
+        except Exception as exc:
+            rep.bad(f'{mod}.py import 실패: {exc!r}')
 
     root = os.path.normpath(os.path.join(here, '..'))
     for name in ('data/waypoints_v2.csv',):

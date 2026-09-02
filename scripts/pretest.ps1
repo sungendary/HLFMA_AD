@@ -17,12 +17,12 @@ $root = Split-Path -Parent $PSScriptRoot
 Set-Location $root
 
 Write-Host ''
-Write-Host '=== HLFMA 현장 셋업 ===' -ForegroundColor Cyan
-Write-Host ("작업 디렉터리: {0}" -f $root)
+Write-Host "=== HLFMA pretest ===" -ForegroundColor Cyan
+Write-Host ("Working Dir: {0}" -f $root)
 
 # --- conda 환경 -------------------------------------------------------
 if ($env:CONDA_DEFAULT_ENV -eq $EnvName) {
-    Write-Host ("conda 환경: {0} (이미 활성)" -f $EnvName) -ForegroundColor Green
+    Write-Host ("conda env: {0}" -f $EnvName) -ForegroundColor Green
 }
 else {
     $conda = (Get-Command conda -ErrorAction SilentlyContinue)
@@ -42,7 +42,7 @@ else {
 
 # --- 네트워크 요약 (실패해도 진행한다. 판정은 preflight가 한다) -------
 Write-Host ''
-Write-Host '--- 이 PC의 IPv4 주소 ---'
+Write-Host "--- Local IPv4 ---"
 Get-NetIPAddress -AddressFamily IPv4 |
     Where-Object { $_.IPAddress -notlike '127.*' } |
     Select-Object InterfaceAlias, IPAddress |

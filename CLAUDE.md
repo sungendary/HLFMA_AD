@@ -5,7 +5,7 @@ VTD 시뮬레이터와 TCP/UDP/RTSP로 통신하며 지정 경로를 자율주�
 
 - 대회일: 2026년 9월 12일
 - 사전테스트: 2026년 9월 3~4일
-- 제어기 PC: Windows / PowerShell / miniconda `hlfma` (Python 3.11, numpy 2.4.6)
+- 제어기 PC: Windows / PowerShell / miniconda `hlfma` (Python 3.11, **표준 라이브러리만**)
 - VTD PC: Ubuntu 24.04
 
 ## 네트워크
@@ -251,8 +251,13 @@ seq,x,y
 - `00_HL_VTD`는 Ego의 외부 제어를 전제하므로 **Path Shape 자율주행이 동작하지 않는다.**
   제어기 미연결 시 accel=0, steering=0이 적용되어 차가 움직이지 않음.
   자동 녹화 시도는 이 때문에 무산됐다
-- **matplotlib은 Windows 앱 제어 정책에 차단됨** -> 시각화는 SVG 직접 생성
-  (`plot_waypoints_svg.py`). numpy는 정상 동작
+- **matplotlib과 numpy 둘 다 Windows 앱 제어 정책에 차단됨.**
+  numpy는 `import numpy`는 통과해도 `numpy.linalg`에서 **DLL 로드가 실패**한다.
+  얕은 import 테스트로는 안 걸러지니 믿지 말 것
+  -> **표준 라이브러리만 쓴다. 예외 없음.** 시각화는 SVG 직접 생성
+  (`plot_waypoints_svg.py`)
+  -> xodr 파서의 clothoid(spiral 1246개)도 Fresnel 적분을 직접 구현해야 한다.
+  선형대수가 필요하면 2x2/3x3은 손으로 푼다
 
 ## 실행 환경 주의
 
@@ -262,7 +267,9 @@ seq,x,y
 
 ## 작업 방침
 
-- 표준 라이브러리 우선. 의존성은 최소로 유지한다 (대회 당일 PC에서 확실히 돌아야 함)
+- **표준 라이브러리만 쓴다.** 선호가 아니라 제약이다 — 이 PC에서 numpy와
+  matplotlib이 앱 제어 정책에 차단된다 (위 '개발 환경' 참고).
+  써도 되는 서드파티는 없다고 보면 된다
 - 제어 루프는 20Hz를 지킨다. 블로킹 연산을 루프 안에 넣지 않는다
 - 예외로 루프가 죽으면 안 된다. 수신·연산 실패 시에도 마지막 유효 명령이나 안전 감속을 계속 송신
 - 모든 수신 프레임을 `logs/`에 기록해 사후 분석이 가능하게 한다
