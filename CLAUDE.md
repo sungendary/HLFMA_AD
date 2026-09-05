@@ -10,14 +10,15 @@ VTD 시뮬레이터와 TCP/UDP/RTSP로 통신하며 지정 경로를 자율주�
 
 ## 현재 상태 요약
 
-경로 추종은 완성됐고 실전에서 검증됐다. **남은 것은 규칙 대응 전부와 도로망 자동 생성이다.**
+경로 추종은 완성됐고 실전에서 검증됐다. route CSV -> 주행 waypoint 자동 생성도 끝났다.
+**남은 것은 규칙 대응 전부와 4단계(정지선·보호구역·신호등 좌표)다.**
 
 | 영역 | 상태 |
 |---|---|
 | 통신·파싱·로깅 | 완료. 현장 VTD에서도 재현 확인 |
 | 경로 추종 (Pure Pursuit) | 완료. 40km/h 825m 완주, 리스폰 0 |
 | 구간 연결 | 완료. 9구간 이어붙이기 검증 |
-| 도로망 (xodr 파서) | **1~2단계 완료.** 주행차로 중심선 2,471개 생성·검증. junction 남음 |
+| 도로망 (xodr 파서) | **1~3단계 완료.** 차로 연결 그래프 + 경로 탐색까지. 정지선·신호등 남음 |
 | 규칙 대응 15개 | **미착수.** 점수는 여기서 갈린다 |
 
 ## 네트워크
@@ -173,6 +174,70 @@ geometry: line 1527 / arc 656 / spiral 1246 / poly3 571
 
 spiral은 Fresnel 적분 없이 **0.1m 간격 수치적분으로 충분하다** (`math`만 사용).
 
+## xodr 3단계 — 차로 연결 그래프 (완료)
+
+`src/xodr_graph.py`. route CSV(`seq,x,y`)를 받아 `pure_pursuit`이 그대로 먹는
+주행 waypoint를 만든다. 노드는 `(road_id, section, lane_id)`, 엣지는 4종
+(section / road-road / junction / 차선변경) 총 4,447개.
+
+```
+python xodr_graph.py --route ../data/route_X.csv --out ../data/route_path.csv
+python xodr_graph.py --validate --dump-graph      # 진단 + 그래프 저장
+python xodr_graph.py --load-graph --route ...     # xodr 재파싱 생략 (1.3s -> 0.03s)
+```
+
+전수 조사로 확정한 사실 (그래프 정확성의 근거)
+
+- **junction 진입은 `<connection><laneLink>`가 유일한 정보원이다.** 진입도로의
+  junction 방향 lane `<link>`는 1073건 전부 비어 있다. 한 차로가 최대 3개
+  connecting road로 갈라지므로(1개:948 2개:121 3개:4) lane link로는 표현이 안 된다.
+  **탈출은** 반대로 connecting road 자신의 road link + lane link로 완전히 기술된다
+- connecting road 499개는 `<connection>`에 정확히 1회씩 등장하고
+  **contactPoint가 499개 전부 `"start"`** — 항상 s=0에서 진입해 +s로 달린다
+- 차로 부호 ↔ contactPoint 규칙(start→음수, end→양수) **671건 전수 일치, 위반 0**
+- **`xodr_lanes.csv`의 heading은 reference line 접선이다.** 양수 차로의 실제 주행
+  헤딩은 `heading + π`. 이 보정이 없으면 역주행 차로를 정주행으로 고른다
+- **차선변경 엣지는 필수다.** 없으면 route_example은 탐색 자체가 실패하고
+  route_pretest_2는 737m 경로가 3,812m 우회로 나온다
+- 차선변경 비용에 구간 길이를 더하면 안 된다. 옆 차로로 옮겨도 세로 길이는 한 번만
+  달리므로, 더하면 같은 구간을 두 번 세서 경로가 +32% 부풀었다
+- 차선변경은 **한 점에서 3.2m 튀면 안 된다** (lookahead 7m 기준 조향 0.31 rad,
+  한계 0.35에 붙는다). 20m에 걸쳐 두 차로 중심선을 smoothstep으로 섞는다
+- 2단계 산출물의 **끝점 9개가 이상치**다 (road 429 / 2396, laneSection 끝에서
+  헤딩이 88~107도 꺾인다). 3단계 로드 시 걸러낸다. 2단계는 건드리지 않는다
+
+설계 결정
+
+- 경유지 스냅은 "가장 가까운 차로"가 아니라 **"가장 가까운 도로 + 그 섹션의
+  driving 차로 전부"**를 후보로 연다. 주최측이 "좌회전 구간에 3차로 좌표가
+  주어질 수도 있다"고 했으므로 차로는 좌표가 아니라 다익스트라가 정한다
+- 비용 = 거리 + 차선변경 페널티(25m). 경유지 좌표는 제약으로만 쓴다
+- 차선변경 게이트는 roadMark `type`이 아니라 **`laneChange` 속성**을 본다
+  (`both` 허용 / `none` 금지). 실선을 넘어야만 풀리면 폴백하고
+  **"실선 차로변경 N회 포함 — 평가항목 6 경미 -3점 예상" 경고를 출력한다**
+- 출력 CSV는 `waypoints_*.csv` 스키마 + `road_id,lane_id,section,s,width,lc_dir,lc_solid`.
+  `pure_pursuit.load_path`는 `segment_id,x,y`만 읽고 DictReader가 여분 컬럼을
+  무시하므로 **pure_pursuit 수정이 필요 없다.** `lc_dir`/`lc_solid`는 항목 13
+  방향지시등이 쓴다
+
+검증 결과 (`--validate`)
+
+| | 탐색 | 녹화 | 오차 | 도로 일치 | 차로 일치 |
+|---|---|---|---|---|---|
+| route_example | 822.3 m | 802.8 m | +2.4% | 100% | 97.4% |
+| route_pretest | 834.5 m | 824.2 m | +1.3% | 100% | 40.5% |
+| route_pretest_2 | 750.2 m | 731.6 m | +2.6% | 100% | 96.5% |
+
+- 녹화 궤적과의 횡오차 중앙값 0.12 / 3.03 / 0.16 m
+- 연결 끊김 88건 중 **선택된 경로 위는 2건뿐이고 둘 다 차선변경으로 빠져나간다**
+  (끝나는 차로라 원래 비켜야 한다). 나머지 78건은 경유지 50m 밖 주차장 진입로 등
+- **route_pretest는 전 구간 한 차로씩 바깥으로 달린다**(차로 일치 40.5%).
+  기하 오류가 아니라 비용 최소 규칙의 결과다 — 그 좌표가 실제로 바깥 차로에 가깝다.
+  직진 구간에 우회전 전용 차로를 고를 위험이 있으므로 **4단계 RM_537
+  (차로별 진행방향 표시)로 보정할 대상이다**
+- route_pretest_2 p10은 선택 차로가 11.4m 떨어져 경고가 뜬다. 교차로에서 바깥
+  차로로 진입한 뒤 안쪽으로 3번 옮기는 비용이 더 커서 그대로 둔 결과다
+
 ## 대회 경로 CSV
 
 ```
@@ -251,6 +316,8 @@ seq,x,y
 |---|---|
 | `data/xodr_reference_lines.csv` | **xodr 1단계 산출물.** road 651개 중심선, 1m 간격 34,223점 |
 | `data/xodr_lanes.csv` | **xodr 2단계 산출물.** 주행차로 2,471개 중심선 95,306점 + roadMark |
+| `data/xodr_graph_nodes.csv` / `_edges.csv` | **xodr 3단계 산출물.** 노드 2,471개 / 엣지 4,447개. `--load-graph`로 재파싱(1.3s)을 0.03s로 줄인다 |
+| `data/route_path*.csv` | 3단계가 생성한 주행 waypoint 예시 (pretest 1·2, example) |
 | `data/waypoints_v2.csv` | 예시 경로 P1~P8, 777m. **xodr 파서 검증용 정답지** |
 | `data/waypoints_pretest1.csv` | 사전테스트 경로 1 (7구간 825m) |
 | `data/waypoints_pretest2.csv` | 사전테스트 경로 2 (9구간 737m) |
@@ -267,6 +334,7 @@ v1 파일들은 첫 녹화 시도라 리스폰 오염이 있다. 참고용.
 |---|---|
 | `src/xodr_parser.py` | **xodr 1단계.** planView -> reference line CSV, `--validate` 판정 리포트 |
 | `src/xodr_lanes.py` | **xodr 2단계.** lane 구조 -> 주행차로 중심선 + roadMark CSV |
+| `src/xodr_graph.py` | **xodr 3단계.** 차로 연결 그래프 + route CSV -> 주행 waypoint, `--validate` |
 | `src/hlvtd_client.py` | 9910 파서·클라이언트, `SpeedEstimator`, 리스폰 감지. 단독 실행 시 모니터 |
 | `src/pure_pursuit.py` | Pure Pursuit 경로 추종 |
 | `src/drive_and_record.py` | WASD 수동 주행 + waypoint 녹화 |
@@ -295,7 +363,8 @@ v1 파일들은 첫 녹화 시도라 리스폰 오염이 있다. 참고용.
 |---|---|
 | 9/5 | **xodr 1단계 완료** — planView -> reference line (`src/xodr_parser.py`) |
 | 9/5 | **xodr 2단계 완료** — lane 중심선 + roadMark (`src/xodr_lanes.py`) |
-| 9/6~9/8 | **xodr 3~4단계** — junction 연결 -> 정지선·보호구역·신호등 |
+| 9/5 | **xodr 3단계 완료** — 차로 연결 그래프 + 경로 탐색 (`src/xodr_graph.py`) |
+| 9/6~9/8 | **xodr 4단계** — 정지선·보호구역·신호등 좌표 |
 | 9/9~9/11 | **규칙 대응** — 신호등 정지 > 충돌 회피 > 보호구역 > 방향지시등 |
 | 9/11 | 시나리오 시험, 코드 동결 |
 
