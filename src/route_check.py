@@ -45,7 +45,7 @@ def load_route(path: str) -> list[tuple[int, float, float]]:
 
 
 def load_segments(path: str) -> dict[str, list[tuple[float, float]]]:
-    """segment_id,seq,x,y,heading — pure_pursuit.load_path와 같은 그룹핑."""
+    """segment_id,seq,x,y,heading ― pure_pursuit.load_path와 같은 그룹핑."""
     segs: dict[str, list[tuple[float, float]]] = defaultdict(list)
     with open(path, encoding='utf-8-sig', newline='') as fh:
         for row in csv.DictReader(fh):
@@ -163,7 +163,7 @@ def main() -> None:
         if not same:
             note = f'세그먼트 바뀜 {a[3]}→{b[3]}'
         elif fwd is not None and fwd <= 0:
-            note = f'*** 인덱스가 전진하지 않는다 ({a[4]}→{b[4]}) — 순서 확인 ***'
+            note = f'*** 인덱스가 전진하지 않는다 ({a[4]}→{b[4]}) ― 순서 확인 ***'
         else:
             note = f'인덱스 {a[4]}→{b[4]} (+{fwd})'
         worst = max(a[5], b[5])
@@ -196,7 +196,7 @@ def main() -> None:
         for seq, x, y, name, _i, d, lat, _n in hits:
             if d > MARGINAL_M:
                 brg = math.degrees(math.atan2(y - 0, x - 0))
-                print(f'  seq {seq} ({x:.1f},{y:.1f}) — 가장 가까운 '
+                print(f'  seq {seq} ({x:.1f},{y:.1f}) ― 가장 가까운 '
                       f'{name}에서 {d:.1f}m '
                       f'{"왼쪽" if lat > 0 else "오른쪽"}으로 벗어남')
         print('\n  → 이 구간을 수동 주행으로 녹화하거나(drive_and_record.py),')

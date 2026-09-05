@@ -6,6 +6,12 @@ matplotlib이 Windows 앱 제어 정책에 막히는 환경을 위한 대안.
 
     python plot_waypoints_svg.py --file waypoints_split.csv
     python plot_waypoints_svg.py --file waypoints_split.csv --route route_example.csv
+    python plot_waypoints_svg.py --file waypoints_v2.csv \
+        --base ../data/xodr_reference_lines.csv
+
+--base 는 xodr_parser.py 출력 같은 도로망을 밑그림으로 깔기 위한 것이다.
+좌표 범위 계산에는 넣지 않는다 — 넣으면 825m 궤적이 1500x2400m 전도에 눌려
+보이지 않는다. 전도를 보려면 --base-bounds 를 준다.
 """
 
 from __future__ import annotations
@@ -25,12 +31,17 @@ CANVAS = 1400
 MARGIN = 70
 
 
-def load_waypoints(path: str) -> dict[str, list[tuple[float, float, float]]]:
+def load_waypoints(path: str, lane0: bool = False
+                   ) -> dict[str, list[tuple[float, float, float]]]:
+    """lane0=True면 xodr 출력의 x0,y0,heading0 열을 쓴다 (없으면 x,y로 폴백)."""
     segs: dict[str, list[tuple[float, float, float]]] = defaultdict(list)
     with open(path, encoding='utf-8-sig') as f:
         for row in csv.DictReader(f):
-            segs[row['segment_id']].append(
-                (float(row['x']), float(row['y']), float(row.get('heading', 0) or 0)))
+            if lane0 and row.get('x0'):
+                x, y, h = row['x0'], row['y0'], row.get('heading0', 0)
+            else:
+                x, y, h = row['x'], row['y'], row.get('heading', 0)
+            segs[row['segment_id']].append((float(x), float(y), float(h or 0)))
     return dict(segs)
 
 
@@ -50,6 +61,11 @@ def main() -> None:
     ap = argparse.ArgumentParser(description='waypoint SVG 뷰어')
     ap.add_argument('--file', default='waypoints.csv')
     ap.add_argument('--route', help='대회 경로 CSV (선택)')
+    ap.add_argument('--base', help='밑그림으로 깔 도로망 CSV (xodr 출력 등)')
+    ap.add_argument('--base-lane0', action='store_true',
+                    help='--base 에서 x0,y0 (lane0 중심선) 열을 쓴다')
+    ap.add_argument('--base-bounds', action='store_true',
+                    help='--base 도 좌표 범위 계산에 넣는다 (전도 보기)')
     ap.add_argument('--out', default='waypoints.svg')
     ap.add_argument('--arrows', type=int, default=15,
                     help='진행 방향 화살표 간격 (점 개수)')
@@ -62,10 +78,14 @@ def main() -> None:
         return
 
     route = load_route(args.route) if args.route else []
+    base = load_waypoints(args.base, args.base_lane0) if args.base else {}
 
-    # 좌표 범위
+    # 좌표 범위. base는 기본적으로 넣지 않는다 (전도에 궤적이 눌린다)
     all_x = [p[0] for pts in segments.values() for p in pts] + [r[1] for r in route]
     all_y = [p[1] for pts in segments.values() for p in pts] + [r[2] for r in route]
+    if base and args.base_bounds:
+        all_x += [p[0] for pts in base.values() for p in pts]
+        all_y += [p[1] for pts in base.values() for p in pts]
     min_x, max_x = min(all_x), max(all_x)
     min_y, max_y = min(all_y), max(all_y)
     span = max(max_x - min_x, max_y - min_y, 1.0)
@@ -101,6 +121,23 @@ def main() -> None:
         parts.append(f'<text x="3" y="{py - 3:.1f}" font-size="10" fill="#999">'
                      f'{gy:.0f}</text>')
         gy += step
+
+    # 밑그림 도로망. 뷰 밖 도로는 컬링한다 (전도는 651개 도로라 대부분 밖이다)
+    if base:
+        half = (CANVAS / 2) / scale
+        vx0, vx1 = cx - half, cx + half
+        vy0, vy1 = cy - half, cy + half
+        drawn = 0
+        for name, pts in sorted(base.items()):
+            if not any(vx0 <= p[0] <= vx1 and vy0 <= p[1] <= vy1 for p in pts):
+                continue
+            coords = ' '.join(f'{px:.1f},{py:.1f}'
+                              for px, py in (to_px(p[0], p[1]) for p in pts))
+            parts.append(f'<polyline points="{coords}" fill="none" stroke="#ccc" '
+                         f'stroke-width="1"/>')
+            drawn += 1
+        lbl = 'lane0 중심선' if args.base_lane0 else 'reference line'
+        print(f'밑그림 {args.base} ({lbl}): 도로 {len(base)}개 중 {drawn}개 표시\n')
 
     print(f'{"구간":<28} {"점":>6} {"길이(m)":>10}')
     print('-' * 48)
