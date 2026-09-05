@@ -17,7 +17,7 @@ VTD 시뮬레이터와 TCP/UDP/RTSP로 통신하며 지정 경로를 자율주�
 | 통신·파싱·로깅 | 완료. 현장 VTD에서도 재현 확인 |
 | 경로 추종 (Pure Pursuit) | 완료. 40km/h 825m 완주, 리스폰 0 |
 | 구간 연결 | 완료. 9구간 이어붙이기 검증 |
-| 도로망 (xodr 파서) | **1단계 완료.** reference line 34,223점 생성·검증. lane/junction 남음 |
+| 도로망 (xodr 파서) | **1~2단계 완료.** 주행차로 중심선 2,471개 생성·검증. junction 남음 |
 | 규칙 대응 15개 | **미착수.** 점수는 여기서 갈린다 |
 
 ## 네트워크
@@ -250,6 +250,7 @@ seq,x,y
 | 파일 | 용도 |
 |---|---|
 | `data/xodr_reference_lines.csv` | **xodr 1단계 산출물.** road 651개 중심선, 1m 간격 34,223점 |
+| `data/xodr_lanes.csv` | **xodr 2단계 산출물.** 주행차로 2,471개 중심선 95,306점 + roadMark |
 | `data/waypoints_v2.csv` | 예시 경로 P1~P8, 777m. **xodr 파서 검증용 정답지** |
 | `data/waypoints_pretest1.csv` | 사전테스트 경로 1 (7구간 825m) |
 | `data/waypoints_pretest2.csv` | 사전테스트 경로 2 (9구간 737m) |
@@ -265,6 +266,7 @@ v1 파일들은 첫 녹화 시도라 리스폰 오염이 있다. 참고용.
 | 파일 | 역할 |
 |---|---|
 | `src/xodr_parser.py` | **xodr 1단계.** planView -> reference line CSV, `--validate` 판정 리포트 |
+| `src/xodr_lanes.py` | **xodr 2단계.** lane 구조 -> 주행차로 중심선 + roadMark CSV |
 | `src/hlvtd_client.py` | 9910 파서·클라이언트, `SpeedEstimator`, 리스폰 감지. 단독 실행 시 모니터 |
 | `src/pure_pursuit.py` | Pure Pursuit 경로 추종 |
 | `src/drive_and_record.py` | WASD 수동 주행 + waypoint 녹화 |
@@ -292,7 +294,8 @@ v1 파일들은 첫 녹화 시도라 리스폰 오염이 있다. 참고용.
 | 시기 | 작업 |
 |---|---|
 | 9/5 | **xodr 1단계 완료** — planView -> reference line (`src/xodr_parser.py`) |
-| 9/6~9/8 | **xodr 2~4단계** — lane -> junction -> 정지선·보호구역·신호등 |
+| 9/5 | **xodr 2단계 완료** — lane 중심선 + roadMark (`src/xodr_lanes.py`) |
+| 9/6~9/8 | **xodr 3~4단계** — junction 연결 -> 정지선·보호구역·신호등 |
 | 9/9~9/11 | **규칙 대응** — 신호등 정지 > 충돌 회피 > 보호구역 > 방향지시등 |
 | 9/11 | 시나리오 시험, 코드 동결 |
 

@@ -301,7 +301,11 @@ def parse_roads(path: str) -> list[Road]:
             for lo in lanes.findall('laneOffset'):
                 offsets.append(tuple(float(lo.get(k))
                                      for k in ('s', 'a', 'b', 'c', 'd')))
-        offsets.sort()
+        # s로만 정렬한다. 튜플 전체로 정렬하면 안 된다 -- 이 지도에는 s가 소수점
+        # 14자리까지 같은 laneOffset 레코드가 쌍으로 있고(road 19개),
+        # 튜플 정렬이 파일 순서를 뒤집어 lane_offset_at 의 "마지막이 이긴다"가
+        # 램프(b!=0) 대신 상수(b=0)를 고른다. 반올림 키 + 안정 정렬로 파일 순서를 지킨다.
+        offsets.sort(key=lambda o: round(o[0], 6))
 
         roads.append(Road(id=r.get('id'), length=float(r.get('length')),
                           junction=r.get('junction', '-1'),
