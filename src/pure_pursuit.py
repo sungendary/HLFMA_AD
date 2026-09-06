@@ -14,6 +14,8 @@
     · lookahead = 속도 비례, 4~10m로 제한 (교차로 회전반경 실측 14m보다 작게)
     · 목표속도는 --speed(km/h). 곡률이 큰 구간에서는 횡가속도 한계로 자동 감속
     · 경로 끝이 가까워지면 감속해 정지
+    · --events로 정지선 목록을 주면 적색·황색 신호에서 정지선 앞에 선다
+      (stoplines.py, 평가항목 7·9)
     · 리스폰(프레임 간 5m 이상 점프) 감지 시 경로 인덱스를 다시 전역 탐색
 """
 
@@ -31,6 +33,7 @@ from hlvtd_client import (
     TURN_OFF, STEER_LIMIT, ACCEL_MAX, ACCEL_MIN,
 )
 from session_log import SessionLog, default_dir
+import stoplines
 
 WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 값
 LD_MIN, LD_MAX = 4.0, 10.0  # m, lookahead 범위
@@ -213,6 +216,24 @@ def run(args) -> None:
 
     target_speed = args.speed / 3.6                 # km/h -> m/s
 
+    # 신호등 정지 (평가항목 7·9). --events가 없고 waypoints 옆에 _events.csv도
+    # 없으면 비활성이고, 그때는 예전과 완전히 같은 주행이 된다.
+    ev_path = '' if args.no_signal else (
+        args.events or stoplines.default_events_path(args.waypoints))
+    ev_ctx = {'t': 0.0, 'x': float('nan'), 'y': float('nan'), 'v': float('nan')}
+    policy = None
+    if ev_path:
+        sl_list, sl_warn = stoplines.load_for_path(path, ev_path)
+        print(f'[pp] 정지선 {len(sl_list)}개 ({os.path.basename(ev_path)})')
+        for line in stoplines.summary(sl_list):
+            print('[pp]' + line)
+        for w in sl_warn:
+            print(f'[pp]   *** {w} ***')
+        n_sig = sum(1 for x in sl_list if x.signalized)
+        print(f'[pp] 그 중 신호 정지선 {n_sig}개. 범퍼 보정 {args.front_overhang:.3f}m')
+    else:
+        print('[pp] 신호등 정지 비활성 (--events 없음)')
+
     # 세션 로그를 먼저 연다. 원본 프레임을 파싱 전에 받아야 하므로
     # raw_sink를 Client에 물려서 연결한다.
     log = SessionLog(args.session, mode='pp', meta={
@@ -222,9 +243,24 @@ def run(args) -> None:
         'route': args.route or '',
         'path_points': len(path.pts),
         'path_length_m': round(path.length, 2),
+        'events': ev_path,
+        'front_overhang': args.front_overhang,
+        'tl_max_hold_s': args.tl_max_hold,
     })
     log.copy_input(args.waypoints, 'waypoints.csv')
     log.copy_input(args.route, 'route.csv')   # 현장에서 받은 원본은 반드시 보존
+
+    if ev_path:
+        def _sig_event(kind: str, detail: str) -> None:
+            print()
+            print(f'[pp] [{kind}] {detail}')
+            log.event(kind, detail, t=ev_ctx['t'],
+                      ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
+
+        policy = stoplines.SignalPolicy(
+            path, sl_list, front_overhang=args.front_overhang,
+            max_hold=args.tl_max_hold, on_event=_sig_event)
+        log.copy_input(ev_path, 'events_in.csv')
 
     client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[pp] {args.host}:{args.port} 연결 시도...')
@@ -254,14 +290,19 @@ def run(args) -> None:
 
             n += 1
             t = time.monotonic() - t0
+            sig = stoplines.SignalCmd()        # 예외가 나도 로깅이 되게
             try:
                 v = speed_est.update(frame.ego_x, frame.ego_y)
+                ev_ctx.update(t=t, x=frame.ego_x, y=frame.ego_y, v=v)
 
                 if detect_respawn(frame, prev_frame):
                     print('\n[pp] *** 리스폰 감지 — 경로 인덱스 재탐색 ***')
                     log.respawn(frame, prev_frame, v, t=t)
                     idx = None
                     finished = False
+                    if policy is not None:
+                        # 위치가 강제로 옮겨졌다. "지나갔다"는 판정을 되돌린다
+                        policy.reset()
                 prev_frame = frame
 
                 if idx is None:                     # 시작 / 리스폰 후 전역 탐색
@@ -294,6 +335,14 @@ def run(args) -> None:
                 rem = path.remaining(idx)
                 v_cmd = min(v_cmd, math.sqrt(2.0 * DECEL_END * max(0.0, rem - 1.0)))
 
+                # 신호등. 정지 프로파일이 경로 끝 감속과 같은 sqrt 형태라
+                # min() 하나로 합쳐진다. 정지선은 경로 중간이므로 아래
+                # 끝단 조향 인계(rem < ld)와는 무관하다.
+                if policy is not None:
+                    sig = policy.update(path.s[idx], v, frame.tl_id,
+                                        frame.tl_state, t)
+                    v_cmd = min(v_cmd, sig.v_limit)
+
                 # 경로 끝: pure pursuit 항을 접어두고 마지막 구간 접선을
                 # 유지하는 조향으로 넘긴다. 끝점에 붙을수록 접선 항의 비중이
                 # 커지고, 그 항은 END_STEER_LIMIT로 묶여 있어 포화되지 않는다.
@@ -311,6 +360,9 @@ def run(args) -> None:
                 accel = SPEED_KP * (v_cmd - v)
                 if v_cmd <= 0.0:                    # 정지 명령은 확실히 제동
                     accel = min(accel, -1.5)
+                # 신호 정지는 속도 상한만으로는 프로파일을 못 따라간다.
+                # P 제어의 정상상태 오차만큼 위로 달려 정지선을 넘는다.
+                accel = min(accel, sig.accel_limit)
                 accel = max(ACCEL_MIN, min(ACCEL_MAX, accel))
                 last_cmd = (steer, accel)
             except Exception as exc:                # 계산 실패해도 루프는 유지
@@ -321,6 +373,7 @@ def run(args) -> None:
                 tx = ty = float('nan')
                 v, v_cmd, ld = speed_est.speed, 0.0, LD_MIN
                 idx = idx or 0
+                sig = stoplines.SignalCmd(action='error')
 
             if not client.send_control(steer, accel, TURN_OFF):
                 print('\n[pp] 송신 실패. 재연결...')
@@ -333,7 +386,8 @@ def run(args) -> None:
 
             seg = seg_at(idx)
             log.add_frame(frame, v, t=t, seg=seg, idx=idx,
-                          tgt_x=tx, tgt_y=ty, ld=ld, steer=steer, accel=accel)
+                          tgt_x=tx, tgt_y=ty, ld=ld, steer=steer, accel=accel,
+                          tl_act=sig.action, tl_dist=sig.dist)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -342,7 +396,10 @@ def run(args) -> None:
                   + f'idx={idx:3d}/{len(path.pts) - 1} 남은{path.remaining(idx):6.1f}m '
                   f'tgt({tx:8.2f},{ty:9.2f}) Ld={ld:4.1f} | '
                   f'steer={steer:+.3f}rad({math.degrees(steer):+5.1f}°) '
-                  f'a={accel:+5.2f}' + ('  [완료]' if finished else ''))
+                  f'a={accel:+5.2f}'
+                  + ('' if sig.action in ('none', 'error')
+                     else f' | TL:{sig.action:5s}{sig.dist:5.1f}m')
+                  + ('  [완료]' if finished else ''))
 
             if finished:
                 print('\n[pp] 경로 끝 도달 — 정지 완료')
@@ -376,6 +433,17 @@ def main() -> None:
     ap.add_argument('--route', help='현장에서 받은 route CSV. 세션에 원본을 복사해 둔다')
     # --log 는 옛 이름. 이제 파일이 아니라 세션 디렉터리를 가리킨다.
     # --log '' 로 끄던 습관은 그대로 통한다.
+    ap.add_argument('--events', default='',
+                    help='정지선 이벤트 CSV (route_path_*_events.csv). '
+                         '생략하면 --waypoints 옆의 _events.csv를 쓴다')
+    ap.add_argument('--no-signal', action='store_true',
+                    help='신호등 정지를 끈다 (회귀 비교용)')
+    ap.add_argument('--front-overhang', type=float,
+                    default=stoplines.FRONT_OVERHANG,
+                    help='후륜축에서 앞범퍼까지 [m]. 9910 ego 좌표는 후륜축이다')
+    ap.add_argument('--tl-max-hold', type=float,
+                    default=stoplines.MAX_HOLD_S,
+                    help='신호 대기 상한 [s]. 넘으면 교착으로 보고 출발한다')
     ap.add_argument('--session', '--log', dest='session',
                     default=default_dir('pp'),
                     help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')
