@@ -41,6 +41,7 @@ import xml.etree.ElementTree as ET
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 
+import xodr_objects as O
 import xodr_parser as X
 
 SNAP_R = 25.0               # 경유지 스냅 반경 [m]
@@ -54,6 +55,13 @@ SNAP_WARN = 10.0            # 경유지-선택차로 횡거리 경고 임계 [m]
 GAP_NEAR = 50.0             # 끊김이 경로에 영향을 준다고 볼 거리 [m]
 LEN_TOL = 0.10              # 녹화 대비 길이 허용 오차
 ROAD_HIT = 0.90             # 도로 일치율 하한
+
+ARROW_PENALTY = 0.0         # 노면 방향표시와 어긋나는 기동의 비용 가산 [m 상당]
+                            # **기본 0 = 끔.** 검증된 3단계 경로를 바꾸지 않는다
+STRAIGHT_LIMIT = math.radians(30)    # 이 안이면 직진으로 본다
+UTURN_LIMIT = math.radians(150)      # 이 밖이면 유턴으로 본다
+ZONE_LEAD = 30.0            # 보호구역 진입을 이만큼 앞당긴다 [m]
+ZONE_TAIL = 30.0            # 50 표시로 닫히지 않은 보호구역의 꼬리 [m]
 
 Node = tuple[str, int, int]     # (road_id, section, lane_id)
 
@@ -156,6 +164,40 @@ def span(pts: list[LanePt]) -> float:
     return abs(pts[-1].s - pts[0].s)
 
 
+def _wrap(a: float) -> float:
+    return (a + math.pi) % (2 * math.pi) - math.pi
+
+
+def _exit_pt(n: Node, pts: dict[Node, list[LanePt]]) -> LanePt:
+    """그 노드의 진행 방향 끝점. 양수 차로는 s가 작은 쪽이 끝이다."""
+    pl = pts[n]
+    return pl[-1] if n[2] < 0 else pl[0]
+
+
+def maneuver(g: Graph, frm: Node, to: Node) -> str:
+    """junction 엣지의 기동. 'st' / 'lt' / 'rt' / 'ut'.
+
+    진입 차로의 진행 방향 끝 헤딩과 connecting road 의 진출 헤딩 차이로 본다.
+    connecting road 자체의 진입-진출 차이만 보면 짧은 연결로에서 회전량이
+    과소평가되므로 접근로 기준으로 잰다.
+    """
+    if frm not in g.pts or to not in g.pts:
+        return 'st'
+    a = travel_heading(frm[2], _exit_pt(frm, g.pts).heading)
+    b = travel_heading(to[2], _exit_pt(to, g.pts).heading)
+    d = _wrap(b - a)
+    if abs(d) >= UTURN_LIMIT:
+        return 'ut'
+    if abs(d) <= STRAIGHT_LIMIT:
+        return 'st'
+    return 'lt' if d > 0 else 'rt'
+
+
+def load_arrows(path: str) -> dict[Node, set[str]]:
+    """4단계 CSV -> 노드별 허용 기동. 주행 방향 마지막 화살표만 쓴다."""
+    return O.exit_arrows(O.load_objects(path))
+
+
 def s_behind(node: Node, s: float, pts: list[LanePt]) -> float:
     """그 노드 안에서 s 지점까지 이미 달린 거리 (진행 방향 기준)."""
     a, b = pts[0].s, pts[-1].s
@@ -196,11 +238,17 @@ def _entry_section(rid: str, cp: str | None, nsec: dict[str, int]) -> int:
 def build_graph(pts: dict[Node, list[LanePt]],
                 sections, road_links, junctions,
                 lc_penalty: float = LC_PENALTY,
-                allow_solid: bool = False) -> Graph:
+                allow_solid: bool = False,
+                arrows: dict[Node, set[str]] | None = None,
+                arrow_penalty: float = ARROW_PENALTY) -> Graph:
     """엣지 4종을 만든다.
 
     방향 판정은 전부 한 규칙으로 통일한다 -- d = +1(음수 차로) / -1(양수 차로).
     진행 방향 끝의 road link 와 그 차로의 같은 방향 lane link 를 본다.
+
+    arrow_penalty > 0 이면 노면 방향표시(4단계)와 어긋나는 junction 기동에
+    비용을 더한다. **소프트 가산이지 차단이 아니다** -- 표시가 틀렸거나 없어도
+    탐색이 실패하면 안 되기 때문이다. 화살표가 없는 노드는 가산 0이다.
     """
     g = Graph(pts=pts)
     nsec = {rid: len(secs) for rid, secs in sections.items()}
@@ -243,10 +291,18 @@ def build_graph(pts: dict[Node, list[LanePt]],
                     g.dead.append(('road-road', n, f'-> road {lk[1]} lane {tgt}'))
             else:
                 got = 0
+                moves = arrows.get(n) if (arrows and arrow_penalty > 0) else None
                 for con, tl, cp in junctions.get((lk[1], rid, lid), ()):
                     to = (con, _entry_section(con, cp, nsec), tl)
                     if to in pts:
-                        E[n].append(Edge(to, w, 'junction'))
+                        # w 에는 절대 섞지 않는다. w 는 407행의 목표 노드 꼬리
+                        # 차감(span - s_behind)과 짝을 이루므로 페널티가 들어가면
+                        # 총거리가 어긋난다. 엣지 비용에만 더한다.
+                        pen = 0.0
+                        if moves and maneuver(g, n, to) not in moves:
+                            pen = arrow_penalty
+                            g.stat['화살표 불일치'] += 1
+                        E[n].append(Edge(to, w + pen, 'junction'))
                         got += 1
                 if got:
                     g.stat['junction'] += 1
@@ -607,6 +663,138 @@ def write_waypoints(path: str, wps: list[Waypoint]) -> int:
 
 
 # ----------------------------------------------------------------------
+# 경로 위 이벤트 (4단계 산출물 투영)
+# ----------------------------------------------------------------------
+
+WP_S_TOL = 2.0              # waypoint 간격이 1m 라 이 안이면 그 지점을 지났다고 본다
+EV_DEDUP = 1.5              # 이 안의 같은 종류는 한 개로 본다 [m]
+EV_HEADER = ['kind', 's_along', 'x', 'y', 'road_id', 'lane_id', 'detail']
+
+EV_KINDS = ('stopline', 'crosswalk')    # 그대로 흘리는 것
+ZONE_KINDS = ('speed30', 'speed50')     # 구간으로 묶는 것
+
+
+def _at(track: list[tuple], c: float) -> tuple[float, float, str, int]:
+    """누적거리 c 지점의 (x, y, road_id, lane_id).
+
+    보호구역 진입·이탈은 표시 위치가 아니라 앞당기고 늦춘 지점이므로,
+    그 지점이 실제로 어느 도로·차로인지는 경로에서 다시 찾아야 한다.
+    """
+    if c <= track[0][0]:
+        return track[0][1], track[0][2], track[0][3], track[0][4]
+    if c >= track[-1][0]:
+        return track[-1][1], track[-1][2], track[-1][3], track[-1][4]
+    lo, hi = 0, len(track) - 1
+    while lo + 1 < hi:
+        mid = (lo + hi) // 2
+        if track[mid][0] <= c:
+            lo = mid
+        else:
+            hi = mid
+    c0, x0, y0, rid, lid = track[lo]
+    c1, x1, y1, _r, _l = track[hi]
+    r = (c - c0) / (c1 - c0) if c1 > c0 else 0.0
+    return x0 + (x1 - x0) * r, y0 + (y1 - y0) * r, rid, lid
+
+
+def route_events(objs, wps: list[Waypoint],
+                 zone_lead: float = ZONE_LEAD,
+                 zone_tail: float = ZONE_TAIL) -> list[tuple]:
+    """경로 위 정지선·횡단보도·보호구역을 along-path 거리와 함께 뽑는다.
+
+    경로가 실제로 지나는 (road, section, lane) 노드에 배정된 오브젝트만 본다.
+    반대 차로와 주차장 진입로의 정지선은 여기서 저절로 걸러진다.
+    차선변경으로 노드의 일부만 달린 경우도 s 허용오차로 걸러진다.
+    """
+    cum = 0.0
+    table: dict[Node, list[tuple[float, float]]] = defaultdict(list)
+    track: list[tuple] = []
+    for i, w in enumerate(wps):
+        if i:
+            cum += math.hypot(w.x - wps[i - 1].x, w.y - wps[i - 1].y)
+        table[(w.road_id, w.section, w.lane_id)].append((w.s, cum))
+        track.append((cum, w.x, w.y, w.road_id, w.lane_id))
+    if not track:
+        return []
+
+    hits: list[tuple[float, object]] = []
+    for o in objs:
+        n = o.node
+        if n is None or n not in table:
+            continue
+        s_wp, c = min(table[n], key=lambda r: abs(r[0] - o.s))
+        if abs(s_wp - o.s) > WP_S_TOL:
+            continue            # 그 노드에서 달리지 않은 구간에 있다
+        hits.append((c, o))
+    hits.sort(key=lambda r: r[0])
+
+    # 지도에 같은 정지선이 t 만 몇 cm 다르게 두 번 그려진 곳이 있다
+    # (road 420 lane -1 s=56.218 에 t=-1.6 / -1.5 두 개). 하나로 본다.
+    dedup: list[tuple[float, object]] = []
+    last: dict[str, float] = {}
+    for c, o in hits:
+        if o.kind in last and c - last[o.kind] < EV_DEDUP:
+            continue
+        last[o.kind] = c
+        dedup.append((c, o))
+    hits = dedup
+
+    out: list[tuple] = []
+    for c, o in hits:
+        if o.kind in EV_KINDS:
+            detail = f'ctrl={o.ctrl_id}' if o.ctrl_id else ''
+            out.append((o.kind, c, o.x, o.y, o.road_id, o.lane_id, detail))
+
+    # -- 보호구역: 표시 하나하나가 아니라 구간으로 묶는다 ------------------
+    # 노면 표시는 구역 안에 주기적으로 그려져 있고 RM_517_50 이 50km/h 복귀
+    # 지점이다. 붉은 구역 폴리곤이 아니므로 경계는 **보수적으로** 잡는다 --
+    # 진입은 앞당기고 이탈은 늦춘다. 제한속도 이하 저속 주행은 감점이 없어서
+    # 그 방향 오차는 안전하지만 반대 방향은 항목 2 감점이다.
+    zone = [(c, o) for c, o in hits if o.kind in ZONE_KINDS]
+    open_c = None
+    marks = 0
+    last30 = 0.0
+    for c, o in zone:
+        if o.kind == 'speed30':
+            if open_c is None:
+                open_c = max(0.0, c - zone_lead)
+                marks = 0
+            marks += 1
+            last30 = c
+        elif open_c is not None:
+            x, y, rid, lid = _at(track, open_c)
+            out.append(('speed30_enter', open_c, x, y, rid, lid,
+                        f'marks={marks} lead={zone_lead:.0f}'))
+            x, y, rid, lid = _at(track, c)
+            out.append(('speed30_exit', c, x, y, rid, lid,
+                        'closed_by=RM_517_50'))
+            open_c = None
+    if open_c is not None:
+        end = min(track[-1][0], last30 + zone_tail)
+        x, y, rid, lid = _at(track, open_c)
+        out.append(('speed30_enter', open_c, x, y, rid, lid,
+                    f'marks={marks} lead={zone_lead:.0f}'))
+        x, y, rid, lid = _at(track, end)
+        out.append(('speed30_exit', end, x, y, rid, lid,
+                    f'closed_by=tail tail={zone_tail:.0f}'))
+
+    out.sort(key=lambda r: (r[1], r[0]))
+    return out
+
+
+def write_route_events(path: str, evs: list[tuple]) -> int:
+    """route_path.csv 스키마는 pure_pursuit 가 읽으므로 건드리지 않고 따로 낸다."""
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
+    with open(path, 'w', encoding='utf-8', newline='') as fh:
+        w = csv.writer(fh)
+        w.writerow(EV_HEADER)
+        for kind, c, x, y, rid, lid, detail in evs:
+            w.writerow([kind, f'{c:.1f}', f'{x:.3f}', f'{y:.3f}',
+                        rid, lid, detail])
+    return len(evs)
+
+
+# ----------------------------------------------------------------------
 # 그래프 덤프 / 로드
 # ----------------------------------------------------------------------
 
@@ -662,7 +850,8 @@ def load_route(path: str) -> list[tuple[float, float]]:
 
 
 def run_route(g: Graph, idx: LaneIndex, route_path: str, out_path: str | None,
-              n_roads: int, quiet: bool = False):
+              n_roads: int, quiet: bool = False, objs=None,
+              events_out: str | None = None):
     """route CSV -> waypoint. 실선 폴백은 호출부(main)에서 그래프를 바꿔 재시도한다."""
     cps = load_route(route_path)
     res, stuck = find_route(g, idx, cps, n_roads)
@@ -673,7 +862,23 @@ def run_route(g: Graph, idx: LaneIndex, route_path: str, out_path: str | None,
         write_waypoints(out_path, wps)
     if not quiet:
         _report_route(route_path, out_path, cps, res, wps, lc)
+    if events_out and objs:
+        evs = route_events(objs, wps)
+        write_route_events(events_out, evs)
+        if not quiet:
+            _report_events(events_out, evs)
     return res, cps, -1
+
+
+def _report_events(path: str, evs: list[tuple]) -> None:
+    kinds = Counter(e[0] for e in evs)
+    print(f'[graph] {os.path.normpath(path)}: 이벤트 {len(evs)}개  ' +
+          '  '.join(f'{k} {v}' for k, v in sorted(kinds.items())))
+    for kind, c, x, y, rid, lid, detail in evs:
+        if kind == 'crosswalk':
+            continue                # 개수가 많아 요약에서는 뺀다
+        print(f'[graph]   {c:7.1f} m  {kind:<14} road {rid:<6} lane {lid:+d}  '
+              f'({x:.1f},{y:.1f})  {detail}')
 
 
 def _report_route(route_path, out_path, cps, res: RouteResult, wps, lc) -> None:
@@ -719,15 +924,98 @@ def _traj_length(rows) -> tuple[float, dict[str, float]]:
     return sum(per.values()), per
 
 
+ROUTES = ('route_example.csv', 'route_pretest.csv', 'route_pretest_2.csv')
+TRAJ = {'route_example.csv': 'waypoints_v2.csv',
+        'route_pretest.csv': 'waypoints_pretest1.csv',
+        'route_pretest_2.csv': 'waypoints_pretest2.csv'}
+
+
+def _hit_rates(idx: LaneIndex, rows, res: RouteResult) -> tuple[float, float]:
+    """녹화 궤적 대비 (도로 일치율, 차로 일치율)."""
+    used = {n[0] for n in res.nodes}
+    used_lane = {(n[0], n[2]) for n in res.nodes}
+    hit = lane_hit = 0
+    for r in rows:
+        near_ = idx.near(float(r['x']), float(r['y']), 6.0)
+        if any(n[0] in used for n in near_):
+            hit += 1
+        if near_:
+            nb = min(near_.items(), key=lambda kv: kv[1][0])[0]
+            if (nb[0], nb[2]) in used_lane:
+                lane_hit += 1
+    return hit / len(rows), lane_hit / len(rows)
+
+
+def _n_lc(res: RouteResult) -> int:
+    return sum(1 for a, b in zip(res.nodes, res.nodes[1:]) if _is_lc(a, b))
+
+
+def compare_arrows(pts, sections, road_links, junctions, idx: LaneIndex,
+                   data: str, n_roads: int, lc_penalty: float,
+                   arrows: dict[Node, set[str]], penalty: float) -> None:
+    """방향표시 페널티 OFF/ON 을 나란히 잰다.
+
+    **차로 일치율만 보면 안 된다.** 일치율이 올라도 거리가 늘거나 차선변경이
+    늘면 득실을 따져야 한다 -- 차선변경은 항목 6(실선 -3점)과 항목 13
+    (방향지시등) 위험을, 거리는 완주 시간을 늘린다.
+    """
+    print('\n' + '=' * 78)
+    print(f'E. 방향표시 페널티 A/B (OFF vs ON={penalty:.0f})')
+    print('=' * 78)
+
+    cols = {}
+    for tag, pen in (('OFF', 0.0), ('ON', penalty)):
+        gg = build_graph(pts, sections, road_links, junctions, lc_penalty,
+                         arrows=arrows, arrow_penalty=pen)
+        gs = build_graph(pts, sections, road_links, junctions, lc_penalty,
+                         allow_solid=True, arrows=arrows, arrow_penalty=pen)
+        per = {}
+        for f in ROUTES:
+            rp = os.path.join(data, f)
+            tp = os.path.join(data, TRAJ[f])
+            if not (os.path.exists(rp) and os.path.exists(tp)):
+                continue
+            cps = load_route(rp)
+            res, _stuck = find_route(gg, idx, cps, n_roads)
+            use = gg
+            if res is None:
+                res, _stuck = find_route(gs, idx, cps, n_roads)
+                use = gs
+            if res is None:
+                per[f] = None
+                continue
+            wps, _lc = path_to_waypoints(use, res, cps)
+            dist = sum(math.hypot(b.x - a.x, b.y - a.y)
+                       for a, b in zip(wps, wps[1:]))
+            with open(tp, encoding='utf-8-sig', newline='') as fh:
+                rows = list(csv.DictReader(fh))
+            road_r, lane_r = _hit_rates(idx, rows, res)
+            per[f] = (dist, _n_lc(res), res.solid_lc, road_r, lane_r)
+        cols[tag] = per
+        if pen > 0:
+            print(f'   페널티 적용 엣지 {gg.stat.get("화살표 불일치", 0)}개')
+
+    print(f'\n   {"":<22}{"페널티 OFF":^34}{"페널티 ON":^34}')
+    print(f'   {"":<22}' + 2 * f'{"거리":>10}{"LC":>5}{"실선":>5}{"도로":>7}{"차로":>7}')
+    for f in ROUTES:
+        a, b = cols['OFF'].get(f), cols['ON'].get(f)
+        if a is None or b is None:
+            print(f'   {f:<22} 탐색 실패')
+            continue
+        line = f'   {f:<22}'
+        for v in (a, b):
+            line += (f'{v[0]:>9.1f}m{v[1]:>5}{v[2]:>5}'
+                     f'{v[3]*100:>6.1f}%{v[4]*100:>6.1f}%')
+        print(line)
+    print('\n   LC = 차선변경 횟수, 실선 = 그중 실선 변경(항목 6 -3점)')
+    print('   차로 일치율이 올라도 거리·LC 가 늘면 득실을 따져야 한다.')
+    print('   **기본값은 OFF 다.** 이 표를 보고 켤지 정한다.')
+
+
 def validate(g: Graph, idx: LaneIndex, roads, data: str,
              n_roads: int, g_solid: Graph | None = None) -> None:
-    routes = [os.path.join(data, f) for f in
-              ('route_example.csv', 'route_pretest.csv', 'route_pretest_2.csv')]
-    traj = {
-        'route_example.csv': 'waypoints_v2.csv',
-        'route_pretest.csv': 'waypoints_pretest1.csv',
-        'route_pretest_2.csv': 'waypoints_pretest2.csv',
-    }
+    routes = [os.path.join(data, f) for f in ROUTES]
+    traj = TRAJ
 
     all_cps = []
     for p in routes:
@@ -832,20 +1120,7 @@ def validate(g: Graph, idx: LaneIndex, roads, data: str,
         rec, _per = _traj_length(rows)
         err = (dist - rec) / rec
 
-        used = {n[0] for n in res.nodes}
-        used_lane = {(n[0], n[2]) for n in res.nodes}
-        hit = lane_hit = 0
-        for r in rows:
-            near_ = idx.near(float(r['x']), float(r['y']), 6.0)
-            if any(n[0] in used for n in near_):
-                hit += 1
-            if near_:
-                # 녹화가 실제로 달린 차로 = 가장 가까운 차로
-                nb = min(near_.items(), key=lambda kv: kv[1][0])[0]
-                if (nb[0], nb[2]) in used_lane:
-                    lane_hit += 1
-        rate = hit / len(rows)
-        lane_rate = lane_hit / len(rows)
+        rate, lane_rate = _hit_rates(idx, rows, res)
         good = abs(err) <= LEN_TOL and rate >= ROAD_HIT
         ok_c &= good
         print(f'   {name:<22} 탐색 {dist:7.1f} m / 녹화 {rec:7.1f} m  '
@@ -899,10 +1174,25 @@ def main() -> None:
                     help='차선변경 비용 가산 [m 상당]')
     ap.add_argument('--snap-roads', type=int, default=SNAP_ROADS,
                     help='경유지마다 후보로 열 도로 수')
+    ap.add_argument('--objects', default=os.path.join(data, 'xodr_objects.csv'),
+                    help='4단계 산출물 (방향표시 / 경로 이벤트)')
+    ap.add_argument('--arrow-penalty', type=float, default=ARROW_PENALTY,
+                    help='노면 방향표시와 어긋나는 기동의 비용 가산 [m 상당]. '
+                         '기본 0 = 끔')
+    ap.add_argument('--events-out', help='경로 위 이벤트 CSV (정지선·보호구역·횡단보도)')
     args = ap.parse_args()
 
     if not os.path.exists(args.lanes):
         raise SystemExit(f'{args.lanes}: 없다. 먼저 xodr_lanes.py 를 돌려라')
+
+    objs, arrows = None, None
+    if os.path.exists(args.objects):
+        objs = O.load_objects(args.objects)
+        arrows = O.exit_arrows(objs)
+        print(f'[graph] {os.path.basename(args.objects)}  오브젝트 {len(objs)}개  '
+              f'방향표시 노드 {len(arrows)}개')
+    elif args.arrow_penalty > 0 or args.events_out:
+        raise SystemExit(f'{args.objects}: 없다. 먼저 xodr_objects.py 를 돌려라')
 
     t0 = time.time()
     pts, dropped = load_lane_points(args.lanes)
@@ -934,9 +1224,11 @@ def main() -> None:
               f'junction laneLink {sum(len(v) for v in junctions.values())}개')
 
         t0 = time.time()
-        g = build_graph(pts, sections, road_links, junctions, args.lc_penalty)
+        g = build_graph(pts, sections, road_links, junctions, args.lc_penalty,
+                        arrows=arrows, arrow_penalty=args.arrow_penalty)
         g_solid = build_graph(pts, sections, road_links, junctions,
-                              args.lc_penalty, allow_solid=True)
+                              args.lc_penalty, allow_solid=True,
+                              arrows=arrows, arrow_penalty=args.arrow_penalty)
         print(f'[graph] 엣지 {sum(len(v) for v in g.edges.values())}개 '
               f'({time.time() - t0:.2f}s)')
         for k, v in g.stat.most_common():
@@ -954,11 +1246,14 @@ def main() -> None:
     if args.route:
         if not os.path.exists(args.route):
             raise SystemExit(f'{args.route}: 없다')
-        res, cps, stuck = run_route(g, idx, args.route, args.out, args.snap_roads)
+        res, cps, stuck = run_route(g, idx, args.route, args.out,
+                                    args.snap_roads, objs=objs,
+                                    events_out=args.events_out)
         if res is None and g_solid is not None:
             print(f'[graph] 경유지 p{stuck + 1} 에서 막혔다. 실선 차로변경을 열어 재시도한다')
             res, cps, stuck = run_route(g_solid, idx, args.route, args.out,
-                                        args.snap_roads)
+                                        args.snap_roads, objs=objs,
+                                        events_out=args.events_out)
         if res is None:
             raise SystemExit(f'[graph] 탐색 실패: 경유지 p{stuck + 1} '
                              f'({cps[stuck][0]:.1f},{cps[stuck][1]:.1f})')
@@ -967,6 +1262,12 @@ def main() -> None:
         if roads is None:
             print('[graph] --load-graph 상태에서는 끊김 진단(A)이 제한된다')
         validate(g, idx, roads, data, args.snap_roads, g_solid)
+        if args.arrow_penalty > 0 and arrows and not args.load_graph:
+            compare_arrows(pts, sections, road_links, junctions, idx, data,
+                           args.snap_roads, args.lc_penalty, arrows,
+                           args.arrow_penalty)
+        elif args.arrow_penalty <= 0:
+            print('\n[graph] 방향표시 A/B 비교: --arrow-penalty 80 처럼 값을 주면 낸다')
 
 
 if __name__ == '__main__':
