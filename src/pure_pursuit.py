@@ -16,6 +16,8 @@
     · 경로 끝이 가까워지면 감속해 정지
     · --events로 정지선 목록을 주면 적색·황색 신호에서 정지선 앞에 선다
       (stoplines.py, 평가항목 7·9)
+    · objects[]를 경로에 투영해 보행자·차량·장애물을 피한다
+      (obstacles.py, 평가항목 10·11·14). --no-obstacle로 끈다
     · 리스폰(프레임 간 5m 이상 점프) 감지 시 경로 인덱스를 다시 전역 탐색
 """
 
@@ -33,6 +35,7 @@ from hlvtd_client import (
     TURN_OFF, STEER_LIMIT, ACCEL_MAX, ACCEL_MIN,
 )
 from session_log import SessionLog, default_dir
+import obstacles
 import stoplines
 
 WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 값
@@ -234,6 +237,9 @@ def run(args) -> None:
     else:
         print('[pp] 신호등 정지 비활성 (--events 없음)')
 
+    # 충돌 회피 (평가항목 10·11·14). --no-obstacle이면 예전과 같은 주행이 된다.
+    obs_policy = None
+
     # 세션 로그를 먼저 연다. 원본 프레임을 파싱 전에 받아야 하므로
     # raw_sink를 Client에 물려서 연결한다.
     log = SessionLog(args.session, mode='pp', meta={
@@ -246,6 +252,9 @@ def run(args) -> None:
         'events': ev_path,
         'front_overhang': args.front_overhang,
         'tl_max_hold_s': args.tl_max_hold,
+        'obstacles': not args.no_obstacle,
+        'obs_lookahead_m': args.obs_lookahead,
+        'obs_max_block_s': args.obs_max_block,
     })
     log.copy_input(args.waypoints, 'waypoints.csv')
     log.copy_input(args.route, 'route.csv')   # 현장에서 받은 원본은 반드시 보존
@@ -261,6 +270,23 @@ def run(args) -> None:
             path, sl_list, front_overhang=args.front_overhang,
             max_hold=args.tl_max_hold, on_event=_sig_event)
         log.copy_input(ev_path, 'events_in.csv')
+
+    if not args.no_obstacle:
+        def _obs_event(kind: str, detail: str) -> None:
+            print()
+            print(f'[pp] [{kind}] {detail}')
+            log.event(kind, detail, t=ev_ctx['t'],
+                      ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
+
+        obs_policy = obstacles.ObstaclePolicy(
+            path, front_overhang=args.front_overhang,
+            lookahead=args.obs_lookahead, max_block=args.obs_max_block,
+            on_event=_obs_event)
+        print('[pp] 충돌 회피 활성 (항목 10·11·14)')
+        for line in obstacles.summary(obs_policy):
+            print('[pp]' + line)
+    else:
+        print('[pp] 충돌 회피 비활성 (--no-obstacle)')
 
     client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[pp] {args.host}:{args.port} 연결 시도...')
@@ -291,6 +317,7 @@ def run(args) -> None:
             n += 1
             t = time.monotonic() - t0
             sig = stoplines.SignalCmd()        # 예외가 나도 로깅이 되게
+            obs = obstacles.ObstacleCmd()
             try:
                 v = speed_est.update(frame.ego_x, frame.ego_y)
                 ev_ctx.update(t=t, x=frame.ego_x, y=frame.ego_y, v=v)
@@ -303,6 +330,8 @@ def run(args) -> None:
                     if policy is not None:
                         # 위치가 강제로 옮겨졌다. "지나갔다"는 판정을 되돌린다
                         policy.reset()
+                    if obs_policy is not None:
+                        obs_policy.reset()      # 추적도 전부 버린다
                 prev_frame = frame
 
                 if idx is None:                     # 시작 / 리스폰 후 전역 탐색
@@ -335,12 +364,21 @@ def run(args) -> None:
                 rem = path.remaining(idx)
                 v_cmd = min(v_cmd, math.sqrt(2.0 * DECEL_END * max(0.0, rem - 1.0)))
 
+                # 충돌 회피를 신호보다 **먼저** 돌린다. 항목 8 면책과
+                # MAX_HOLD_S 동결에 obs.blocking이 필요하기 때문이다.
+                # 의존은 이 한 방향뿐이다.
+                if obs_policy is not None:
+                    obs = obs_policy.update(idx, path.s[idx], v,
+                                            frame.ego_x, frame.ego_y,
+                                            frame.ego_heading, frame.objects, t)
+                    v_cmd = min(v_cmd, obs.v_limit)
+
                 # 신호등. 정지 프로파일이 경로 끝 감속과 같은 sqrt 형태라
                 # min() 하나로 합쳐진다. 정지선은 경로 중간이므로 아래
                 # 끝단 조향 인계(rem < ld)와는 무관하다.
                 if policy is not None:
                     sig = policy.update(path.s[idx], v, frame.tl_id,
-                                        frame.tl_state, t)
+                                        frame.tl_state, t, blocked=obs.blocking)
                     v_cmd = min(v_cmd, sig.v_limit)
 
                 # 경로 끝: pure pursuit 항을 접어두고 마지막 구간 접선을
@@ -362,7 +400,7 @@ def run(args) -> None:
                     accel = min(accel, -1.5)
                 # 신호 정지는 속도 상한만으로는 프로파일을 못 따라간다.
                 # P 제어의 정상상태 오차만큼 위로 달려 정지선을 넘는다.
-                accel = min(accel, sig.accel_limit)
+                accel = min(accel, sig.accel_limit, obs.accel_limit)
                 accel = max(ACCEL_MIN, min(ACCEL_MAX, accel))
                 last_cmd = (steer, accel)
             except Exception as exc:                # 계산 실패해도 루프는 유지
@@ -374,6 +412,7 @@ def run(args) -> None:
                 v, v_cmd, ld = speed_est.speed, 0.0, LD_MIN
                 idx = idx or 0
                 sig = stoplines.SignalCmd(action='error')
+                obs = obstacles.ObstacleCmd(action='error')
 
             if not client.send_control(steer, accel, TURN_OFF):
                 print('\n[pp] 송신 실패. 재연결...')
@@ -387,7 +426,9 @@ def run(args) -> None:
             seg = seg_at(idx)
             log.add_frame(frame, v, t=t, seg=seg, idx=idx,
                           tgt_x=tx, tgt_y=ty, ld=ld, steer=steer, accel=accel,
-                          tl_act=sig.action, tl_dist=sig.dist)
+                          tl_act=sig.action, tl_dist=sig.dist,
+                          ob_act=obs.action, ob_kind=obs.kind,
+                          ob_id=obs.obj_id, ob_dist=obs.dist, ob_lat=obs.lat)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -399,6 +440,9 @@ def run(args) -> None:
                   f'a={accel:+5.2f}'
                   + ('' if sig.action in ('none', 'error')
                      else f' | TL:{sig.action:5s}{sig.dist:5.1f}m')
+                  + ('' if obs.action in ('none', 'error')
+                     else f' | OB:{obs.action:6s}{obs.kind[:3]}'
+                          f'{obs.dist:5.1f}m{obs.lat:+5.1f}')
                   + ('  [완료]' if finished else ''))
 
             if finished:
@@ -444,6 +488,14 @@ def main() -> None:
     ap.add_argument('--tl-max-hold', type=float,
                     default=stoplines.MAX_HOLD_S,
                     help='신호 대기 상한 [s]. 넘으면 교착으로 보고 출발한다')
+    ap.add_argument('--no-obstacle', action='store_true',
+                    help='충돌 회피를 끈다 (회귀 비교용)')
+    ap.add_argument('--obs-lookahead', type=float,
+                    default=obstacles.LOOKAHEAD_M,
+                    help='충돌 회피가 볼 전방 거리 [m]')
+    ap.add_argument('--obs-max-block', type=float,
+                    default=obstacles.MAX_BLOCK_S,
+                    help='보행자 대기 상한 [s]. 넘으면 교착으로 보고 기어간다')
     ap.add_argument('--session', '--log', dest='session',
                     default=default_dir('pp'),
                     help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')

@@ -284,6 +284,7 @@ class SignalPolicy:
         self._announced = set()     # 이벤트 중복 억제 키
         self._cur = None            # 현재 대상 정지선
         self._spent = set()         # 방금 놓아준 정지선의 ctrl id
+        self._blocked = False       # 전방 객체에 막혀 있나 (obstacles.py가 준다)
 
     def _announce(self, key, kind: str, detail: str) -> None:
         if key in self._announced:
@@ -331,7 +332,17 @@ class SignalPolicy:
 
     # -- 본체 -----------------------------------------------------------
     def update(self, s_ego: float, v: float, tl_id: int, tl_state: int,
-               t: float) -> SignalCmd:
+               t: float, blocked: bool = False) -> SignalCmd:
+        """blocked는 "전방에 차량·보행자가 있어 못 간다"는 뜻이다.
+
+        충돌 회피(obstacles.py)가 넘긴다. 기본값이 False라 예전 호출은 그대로
+        동작한다. 두 가지를 바꾼다.
+
+          · 항목 8(녹색 정지선 30m 이내 5초 정차)은 전방 객체가 있으면 면책이다
+          · MAX_HOLD_S를 세지 않는다. 안 그러면 보행자에 막혀 적색 앞에 45초
+            서 있을 때 정지선을 놓아 버리고, 보행자가 비키는 순간 적색을 통과한다
+        """
+        self._blocked = blocked
         # 지나간 정지선을 정리한다. 범퍼가 넘어갔으면 끝이다.
         for sl in self.stoplines:
             if id(sl) not in self._done and sl.s - s_ego < -BEHIND_M:
@@ -469,8 +480,10 @@ class SignalPolicy:
         self._clear_timers()
 
         # 항목 8: 녹색 + 정지선 30m 이내 + 5초 이상 정차는 감점이다.
-        # 전방 객체 면책은 9/9 충돌회피가 붙을 때 연결한다.
-        if 0.0 < d <= GREEN_STUCK_M and v < STOP_SPEED:
+        # 다만 전방에 차량·보행자가 있으면 면책이므로 감시하지 않는다.
+        if self._blocked:
+            self._green_stuck_since = None
+        elif 0.0 < d <= GREEN_STUCK_M and v < STOP_SPEED:
             if self._green_stuck_since is None:
                 self._green_stuck_since = t
             elif t - self._green_stuck_since >= GREEN_STUCK_S:
@@ -493,7 +506,9 @@ class SignalPolicy:
         v_limit, accel_limit = _profile(avail, v)
 
         if v < STOP_SPEED and v_limit <= 0.0:
-            if self._hold_since is None:
+            if self._hold_since is None or self._blocked:
+                # 전방 객체에 막혀 못 가는 시간은 신호 대기로 세지 않는다.
+                # 세면 정지선을 놓아 버리고 객체가 비키는 순간 적색을 통과한다
                 self._hold_since = t
             elif t - self._hold_since >= self.max_hold:
                 # 완주가 최우선이다. -6점을 먹더라도 미완주는 피한다.
