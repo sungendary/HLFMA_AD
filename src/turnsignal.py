@@ -35,16 +35,24 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O가 없는 순수 로직�
 
 --- 겹칠 때 우선순위 ---
 
-**차선변경이 교차로 회전을 이긴다.** 항목 13이 강제하는 것은 차로 변경뿐이고
-회전 점등은 우리가 얹은 여유분이라, 양보시켜도 감점이 없다. 차선변경 구간이
-끝나는 그 프레임에 즉시 회전 방향으로 전환한다.
+**선행 점등 중에는 차선변경이 이긴다.** 항목 13이 강제하는 것은 차로 변경뿐이고,
+그 3초는 구간에 들어가기 **전에** 확보해야 한다. 그래서 s_ego가 아직 구간 시작
+앞이면 오늘까지의 규칙을 그대로 쓴다.
 
   · 같은 방향(좌차선변경 -> 좌회전)이면 두 구간이 이어져 연속 점등이 된다
-  · 반대 방향(우차선변경 -> 좌회전)이면 우측이 꺼지는 즉시 좌측이 켜진다.
-    이때 회전 점등이 잘리므로 turn_conflict 이벤트를 남긴다.
-    **경로 1에 실제로 있다** — 차선변경 right[734.3,754.3]이 좌회전
-    [736.9,767.8] **안에** 들어 있어, 좌회전 앞 17m를 우측 점등으로 지난다.
-    감점 항목이 아니라 그대로 두되 이벤트로 보이게 한다
+  · 반대 방향이면 turn_conflict 이벤트를 남긴다
+
+**구간에 들어간 뒤에는 실제 이동 방향이 이긴다.** 실차에서 99도 좌회전을 도는
+내내 우측 깜빡이가 켜져 있었다 — 경로 1의 차선변경 right[734.3,754.3]이 좌회전
+[736.9,767.8] **안에** 87% 들어 있기 때문이다. 램프 하나로 두 기동을 동시에
+알릴 수는 없으므로, 선행 3초를 이미 확보한 뒤에는 눈에 보이는 것(실제 횡이동)을
+따른다. 판정은 _lateral_ahead 하나이고, 넘길 때 turn_takeover를 남긴다.
+
+  · 넘긴 구간은 **후보에서 빠질 때까지 래치한다.** 조건이 사라졌을 때 풀면
+    obstacles의 크립 교착, crosswalks의 탈출 자기취소와 같은 채터링이 난다
+  · |횡이동| < OVERRIDE_M이면 애매하다고 보고 넘기지 않는다. 경로 1 s=650~675
+    (우측 차선변경의 선행 구간)이 +2.8~+5.4m로 좌를 가리키므로, 선행 보호가
+    없으면 멀쩡한 점등이 뒤집힌다
 
 --- 래치 ---
 
@@ -55,6 +63,7 @@ lead가 속도에 비례하므로(3.5초 x v) 접근 중 감속하면 lead가 �
 
 from __future__ import annotations
 
+import bisect
 import csv
 import math
 import os
@@ -78,6 +87,17 @@ NOISE_RAD = 0.0015          # rad/step, 이보다 작은 증분은 방향이 없
 TURN_GAP_M = 8.0            # m, run 안에서 이만큼 무방향이 이어지면 끊는다
 TURN_MAX_M = 70.0           # m, 이보다 긴 run은 교차로 회전이 아니라 도로 커브다.
                             # 연결로 실측이 23~32m이므로 넉넉하다
+
+# 방향 상충 해소 — "실제로 어디로 가고 있나"
+OVERRIDE_S = 3.0            # s, 앞을 내다보는 시간. 항목 13의 요건과 같은 값이다
+OVERRIDE_MIN_M = 20.0       # m, 저속 하한 (정지선 앞에 선 채로도 판정이 서야 한다)
+OVERRIDE_M = 2.0            # m, 이보다 작은 횡이동은 방향이 없다고 본다.
+                            # 차로폭 3.2의 절반보다 크고, 실측 애매대역
+                            # (경로 1에서 -1.2~+1.6m)보다 크다
+TAKEOVER_AFTER_M = 2.0      # m, 구간 시작을 이만큼 지난 뒤에 넘긴다.
+                            # **항목 13의 판정 시점이 구간 시작 그 프레임이다**
+                            # (check_signals.check_turn). 그 프레임까지는
+                            # 차선변경 방향이 켜져 있어야 선행 점등이 인정된다
 
 SIGNAL_NAME = {TURN_OFF: 'OFF', TURN_LEFT: 'LEFT', TURN_RIGHT: 'RIGHT'}
 SIGNAL_OF = {'left': TURN_LEFT, 'right': TURN_RIGHT}
@@ -225,6 +245,27 @@ def find_turns(path) -> list:
     return out
 
 
+def _lateral_ahead(path, s_ego: float, span_m: float) -> float:
+    """지금 헤딩 기준으로 span_m 앞 경로점의 부호 횡변위 [m]. **좌가 양수.**
+
+    부호 규약은 obstacles._project / route_check.nearest_on_route와 같다.
+    헤딩은 stoplines._path_heading을 그대로 쓴다 (길이 0 선분을 이미 방어한다).
+
+    이 값이 "다음 3초 안에 실제로 움직일 방향"이다. 차선변경이면 차로폭
+    (3.2m)만큼, 교차로 회전이면 그보다 훨씬 크게 나온다 — 경로 1 실측(창 37m)
+    에서 우측 차선변경이 -2.3~-5.8m, 99도 좌회전이 +22.9~+26.3m다.
+    """
+    n = len(path.pts)
+    i0 = max(0, min(n - 1, bisect.bisect_right(path.s, s_ego) - 1))
+    i1 = min(n - 1, bisect.bisect_left(path.s, path.s[i0] + span_m))
+    if i1 <= i0:
+        return 0.0
+    th = _path_heading(path, i0, HEAD_SPAN_M)
+    dx = path.pts[i1][0] - path.pts[i0][0]
+    dy = path.pts[i1][1] - path.pts[i0][1]
+    return -math.sin(th) * dx + math.cos(th) * dy
+
+
 def _merge(zones: list) -> list:
     """겹치는 같은 방향·같은 종류 구간을 하나로 합친다.
 
@@ -292,9 +333,23 @@ class TurnSignalPolicy:
     def reset(self) -> None:
         """리스폰 시 호출한다. 래치를 버린다."""
         self._active = None
+        self._forced = None         # 실제 이동 방향으로 넘겨받은 구간 (래치)
+        self._carry = None          # 경로 교체 직전의 점등 (signal, 점등 시각)
         self._on_t = 0.0
         self._on_s = 0.0
         self._announced = set()
+
+    def adopt(self, prev, t: float) -> None:
+        """경로 교체(우회) 시 직전 정책의 점등 상태를 이어받는다.
+
+        **램프는 실제로 꺼지지 않는다.** 새 정책이 점등 시각을 0으로 두면
+        로그에만 소등/점등이 찍히고 항목 13이 요구하는 "연속 점등 시간"도
+        끊겨 보인다. _switch의 same 분기와 같은 취지다. 구간(_active)은 옛
+        경로의 s 기준이라 가져오지 않고 방향과 시각만 넘겨받는다.
+        """
+        if prev is None or prev._active is None:
+            return
+        self._carry = (prev._active.signal, prev._on_t)
 
     def _announce(self, key, kind: str, detail: str) -> None:
         if key in self._announced:
@@ -322,6 +377,11 @@ class TurnSignalPolicy:
         """
         same = (self._active is not None
                 and self._active.signal == z.signal)
+        if not same and self._carry is not None:
+            if self._carry[0] == z.signal:      # 경로 교체 전과 같은 방향이다
+                same = True
+                self._on_t, self._on_s = self._carry[1], s_ego
+            self._carry = None
         if not same:
             self._finish(t, s_ego)
             self._on_t, self._on_s = t, s_ego
@@ -332,6 +392,47 @@ class TurnSignalPolicy:
             + ('구간 인계' if same else '점등')
             + f' — 구간 시작 {z.s_start - s_ego:.1f}m 앞 '
               f'(v={v * 3.6:.0f}km/h, lead {lead:.1f}m)')
+
+    def _takeover(self, best, cands: list, opp: list, s_ego: float,
+                  v: float, t: float):
+        """상충하는 후보 중 실제 이동 방향과 맞는 구간. 넘길 게 없으면 None.
+
+        **선행 점등 중에는 넘기지 않는다.** 항목 13이 강제하는 3초는 구간에
+        들어가기 전에 확보해야 하는데, 그 시점의 창은 아직 앞 기동을 보고 있어
+        방향이 반대로 나온다 (경로 1 s=650~675에서 +2.8~+5.4m).
+
+        보호는 두 겹이다. **(1)** best 구간 자체의 판정 시점(구간 시작)을
+        TAKEOVER_AFTER_M만큼 지나야 하고, **(2)** 같은 방향의 다른 차선변경이
+        아직 선행 점등을 기다리고 있으면 넘기지 않는다. 둘째가 없으면 경로 1의
+        첫 차선변경 꼬리(s=712, 횡이동 +3m)에서 미리 좌측으로 넘어가 s=734.3
+        차선변경의 선행 점등을 통째로 뺏는다 -- 실측으로 확인했다.
+        """
+        if s_ego < best.s_start + TAKEOVER_AFTER_M:
+            return None
+        if any(z.kind == 'lc' and z.signal == best.signal and s_ego < z.s_start
+               for z in cands):
+            return None
+        span = max(OVERRIDE_S * max(v, self.v_ref), OVERRIDE_MIN_M)
+        lat = _lateral_ahead(self.path, s_ego, span)
+        if abs(lat) < OVERRIDE_M:
+            return None                     # 애매하다. 오늘 그대로 둔다
+        want = TURN_LEFT if lat > 0.0 else TURN_RIGHT
+        if want == best.signal:
+            return None
+        alt = next((z for z in opp if z.signal == want), None)
+        if alt is None:                     # 신호는 좌/우뿐이라 보통 여기 안 온다
+            return None
+        lit = t - self._on_t if self._active is not None else 0.0
+        self._on_event(
+            'turn_takeover',
+            f'{KIND_NAME[best.kind]} {best.dir}'
+            f'[{best.s_start:.1f},{best.s_end:.1f}] -> '
+            f'{KIND_NAME[alt.kind]} {alt.dir}'
+            f'[{alt.s_start:.1f},{alt.s_end:.1f}] — '
+            f's={s_ego:.1f}m에서 실제 횡이동 {lat:+.1f}m/{span:.0f}m '
+            f'(창 {OVERRIDE_S:.1f}초, v={v * 3.6:.0f}km/h). '
+            f'{KIND_NAME[best.kind]} {best.dir} 점등 {lit:.1f}초는 이미 나갔다')
+        return alt
 
     def update(self, s_ego: float, v: float, t: float) -> TurnCmd:
         lead = max(self.lead_s * max(v, self.v_ref), self.lead_min)
@@ -346,6 +447,11 @@ class TurnSignalPolicy:
 
         if not cands:
             self._finish(t, s_ego)
+            if self._carry is not None:
+                self._on_event('turn_off',
+                               f'경로 교체로 이어받은 점등 소등 — '
+                               f'{t - self._carry[1]:.1f}초 점등')
+                self._carry = None
             return TurnCmd()
 
         # 차선변경이 교차로 회전을 이긴다. 같은 종류면 먼저 시작하는 구간
@@ -353,7 +459,22 @@ class TurnSignalPolicy:
         cands.sort(key=lambda z: (0 if z.kind == 'lc' else 1, z.s_start))
         best = cands[0]
 
-        if best.kind == 'lc':
+        # 넘겨받은 구간은 **후보에서 빠질 때까지** 유지한다. 횡이동이 애매해지는
+        # 프레임마다 원래 구간으로 돌아가면 램프가 떨린다.
+        if self._forced is not None:
+            if any(z is self._forced for z in cands):
+                best = self._forced
+            else:
+                self._forced = None
+
+        if self._forced is None:
+            opp = [z for z in cands if z.signal != best.signal]
+            alt = (self._takeover(best, cands, opp, s_ego, v, t)
+                   if opp else None)
+            if alt is not None:
+                self._forced = best = alt
+
+        if self._forced is None and best.kind == 'lc':
             for other in cands[1:]:
                 if other.kind == 'turn' and other.signal != best.signal:
                     # 회전이 뒤에 있으면 선행 점등이, 앞에 있으면 남은 점등이
@@ -366,8 +487,9 @@ class TurnSignalPolicy:
                         f'[{best.s_start:.1f},{best.s_end:.1f}]이 '
                         f'회전 {other.dir}'
                         f'[{other.s_start:.1f},{other.s_end:.1f}]을 밀어낸다 — '
-                        f'항목 13은 차선변경만 강제한다. '
-                        f'회전 점등 {max(0.0, lost):.1f}m 손실')
+                        f'선행 점등 중에는 차선변경이 이긴다(항목 13). '
+                        f'구간에 들어간 뒤 실제 이동이 반대면 넘긴다. '
+                        f'회전 점등 최대 {max(0.0, lost):.1f}m 손실')
                     break
 
         if best is not self._active:
@@ -408,18 +530,28 @@ def _plan(csv_path: str, segments: list, events_csv: str,
     for w in warn:
         print(f'[ts]   *** {w} ***')
 
-    # 방향이 어긋난 채 겹치는 구간. 항목 13은 차선변경만 강제하므로 그쪽이
-    # 이기고, 회전 점등의 선행이 잘린다.
+    # 방향이 어긋난 채 겹치는 구간. 선행 점등 중에는 차선변경이 이기고, 구간에
+    # 들어간 뒤에는 실제 횡이동이 이긴다. 여기서는 **구간 시작 시점의 횡이동**을
+    # 재서 런타임이 어느 쪽으로 넘길지 미리 보여 준다 (지시속도 45km/h 기준).
+    span = OVERRIDE_S * 12.5
     for i, a in enumerate(zones):
         for b in zones[i + 1:]:
             if b.s_start > a.s_end:
                 break
-            if a.signal != b.signal:
-                print(f'[ts]   *** 충돌: {KIND_NAME[a.kind]} {a.dir} '
-                      f'[{a.s_start:.1f},{a.s_end:.1f}] vs '
-                      f'{KIND_NAME[b.kind]} {b.dir} '
-                      f'[{b.s_start:.1f},{b.s_end:.1f}] — '
-                      f'{KIND_NAME[a.kind]}이 이긴다 ***')
+            if a.signal == b.signal:
+                continue
+            lat = _lateral_ahead(path, a.s_start, span)
+            if abs(lat) < OVERRIDE_M:
+                verdict = f'횡이동 {lat:+.1f}m — 애매해서 {KIND_NAME[a.kind]} 유지'
+            elif (lat > 0.0) == (a.signal == TURN_LEFT):
+                verdict = f'횡이동 {lat:+.1f}m — {KIND_NAME[a.kind]} 유지'
+            else:
+                verdict = (f'횡이동 {lat:+.1f}m — 구간 진입 후 '
+                           f'{KIND_NAME[b.kind]} {b.dir}로 넘긴다')
+            print(f'[ts]   *** 상충: {KIND_NAME[a.kind]} {a.dir} '
+                  f'[{a.s_start:.1f},{a.s_end:.1f}] vs '
+                  f'{KIND_NAME[b.kind]} {b.dir} '
+                  f'[{b.s_start:.1f},{b.s_end:.1f}] — {verdict} ***')
 
     if events_csv and os.path.exists(events_csv):
         import stoplines
@@ -578,6 +710,123 @@ def _selftest() -> int:
     zs, ws = load_lane_changes(path, manual)
     check('lc_dir 없는 CSV는 경고 없이 빈 목록', not zs and not ws,
           f'{len(zs)}구간 {len(ws)}경고')
+
+    # ------------------------------------------------------------------
+    # 11~17. 방향 상충 해소 (실차에서 좌회전 중 우측 깜빡이가 켜졌다)
+
+    def arc_path(sign=1.0, R=15.0):
+        """직선 99m -> 90도 회전 -> 직선 60m. sign>0이 좌회전."""
+        pts = [(i * 1.0, 0.0) for i in range(100)]
+        for k in range(1, 40):
+            a = k * (math.pi / 2) / 39
+            pts.append((99.0 + R * math.sin(a), sign * R * (1.0 - math.cos(a))))
+        for k in range(1, 61):
+            pts.append((99.0 + R, sign * (R + k * 1.0)))
+        return Path(pts)
+
+    def sig_at(hist, s0):
+        return next((g for _t, ss, g in hist if ss >= s0), TURN_OFF)
+
+    # 11. 부호 규약 — 좌가 양수. obstacles._project / route_check와 같다
+    left_p, right_p = arc_path(1.0), arc_path(-1.0)
+    lat_l = _lateral_ahead(left_p, 100.0, 37.5)
+    lat_r = _lateral_ahead(right_p, 100.0, 37.5)
+    lat_s = _lateral_ahead(path, 100.0, 37.5)
+    check('_lateral_ahead 부호 (좌회전 양수 / 우회전 음수 / 직선 0)',
+          lat_l > 5.0 and lat_r < -5.0 and abs(lat_s) < 0.1,
+          f'좌 {lat_l:+.1f}m / 우 {lat_r:+.1f}m / 직선 {lat_s:+.2f}m')
+
+    # 12~13. 우측 차선변경 마커가 좌회전 구간 안에 들어 있는 경우.
+    #        경로 1의 s=744.3이 실제로 이 모양이다.
+    tz = find_turns(left_p)[0]
+    lcz = TurnZone('lc', 'right', 95.0, 115.0, 95.0, 0.0)
+    rec3 = _Rec()
+    pol3 = TurnSignalPolicy(left_p, [lcz, tz], v_ref=12.5, on_event=rec3)
+    _on3, _r3, hist3 = _run(pol3, {}, lambda t: 12.5, length=175.0)
+
+    check('선행 점등 중에는 차선변경을 지킨다 (구간 시작 전)',
+          sig_at(hist3, 80.0) == TURN_RIGHT and sig_at(hist3, 94.0) == TURN_RIGHT,
+          f's=80 {SIGNAL_NAME[sig_at(hist3, 80.0)]} / '
+          f's=94 {SIGNAL_NAME[sig_at(hist3, 94.0)]}')
+    tk = [d for k, d in rec3.ev if k == 'turn_takeover']
+    check('구간에 들어간 뒤 실제 이동 방향으로 넘긴다',
+          sig_at(hist3, 102.0) == TURN_LEFT and len(tk) == 1,
+          f's=102 {SIGNAL_NAME[sig_at(hist3, 102.0)]} / '
+          f'turn_takeover {len(tk)}회')
+
+    # 14. 래치 — 넘긴 뒤에는 구간이 후보에서 빠질 때까지 유지한다.
+    #     조건이 사라졌을 때 풀면 obstacles/crosswalks가 냈던 채터링이 난다.
+    seg = [g for _t, ss, g in hist3 if 102.0 <= ss <= 122.0]
+    flips = sum(1 for a, b in zip(seg, seg[1:]) if a != b)
+    check('넘긴 뒤 램프가 떨리지 않는다 (래치)',
+          flips == 0 and seg and seg[0] == TURN_LEFT, f'전환 {flips}회')
+
+    # 15. 애매하면(직선) 넘기지 않는다 — 오늘 그대로 차선변경이 이긴다
+    rec4 = _Rec()
+    pol4 = TurnSignalPolicy(path,
+                            [TurnZone('lc', 'right', 100.0, 120.0, 100.0, 0.0),
+                             TurnZone('turn', 'left', 102.0, 140.0, 102.0, 0.0)],
+                            v_ref=12.5, on_event=rec4)
+    _o4, _r4, hist4 = _run(pol4, {}, lambda t: 12.5)
+    check('횡이동이 애매하면 넘기지 않는다',
+          sig_at(hist4, 110.0) == TURN_RIGHT
+          and not [1 for k, _d in rec4.ev if k == 'turn_takeover'],
+          f's=110 {SIGNAL_NAME[sig_at(hist4, 110.0)]}')
+    check('넘기지 않으면 turn_conflict는 그대로 난다',
+          'turn_conflict' in rec4.kinds())
+
+    # 16~17. 실제 경로 회귀. 경로 1은 고쳐지고 경로 2는 오늘과 같아야 한다.
+    from pure_pursuit import load_path
+    for name, marks in (
+            ('route_path_pt1.csv',
+             ((690.0, TURN_RIGHT, '우측 차선변경 중'),
+              (730.0, TURN_RIGHT, '둘째 차선변경 선행 보호'),
+              (734.3, TURN_RIGHT, '항목 13 판정 시점'),
+              (740.0, TURN_LEFT, '좌회전 진입 후'),
+              (760.0, TURN_LEFT, '좌회전 한복판'))),
+            ('route_path_pt2.csv',
+             ((610.0, TURN_RIGHT, '우회전 중'),
+              (670.0, TURN_LEFT, '좌측 차선변경 중'))),
+    ):
+        f = os.path.normpath(os.path.join(here, '..', 'data', name))
+        rp, _b = load_path(f, _segments_of(f))
+        rz, _w = build_zones(rp, f)
+        recr = _Rec()
+        polr = TurnSignalPolicy(rp, rz, v_ref=12.5, on_event=recr)
+        _o, _r, histr = _run(polr, {}, lambda t: 12.5, length=rp.length - 1.0)
+        for s0, want, why in marks:
+            got = sig_at(histr, s0)
+            check(f'{name} s={s0:.0f} {SIGNAL_NAME[want]} ({why})', got == want,
+                  SIGNAL_NAME[got])
+        if name.endswith('pt2.csv'):
+            check('경로 2는 넘기지 않는다 (상충이 선행 단계뿐)',
+                  not [1 for k, _d in recr.ev if k == 'turn_takeover'])
+
+    # 18. 경로 교체(우회) 시 점등 인계 — 램프는 실제로 꺼지지 않는다
+    zr = TurnZone('lc', 'right', 100.0, 120.0, 100.0, 0.0)
+    pol5 = TurnSignalPolicy(path, [zr], v_ref=12.5)
+    for k in range(120):                    # s=0..75, 점등은 s=56.2부터
+        pol5.update(k * 0.625, 12.5, k * 0.05)
+    def after_rebind(carry):
+        rec6 = _Rec()
+        pol6 = TurnSignalPolicy(path, [TurnZone('lc', 'right', 100.0, 120.0,
+                                                100.0, 0.0)],
+                                v_ref=12.5, on_event=rec6)
+        if carry:
+            pol6.adopt(pol5, 6.0)
+        for k in range(120, 260):
+            pol6.update(k * 0.625, 12.5, k * 0.05)
+        ons = [d for k, d in rec6.ev if k == 'turn_on']
+        offs = [d for k, d in rec6.ev if k == 'turn_off']
+        return ons, offs
+
+    ons_c, offs_c = after_rebind(True)
+    ons_n, offs_n = after_rebind(False)
+    check('경로 교체에서 점등 시각을 이어받는다 (인계)',
+          len(offs_c) == 1 and len(offs_n) == 1 and offs_c[0] != offs_n[0]
+          and '구간 인계' in ons_c[0] and '구간 인계' not in ons_n[0],
+          f'인계 {offs_c[0].split("— ")[-1]} / 미인계 '
+          f'{offs_n[0].split("— ")[-1]}')
 
     print('\n자기검사 ' + ('전부 통과' if ok else '실패 있음'))
     return 0 if ok else 1

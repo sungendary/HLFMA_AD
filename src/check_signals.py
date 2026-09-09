@@ -21,6 +21,20 @@ B 횡단보도 정차 (항목 12, 경미 -3)
 
 옛 로그에는 turn / cw_act 컬럼이 없다. 전부 get으로 읽어 그대로 0/빈칸으로
 떨어지게 둔다 — 베이스라인이 "점등 0초"로 나오는 것이 정확한 기록이다.
+
+--- 우회 주행 (leg 분할) ---
+
+detour.py가 경로를 갈아 끼우면 **그 뒤로는 원본 경로를 달리지 않는다.** 그런데
+meta.json의 waypoints는 일부러 원본으로 남긴다(우회로로 바꾸면 그 밖의 신호·충돌을
+아예 못 센다). 그래서 원본 경로로만 채점하면 **달린 적도 없는 차선변경이 미점등으로
+찍힌다** — logs/pp_20260909_152624가 실제로 2/2 FAIL로 나왔고, 제어기는 그때
+우회로의 차선변경에 정상 점등하고 있었다.
+
+meta.json의 detours[]가 교체 시각과 CSV를 기록하므로, 주행을 그 시각으로 **leg**로
+잘라 각 leg를 **그때 실제로 달린 경로**로 채점한다. 우회가 없으면 leg가 하나뿐이라
+예전과 글자 그대로 같은 출력이 나온다.
+
+--path / --events / --segments를 명시하면 leg 분할을 끄고 그 경로 하나로만 잰다.
 """
 
 from __future__ import annotations
@@ -73,16 +87,9 @@ def read_drive(session: str) -> list:
     return out
 
 
-def guess_inputs(session: str, waypoints: str, events: str,
+def guess_inputs(session: str, meta: dict, waypoints: str, events: str,
                  segments: list) -> tuple:
-    """meta.json에서 경로·구간·이벤트를 복원한다. (path, wp, ev)."""
-    meta = {}
-    try:
-        with io.open(os.path.join(session, 'meta.json'), encoding='utf-8') as fh:
-            meta = json.load(fh)
-    except (OSError, ValueError):
-        pass
-
+    """meta.json에서 첫 leg의 경로·이벤트·구간을 복원한다. (wp, ev, segs)."""
     wp = waypoints or meta.get('waypoints') or ''
     if not os.path.exists(wp):
         wp = os.path.join(session, 'waypoints.csv')
@@ -90,12 +97,46 @@ def guess_inputs(session: str, waypoints: str, events: str,
     if not os.path.exists(ev):
         cand = os.path.join(session, 'events_in.csv')
         ev = cand if os.path.exists(cand) else ''
-    segs = segments or meta.get('segments') or []
-    if not os.path.exists(wp) or not segs:
-        return None, wp, ev
-    from pure_pursuit import load_path
-    path, _bounds = load_path(wp, list(segs))
-    return path, wp, ev
+    return wp, ev, list(segments or meta.get('segments') or [])
+
+
+def read_meta(session: str) -> dict:
+    try:
+        with io.open(os.path.join(session, 'meta.json'), encoding='utf-8') as fh:
+            return json.load(fh)
+    except (OSError, ValueError):
+        return {}
+
+
+def legs_of(session: str, meta: dict, wp: str, ev: str, segs: list) -> list:
+    """주행 구간(leg) 목록. [{label, wp, ev, segs, t0, t1}, ...].
+
+    meta.detours[]가 없으면 leg 하나 = 예전 동작이다.
+
+    **CSV는 basename으로 세션 디렉터리 안에서 찾는다** — meta에 박힌 절대경로는
+    로그를 옮기면 깨진다. 이벤트 CSV는 detour_N_events.csv 규약을 그대로 쓴다
+    (detour.DetourPlanner._solve).
+    """
+    legs = [{'label': os.path.basename(wp) or 'waypoints.csv',
+             'wp': wp, 'ev': ev, 'segs': list(segs),
+             't0': float('-inf'), 't1': float('inf')}]
+    det = meta.get('detours') or []
+    for k, d in enumerate(det):
+        try:
+            t0 = float(d['t'])
+        except (KeyError, TypeError, ValueError):
+            continue
+        csv_path = os.path.join(session, os.path.basename(d.get('csv') or ''))
+        if not os.path.exists(csv_path):
+            print(f'      *** detours[{k}]의 {os.path.basename(csv_path)}가 '
+                  f'없다 — 그 leg는 앞 경로로 잰다 ***')
+            continue
+        ev_path = os.path.splitext(csv_path)[0] + '_events.csv'
+        legs[-1]['t1'] = t0
+        legs.append({'label': os.path.basename(csv_path), 'wp': csv_path,
+                     'ev': ev_path if os.path.exists(ev_path) else '',
+                     'segs': [], 't0': t0, 't1': float('inf')})
+    return legs
 
 
 def project(path, frames: list) -> None:
@@ -124,21 +165,30 @@ def expand(patterns: list) -> list:
 # ----------------------------------------------------------------------
 # A 방향지시등
 
-def check_turn(frames: list, zones: list) -> list:
-    """구간마다 (zone, 선행 점등 시간, 방향 일치 여부)."""
+def check_turn(frames: list, zones: list, partial: bool = False) -> list:
+    """구간마다 (zone, 선행 점등 시간, 방향 일치, 측정 가능).
+
+    partial=True면 이 프레임 묶음이 주행의 일부(leg)라는 뜻이다. **점등 방향이
+    맞는데 leg가 구간 시작 3초 앞을 못 덮으면 측정불가다** — 선행 점등이 앞
+    leg에 걸쳐 있는 것이지 위반이 아니다. 방향이 틀린 것은 그 프레임만 보면
+    되므로 leg가 짧아도 판정할 수 있다.
+    """
     out = []
     for z in zones:
         hit = next((i for i, f in enumerate(frames) if f['s'] >= z.s_start),
                    None)
         if hit is None:
-            out.append((z, float('nan'), False))
+            out.append((z, float('nan'), False, True))
             continue
         # 구간 시작 직전의 **연속** 점등만 센다. 중간에 꺼지면 거기서 끊긴다.
         j = hit
         while j > 0 and frames[j - 1]['turn'] == z.signal:
             j -= 1
-        lead = frames[hit]['t'] - frames[j]['t'] if frames[hit]['turn'] == z.signal else 0.0
-        out.append((z, lead, frames[hit]['turn'] == z.signal))
+        matched = frames[hit]['turn'] == z.signal
+        lead = frames[hit]['t'] - frames[j]['t'] if matched else 0.0
+        known = not (partial and matched and lead < LEAD_REQ_S
+                     and frames[hit]['t'] - frames[0]['t'] < LEAD_REQ_S)
+        out.append((z, lead, matched, known))
     return out
 
 
@@ -184,50 +234,99 @@ def report(session: str, waypoints: str, events: str, segments: list,
            junction: bool) -> dict:
     name = os.path.basename(os.path.normpath(session))
     frames = read_drive(session)
+    tally = {'lc_fail': 0, 'lc_total': 0, 'lc_unknown': 0,
+             'xw_viol': 0, 'xw_total': 0}
     if not frames:
         print(f'  {name}: drive.csv가 비어 있다')
-        return {'lc_fail': 0, 'lc_total': 0, 'xw_viol': 0, 'xw_total': 0}
+        return tally
 
-    path, wp, ev = guess_inputs(session, waypoints, events, segments)
-    if path is None:
-        print(f'  {name}: 경로를 복원할 수 없다 (waypoints/segments)')
-        return {'lc_fail': 0, 'lc_total': 0, 'xw_viol': 0, 'xw_total': 0}
-    project(path, frames)
+    meta = read_meta(session)
+    wp, ev, segs = guess_inputs(session, meta, waypoints, events, segments)
+    # 경로를 손으로 지정했으면 leg 분할을 끄고 그 경로 하나로만 잰다.
+    manual = bool(waypoints or events or segments)
+    legs = ([{'label': os.path.basename(wp), 'wp': wp, 'ev': ev,
+              'segs': list(segs), 't0': float('-inf'), 't1': float('inf')}]
+            if manual else legs_of(session, meta, wp, ev, segs))
 
-    zones, _w = turnsignal.build_zones(path, wp, junction=junction)
-    rows = check_turn(frames, zones)
-    lc_fail = lc_total = 0
+    print(f'  {name}  {len(frames)}프레임 {frames[-1]["t"]:.1f}초'
+          + (f'  (leg {len(legs)}개 — 우회 {len(legs) - 1}회)'
+             if len(legs) > 1 else ''))
 
-    print(f'  {name}  {len(frames)}프레임 {frames[-1]["t"]:.1f}초 '
-          f'{frames[-1]["s"]:.1f}m')
+    from pure_pursuit import load_path
+    stray = 0.0
+    lc_rows, xw_rows_all = [], []
+    for k, leg in enumerate(legs):
+        fr = [f for f in frames if leg['t0'] <= f['t'] < leg['t1']]
+        lsegs = leg['segs'] or (turnsignal._segments_of(leg['wp'])
+                                if os.path.exists(leg['wp']) else [])
+        if not fr or not os.path.exists(leg['wp']) or not lsegs:
+            print(f'    leg {k + 1} {leg["label"]}: 경로를 복원할 수 없다')
+            continue
+        path, _bounds = load_path(leg['wp'], list(lsegs))
+        project(path, fr)
+        s_lo = min(f['s'] for f in fr)
+        s_hi = max(f['s'] for f in fr)
+        if len(legs) > 1:
+            print(f'    leg {k + 1}  {leg["label"]}  '
+                  f's {s_lo:.1f}~{s_hi:.1f}m  '
+                  f't {max(0.0, fr[0]["t"]):.1f}~{fr[-1]["t"]:.1f}초')
+
+        all_zones, _w = turnsignal.build_zones(path, leg['wp'],
+                                               junction=junction)
+        # **그 leg에서 실제로 지난 구간만** 채점한다. 우회로 교체 뒤의 옛 경로
+        # 구간을 세면 달린 적 없는 차선변경이 미점등으로 찍힌다.
+        zones = [z for z in all_zones if s_lo <= z.s_start <= s_hi]
+        lc_rows.extend((k, r) for r in
+                       check_turn(fr, zones, partial=len(legs) > 1))
+        # 구간 밖 점등은 **거르지 않은** 구간 목록으로 잰다. leg가 끝나기 전에
+        # 켜 둔 선행 점등(그 구간은 다음 leg에서 사라진다)까지 세면 안 된다.
+        stray += stray_signal(fr, all_zones)
+
+        xw_zones = ([] if not leg['ev']
+                    else crosswalks.load_for_path(path, leg['ev'])[0])
+        # **중심이 아니라 겹침으로 고른다.** det_many8에서 차가 s=129.5에 섰는데
+        # 횡단보도 중심이 s=131.5라, 중심으로 걸렀더니 22.55초짜리 실제 위반이
+        # 통째로 빠졌다. 후륜축이 구간 안에 있으면 위반이다.
+        xw_zones = [z for z in xw_zones if z.s0 <= s_hi and z.s1 >= s_lo]
+        xw_rows_all.extend((k, r) for r in check_crosswalk(fr, xw_zones))
+
     print('    A 방향지시등 (항목 13)')
-    for z, lead, matched in rows:
+    for k, (z, lead, matched, known) in lc_rows:
         req = (z.kind == 'lc')
-        lc_total += 1 if req else 0
-        bad = req and not (matched and lead >= LEAD_REQ_S)
-        lc_fail += 1 if bad else 0
+        if req and known:
+            tally['lc_total'] += 1
+        bad = req and known and not (matched and lead >= LEAD_REQ_S)
+        tally['lc_fail'] += 1 if bad else 0
+        tally['lc_unknown'] += 1 if (req and not known) else 0
         mark = ('FAIL' if bad else 'PASS') if req else '   .'
+        if req and not known:
+            mark = '  ??'
         print(f'      {mark}  s={z.s_start:7.1f}m  '
-              f'{turnsignal.KIND_NAME[z.kind]:6s} {z.dir:5s}  '
-              f'선행 {lead:5.2f}초'
-              + ('' if matched else '  ← 미점등/방향 불일치'))
-    stray = stray_signal(frames, zones)
+              + (f'[leg {k + 1}] ' if len(legs) > 1 else '')
+              + f'{turnsignal.KIND_NAME[z.kind]:6s} {z.dir:5s}  '
+                f'선행 {lead:5.2f}초'
+              + ('' if matched else '  ← 미점등/방향 불일치')
+              + ('  ← leg가 3초 앞을 못 덮는다 (측정불가)'
+                 if req and not known else ''))
+    if not lc_rows:
+        print('      점등 구간 없음')
     if stray > 0.5:
         print(f'      (구간 밖 점등 {stray:.1f}초 — 감점 항목은 아니다)')
 
-    xw_zones, _w2 = ([], []) if not ev else crosswalks.load_for_path(path, ev)
-    xw_rows = check_crosswalk(frames, xw_zones)
-    xw_viol = sum(1 for _z, d, _a in xw_rows if d >= DWELL_REQ_S)
     print('    B 횡단보도 정차 (항목 12)')
-    if not xw_zones:
+    if not xw_rows_all:
         print('      횡단보도 없음 (이벤트 CSV 미지정)')
-    for z, dwell, act in xw_rows:
+    for k, (z, dwell, act) in xw_rows_all:
+        tally['xw_total'] += 1
+        if dwell >= DWELL_REQ_S:
+            tally['xw_viol'] += 1
         mark = 'VIOL' if dwell >= DWELL_REQ_S else 'ok  '
-        print(f'      {mark}  s={z.s:7.1f}m  최장 정차 {dwell:5.2f}초'
+        print(f'      {mark}  s={z.s:7.1f}m  '
+              + (f'[leg {k + 1}] ' if len(legs) > 1 else '')
+              + f'최장 정차 {dwell:5.2f}초'
               + (f'  cw_act={act}' if act else ''))
 
-    return {'lc_fail': lc_fail, 'lc_total': lc_total,
-            'xw_viol': xw_viol, 'xw_total': len(xw_zones)}
+    return tally
 
 
 def main() -> None:
@@ -248,7 +347,8 @@ def main() -> None:
     segs = [s.strip() for s in args.segments.split(',') if s.strip()]
 
     def run(label, sessions):
-        tally = {'lc_fail': 0, 'lc_total': 0, 'xw_viol': 0, 'xw_total': 0}
+        tally = {'lc_fail': 0, 'lc_total': 0, 'lc_unknown': 0,
+                 'xw_viol': 0, 'xw_total': 0}
         if not sessions:
             return tally
         print(f'\n== {label}')
@@ -269,6 +369,10 @@ def main() -> None:
               f'{base["xw_viol"]:>12d}/{base["xw_total"]:<5d}')
     print(f'{"대상":14s}{cur["lc_fail"]:>10d}/{cur["lc_total"]:<5d}'
           f'{cur["xw_viol"]:>12d}/{cur["xw_total"]:<5d}')
+    unknown = base['lc_unknown'] + cur['lc_unknown']
+    if unknown:
+        print(f'  차선변경 {unknown}건은 leg 경계에 걸려 측정불가라 뺐다 '
+              f'(우회 교체가 구간 시작 3초 안에 일어났다)')
     raise SystemExit(1 if (cur['lc_fail'] or cur['xw_viol']) else 0)
 
 

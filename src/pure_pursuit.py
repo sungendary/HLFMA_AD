@@ -494,6 +494,10 @@ def run(args) -> None:
                         end_heading = nb['end_heading']
                         seg_starts = [st for _nm, st in bounds]
                         policy, obs_policy = nb['sig'], nb['obs']
+                        # 램프는 교체로 꺼지지 않는다. 방향이 같으면 점등
+                        # 시각을 이어받아 로그에 없는 깜빡임을 만들지 않는다.
+                        if nb['turn'] is not None:
+                            nb['turn'].adopt(turn_policy, t)
                         turn_policy, xw_policy = nb['turn'], nb['xw']
                         det_policy.rebind(path, plan.rows, plan.zones, bounds)
                         idx = None          # 리스폰과 같은 전역 재탐색
@@ -509,6 +513,13 @@ def run(args) -> None:
                             'first_lc_m': round(plan.first_lc_m, 1),
                             'tight': plan.tight, 'blocked': plan.blocked})
                         log.note('detours', detours_meta)
+                        # 시작 시 값이 남아 있으면 "정책이 재구성되지 않았다"는
+                        # 오해의 근거가 된다. 실제로 한 번 그랬다.
+                        log.note('path_points', len(path.pts))
+                        log.note('path_length_m', round(path.length, 2))
+                        log.note('stoplines', nb['n_sl'])
+                        log.note('turn_zones', nb['n_tz'])
+                        log.note('crosswalks', nb['n_xw'])
 
                 if idx is None:                     # 시작 / 리스폰 후 전역 탐색
                     idx = path.nearest(frame.ego_x, frame.ego_y)
