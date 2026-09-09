@@ -39,7 +39,8 @@ DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'tgt_x', 'tgt_y', 'ld', 'steer', 'accel', 'tl_id', 'tl_state',
               'n_obj', 'tl_act', 'tl_dist',
               'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat',
-              'turn', 'turn_src', 'cw_act', 'cw_dist']
+              'turn', 'turn_src', 'cw_act', 'cw_dist',
+              'dt_act', 'dt_dist']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -148,7 +149,8 @@ class SessionLog:
                   ob_act: str = '', ob_kind: str = '', ob_id: int = -1,
                   ob_dist: float = NAN, ob_lat: float = NAN,
                   turn: int = 0, turn_src: str = '',
-                  cw_act: str = '', cw_dist: float = NAN) -> None:
+                  cw_act: str = '', cw_dist: float = NAN,
+                  dt_act: str = '', dt_dist: float = NAN) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -168,7 +170,8 @@ class SessionLog:
                 frame.tl_id, frame.tl_state, len(frame.objects),
                 tl_act, tl_dist,
                 ob_act, ob_kind, ob_id, ob_dist, ob_lat,
-                turn, turn_src, cw_act, cw_dist)])
+                turn, turn_src, cw_act, cw_dist,
+                dt_act, dt_dist)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (
@@ -224,7 +227,12 @@ class SessionLog:
 
         횡단보도 정차 금지(crosswalks.py)가 내는
         xw_guard / xw_guard_infeasible / xw_dwell / crosswalk_escape /
-        xw_escape_blocked / xw_clear 중 하나.
+        xw_escape_blocked / xw_clear,
+
+        영구 정지 객체 우회(detour.py)가 내는
+        detour_start / detour_done / detour_failed / detour_impossible /
+        detour_tight / detour_solid_lc / detour_ld_boost / detour_ld_restore /
+        last_resort_pass / last_resort_clear 중 하나.
         """
         if not self.enabled:
             return

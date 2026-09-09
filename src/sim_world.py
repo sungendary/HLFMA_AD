@@ -260,6 +260,107 @@ class ObjectTrack:
 
 
 # ----------------------------------------------------------------------
+# 합성 객체 주입
+
+OBJ_RANGE_M = 80.0          # 9910 명세의 수신 반경. 이 밖은 넣지 않는다
+INJECT_ID_BASE = 900        # 녹화 id와 겹치지 않게
+
+
+class Injected:
+    """경로 위에 놓는 합성 정지 객체.
+
+    녹화 로그에는 **경로를 막는 정지 차량이 하나도 없다** (사전테스트 6세션
+    전부). 우회를 검증하려면 만들어 넣는 수밖에 없다. --objects 재생 블록의
+    빈 슬롯에 끼워 넣으므로 재생 자체는 그대로 간다.
+    """
+
+    __slots__ = ('id', 'x', 'y', 'heading', 'speed', 'length', 'width',
+                 'height')
+
+    def __init__(self, oid, x, y, heading, speed, length, width, height):
+        self.id = oid
+        self.x, self.y, self.heading = x, y, heading
+        self.speed = speed
+        self.length, self.width, self.height = length, width, height
+
+    @classmethod
+    def parse(cls, spec: str, path, oid: int) -> 'Injected':
+        """s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7] -> 월드 좌표로 고정.
+
+        s(경로 호길이)와 lat(부호 횡거리, 좌가 양수)을 시작 시 한 번만
+        (x,y,heading)으로 바꾼다. 이후 움직이지 않는다.
+        """
+        kv = {}
+        for part in spec.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '=' not in part:
+                raise SystemExit(f'--inject-object 형식 오류: {part!r} '
+                                 '(s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0)')
+            k, val = part.split('=', 1)
+            kv[k.strip()] = float(val)
+        if 's' not in kv:
+            raise SystemExit(f'--inject-object 에는 s= 가 필요하다: {spec!r}')
+
+        s = kv['s']
+        lat = kv.get('lat', 0.0)
+        i = 0
+        while i < len(path.pts) - 2 and path.s[i + 1] < s:
+            i += 1
+        ax, ay = path.pts[i]
+        bx, by = path.pts[i + 1]
+        seg = max(1e-6, path.s[i + 1] - path.s[i])
+        u = min(1.0, max(0.0, (s - path.s[i]) / seg))
+        hx, hy = ax + u * (bx - ax), ay + u * (by - ay)
+        th = math.atan2(by - ay, bx - ax)
+        # 부호 규약은 obstacles._project 와 같다 (진행방향 좌측이 양수)
+        x = hx - math.sin(th) * lat
+        y = hy + math.cos(th) * lat
+        return cls(int(kv.get('id', oid)), x, y, th, kv.get('v', 0.0),
+                   kv.get('l', 4.39), kv.get('w', 1.81), kv.get('h', 1.35))
+
+    def __repr__(self) -> str:
+        return (f'<Injected {self.id} ({self.x:.1f},{self.y:.1f}) '
+                f'{self.length:.2f}x{self.width:.2f}x{self.height:.2f} '
+                f'v={self.speed:.1f}>')
+
+
+def overlay(block: bytes, objs: list, ego) -> bytes:
+    """1080B 블록의 빈 슬롯(id==0)에 합성 객체를 끼워 넣는다.
+
+    빈 슬롯이 없으면 가장 먼 녹화 객체를 밀어낸다 -- 실제 VTD도 가까운 순
+    30개만 주므로 같은 규칙이다.
+    """
+    if not objs:
+        return block
+    near = [o for o in objs
+            if math.hypot(o.x - ego.x, o.y - ego.y) <= OBJ_RANGE_M]
+    if not near:
+        return block
+    buf = bytearray(block)
+    free, far = [], []
+    for k in range(OBJECT_SLOTS):
+        off = k * OBJ.size
+        oid, ox, oy = OBJ.unpack_from(buf, off)[:3]
+        if oid == 0:
+            free.append(k)
+        else:
+            far.append((math.hypot(ox - ego.x, oy - ego.y), k))
+    far.sort(reverse=True)
+    for o in near:
+        if free:
+            k = free.pop(0)
+        elif far:
+            k = far.pop(0)[1]
+        else:
+            break
+        OBJ.pack_into(buf, k * OBJ.size, o.id, o.x, o.y, 0.0, o.heading,
+                      o.speed, o.length, o.width, o.height)
+    return bytes(buf)
+
+
+# ----------------------------------------------------------------------
 
 def pack_frame(ego: EgoSim, objects: bytes, tl_id: int, tl_state: int) -> bytes:
     """9910 수신 형식 그대로 1109B를 만든다."""

@@ -188,6 +188,12 @@ def build_sim(args):
     track = sim_world.ObjectTrack.from_session(
         args.objects_from or args.tl_from, path, args.objects)
 
+    # 합성 정지 객체. 녹화 로그에는 경로를 막는 정지 차량이 하나도 없어
+    # 우회를 검증할 방법이 이것뿐이다.
+    injected = [sim_world.Injected.parse(spec, path,
+                                         sim_world.INJECT_ID_BASE + k)
+                for k, spec in enumerate(args.inject_object or ())]
+
     print(f'[sim] 경로 {path.length:.1f}m ({len(segs)}구간), '
           f'정지선 {len(sl_list)}개 중 신호 {len(src.sl)}개')
     print('[sim] 신호 위상표'
@@ -195,11 +201,16 @@ def build_sim(args):
     for line in sched.describe():
         print('[sim]' + line)
     print(f'[sim] 객체 재생 모드={track.mode} 프레임={len(track.blocks)}')
-    return path, sl_list, src, track
+    for o in injected:
+        i = path.nearest(o.x, o.y)
+        print(f'[sim] 주입 id={o.id} s={path.s[i]:.1f}m '
+              f'({o.x:.1f},{o.y:.1f}) '
+              f'{o.length:.2f}x{o.width:.2f}x{o.height:.2f} v={o.speed:.1f}')
+    return path, sl_list, src, track, injected
 
 
 def serve_sim(conn: socket.socket, ctx, args) -> None:
-    path, _sl_list, src, track = ctx
+    path, _sl_list, src, track, injected = ctx
     stats = ControlStats()
     alive = threading.Event()
     alive.set()
@@ -222,7 +233,7 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
         idx = path.nearest(ego.x, ego.y, start=idx)
         s_ego = path.s[idx]
         tl_id, tl_state = src.sample(s_ego, sim_t)
-        blob = track.at(s_ego, sim_t)
+        blob = sim_world.overlay(track.at(s_ego, sim_t), injected, ego)
         try:
             conn.sendall(sim_world.pack_frame(ego, blob, tl_id, tl_state))
         except OSError:
@@ -304,6 +315,10 @@ def main() -> None:
     sim.add_argument('--tl-acquire', type=float,
                      default=sim_world.DEFAULT_ACQUIRE_M,
                      help='신호를 보고하기 시작하는 거리 [m]')
+    sim.add_argument('--inject-object', action='append', metavar='SPEC',
+                     help='경로 위에 합성 정지 객체를 놓는다. 반복 지정 가능. '
+                          's=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7] '
+                          '(s=경로 호길이, lat=부호 횡거리 좌가 양수)')
     sim.add_argument('--objects', choices=('s', 't', 'none'), default='s',
                      help='objects[] 재생 색인: s=진행거리 t=시간 none=없음')
     sim.add_argument('--objects-from', default='',

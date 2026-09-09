@@ -426,14 +426,27 @@ class RouteResult:
 
 
 def find_route(g: Graph, idx: LaneIndex, cps: list[tuple[float, float]],
-               n_roads: int = SNAP_ROADS) -> tuple[RouteResult | None, int]:
+               n_roads: int = SNAP_ROADS,
+               pin: dict[int, set] | None = None) -> tuple[RouteResult | None, int]:
     """계층 다익스트라. 상태 = (node, k), k = 만족한 경유지 수.
 
     경유지 좌표는 비용에 넣지 않고 "그 도로/섹션을 지난다"는 제약으로만 쓴다.
     두 번째 반환값은 탐색이 막힌 경유지 index (성공이면 -1).
+
+    pin은 특정 경유지의 후보를 주어진 노드 집합으로 좁힌다. 기본값 None이면
+    예전과 완전히 같다. 런타임 우회 재탐색(detour.py)이 **출발 차로를 ego가
+    실제로 있는 차로(와 그 옆 차로)로 묶는 데** 쓴다 — 안 그러면 다익스트라가
+    차선변경 비용을 물지 않고 출발 후보 중 가장 싼 차로를 골라, 경로가 첫
+    점에서 몇 차로씩 옆으로 튄다. 좁힌 결과가 비면 제약을 버린다. 탐색을
+    실패시키는 것보다 낫다.
     """
     C = [snap_candidates(idx, x, y, leg_heading(cps, k), n_roads)
          for k, (x, y) in enumerate(cps)]
+    for k, allow in (pin or {}).items():
+        if 0 <= k < len(C):
+            keep = {n: v for n, v in C[k].items() if n in allow}
+            if keep:
+                C[k] = keep
     for k, c in enumerate(C):
         if not c:
             return None, k
