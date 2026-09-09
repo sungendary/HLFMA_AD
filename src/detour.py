@@ -38,6 +38,14 @@ obstacles.py는 앞차가 안 비키면 크립으로 CREEP_GAP(2m)까지 접근�
    3.2m 오프셋에서 조향이 한계 0.35 rad에 붙는다. 그래서 (a) 정지를 기다리지
    않고 접근 중에 먼저 발동하고, (b) 그래도 촉박하면 lookahead를 일시 상향한다.
 
+5. **제한은 "총 횟수"가 아니라 "같은 지점의 반복"에 걸어야 한다.** 총 3회로
+   묶었더니 네 번째 정지 차량에서 대응하지 못하고 영구 정지했다. 전체는 20회
+   (실질 무제한)로 두고 **같은 객체 id에 3회**로 좁힌다(_Hist).
+
+6. **녹색인데 못 가면 그것은 신호 대기가 아니라 객체 교착이다.** 정지선 35m
+   앞에서 차량에 막혔는데 sig.stopping이 참이라 확인 타이머와 안전망 누적이
+   둘 다 멈췄다. GO_STATES(3/5)일 때는 얼리지 않는다.
+
 --- 이 모듈이 min() 합류에 끼지 않는 이유 ---
 
 우회는 속도 정책이 아니다. v_limit을 내지 않는다. 대신 두 가지를 낸다.
@@ -65,8 +73,14 @@ BLOCK_CORRIDOR_M = 1.5      # m, 차체가 실제로 쓸어가는 반폭. obstac
 STOPPED_MS = 0.3            # m/s, 이 아래면 정지. 움직이는 객체는 대상 아니다 --
                             # 횡단 중 보행자를 우회하면 항목 10 중대 -6점이다
 DETOUR_LOOKAHEAD_M = 60.0   # m, 이 안의 객체만 본다 (obstacles.LOOKAHEAD_M과 같게)
-MAX_DETOURS = 3             # 무한 재탐색 방지
-MAX_TRIES_PER_OBJ = 2       # 접근 중 1회 + 정지 후 1회
+# **제한의 대상은 "총 몇 번 우회했나"가 아니라 "같은 지점에서 같은 답을 반복해서
+# 받나"다.** 처음에 총 3회로 묶었더니 네 번째 정지 차량에서 대응하지 못하고 영구
+# 정지했다 -- 완주 그룹은 미완주 그룹보다 항상 상위라 그쪽이 훨씬 나쁘다.
+MAX_DETOURS = 20            # 실질 무제한. 차폭 경계에서 진동하는 객체가 리셋을
+                            # 반복하는 병리적 경우의 유일한 상한으로만 남긴다
+MAX_TRIES_PER_OBJ = 3       # 같은 객체 id에 대한 재탐색 요청 횟수
+TRIES_RESET_S = 3.0         # s, 이만큼 후보에서 사라지면 그 객체 기록을 버린다.
+                            # "정상 주행 복귀"의 정의다 -- 아래 _Hist 참고
 RETRY_MIN_S = 5.0           # s, 재시도 사이 최소 간격. 같은 입력으로 곧바로
                             # 다시 풀어 봐야 같은 답이 나온다
 
@@ -103,7 +117,8 @@ LD_RESTORE_N = 5            # 프레임, 연속 이만큼 유지돼야 복원
 LD_BOOST_MAX_S = 10.0       # s, 상한
 
 # 최후 안전망
-LAST_RESORT_S = 20.0        # s, 이만큼 정지가 지속되면 밀고 나간다
+LAST_RESORT_S = 10.0        # s, 이만큼 정지가 지속되면 밀고 나간다. 20초는
+                            # 길었다 -- 15분 예산에서 여러 번 발동하면 손실이 크다
 LAST_RESORT_V = 5.0 / 3.6   # m/s, 5km/h
 LR_EXIT_M = 3.0             # m, 객체를 이만큼 지나면 해제
 
@@ -688,10 +703,13 @@ LR_NEAR_M = 15.0            # m, 이 안에 있는 확정 막힘만 최후 안�
 
 
 class _B:
-    """막힘 후보 하나. 확인 시간(acc)이 핵심이다."""
+    """막힘 후보 하나. 확인 시간(acc)이 핵심이다.
 
-    __slots__ = ('id', 'x', 'y', 's', 'lat', 'd', 'kind', 'acc', 'tries',
-                 'missing', 'last_try')
+    **경로가 바뀌면 통째로 버린다** -- s/lat/d가 전부 옛 경로 기준이다.
+    경로 교체를 넘어 살아야 하는 것(시도 횟수)은 _Hist에 둔다.
+    """
+
+    __slots__ = ('id', 'x', 'y', 's', 'lat', 'd', 'kind', 'acc', 'missing')
 
     def __init__(self, oid, x, y, s, lat, d, kind, t):
         self.id = oid
@@ -699,9 +717,28 @@ class _B:
         self.s, self.lat, self.d = s, lat, d
         self.kind = kind
         self.acc = 0.0          # 조건을 만족한 누적 시간 [s]
+        self.missing = 0        # 안 보인 연속 프레임 수
+
+
+class _Hist:
+    """객체별 기록. **경로 교체(rebind)를 넘어 산다.**
+
+    시도 횟수를 _B에 두면 우회에 성공하는 순간 0으로 돌아간다 -- rebind가
+    _B를 통째로 버리기 때문이다. MAX_DETOURS를 20으로 올린 지금 그대로 두면
+    같은 객체가 계속 차폭 안에 남을 때 20회까지 무한 루프를 돈다.
+
+    **리셋은 "그 객체가 후보에서 사라졌을 때"다** (TRIES_RESET_S). 우회에
+    성공하면 그 객체는 필요 여유(2.3/1.8/1.5m) 밖이라 즉시 후보에서 빠진다.
+    "움직이기 시작했을 때"로 잡으면 obstacles의 크립 교착, crosswalks의 탈출
+    자기취소와 똑같은 실수가 된다.
+    """
+
+    __slots__ = ('tries', 'last_try', 'gone_s')
+
+    def __init__(self):
         self.tries = 0
         self.last_try = -1e9    # 마지막 재탐색 요청 시각
-        self.missing = 0        # 안 보인 연속 프레임 수
+        self.gone_s = 0.0       # 후보에서 사라져 있은 시간 [s]
 
 
 class DetourPolicy:
@@ -734,6 +771,7 @@ class DetourPolicy:
     def reset(self) -> None:
         """리스폰 시. 위치가 강제로 옮겨졌으므로 관측을 전부 버린다."""
         self._blocks: dict = {}
+        self._hist: dict = {}           # id -> _Hist. rebind를 넘어 산다
         self._last_t = None
         self._pending: tuple = ()
         self._failed: set = set()       # 재탐색이 실패한 객체
@@ -746,6 +784,18 @@ class DetourPolicy:
         self._ld_until = 0.0
         self._ld_ok = 0
 
+    def _persist(self, oid: int) -> '_Hist':
+        """영속 기록을 연다.
+
+        **_failed/_impossible에 넣을 때는 반드시 이걸 거친다.** 정리 루프가
+        _hist를 훑으므로, 항목 없이 집합에만 넣으면 그 id는 영영 지워지지 않고
+        (우회 불가로 한 번 찍힌 객체를 지나쳐도) 다시 시도할 수 없게 된다.
+        """
+        h = self._hist.get(oid)
+        if h is None:
+            h = self._hist[oid] = _Hist()
+        return h
+
     def _announce(self, key, kind: str, detail: str) -> None:
         if key in self._announced:
             return
@@ -757,14 +807,18 @@ class DetourPolicy:
 
         **lookahead 상향과 최후 안전망 래치는 남긴다.** poll()이 켠 상향을
         reset()이 곧바로 지워 조향 보정이 한 프레임도 걸리지 않은 적이 있다.
+        **객체별 시도 횟수(_hist)도 남긴다** -- 여기서 버리면 우회 성공마다
+        0으로 돌아가 같은 객체를 무한히 다시 푼다.
         """
         keep_lr = (self._lr_id, self._lr_acc)
         keep_ld = (self._ld_on, self._ld_until, self._ld_ok)
         failed, impossible, n = self._failed, self._impossible, self.n_detours
+        hist = self._hist       # 시도 횟수는 경로 교체를 넘어 살아야 한다
         self.reset()
         self.path, self.rows, self.zones = path, rows, zones
         self.bounds = bounds
         self._failed, self._impossible = failed, impossible
+        self._hist = hist
         self.n_detours = n
         self._lr_id, self._lr_acc = keep_lr
         self._ld_on, self._ld_until, self._ld_ok = keep_ld
@@ -783,15 +837,29 @@ class DetourPolicy:
     # -- 매 프레임 ------------------------------------------------------
     def update(self, idx: int, s_ego: float, v: float, ego_x: float,
                ego_y: float, objects, t: float, *, sig_stopping: bool = False,
-               obs=None, finished: bool = False) -> DetourCmd:
+               sig_green: bool = False, obs=None,
+               finished: bool = False) -> DetourCmd:
+        """sig_green은 **stoplines.GO_STATES = {3 녹색, 5 녹색+좌회전}**이다.
+
+        4(좌회전 전용)는 여기 들어가지 않는다. 직진 차로에서 4는 실질적으로
+        적색이고 그 판단은 stoplines의 기동 분류가 이미 한다 -- 직진이면
+        _stop으로 가 sig_stopping이 참이 되고, 좌회전 기동이면 _go라 거짓이다.
+        그래서 4를 위한 분기가 따로 필요 없다.
+
+        **녹색인데 못 가고 있으면 그것은 신호 대기가 아니라 객체 교착이다.**
+        정지선 35m 앞에서 차량에 막혔는데 sig.stopping이 참이라 확인 타이머와
+        안전망 누적이 둘 다 멈춘 적이 있다. tl_go(GREEN+LEFT)가 난 뒤에도 차가
+        움직이지 않은 것이 결정적 증거다.
+        """
         dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
         self._last_t = t
+        sig_wait = sig_stopping and not sig_green
 
         cands = self._candidates(idx, s_ego, ego_x, ego_y, objects)
-        self._track(cands, dt, sig_stopping, t)
+        self._track(cands, dt, sig_wait, t)
 
         cmd = DetourCmd()
-        self._last_resort(v, dt, sig_stopping, obs, finished, cmd)
+        self._last_resort(v, dt, sig_wait, obs, finished, cmd)
         if self._ld_on:
             cmd.ld_min = DETOUR_LD_M
             self._ld_check(idx, ego_x, ego_y, t)
@@ -838,7 +906,7 @@ class DetourPolicy:
             out[o.id] = (o.x, o.y, s_obj, lat, d, OB.classify(o))
         return out
 
-    def _track(self, cands: dict, dt: float, sig_stopping: bool,
+    def _track(self, cands: dict, dt: float, sig_wait: bool,
                t: float) -> None:
         for oid in list(self._blocks):
             if oid in cands:
@@ -848,6 +916,18 @@ class DetourPolicy:
             if b.missing <= OB.TRACK_GRACE:
                 continue        # 한 프레임 튀었다고 8초 확인을 버리지 않는다
             del self._blocks[oid]
+
+        # 객체별 기록은 _blocks보다 오래 산다. **경로를 갈아 끼우면 _blocks는
+        # 통째로 비지만 _hist는 남으므로 여기서만 정리한다** -- 위 드롭아웃
+        # 루프는 TRACK_GRACE 프레임짜리라 교체 뒤에는 아예 돌지 않는다.
+        for oid, h in list(self._hist.items()):
+            if oid in cands:
+                h.gone_s = 0.0
+                continue
+            h.gone_s += dt
+            if h.gone_s < TRIES_RESET_S:
+                continue
+            del self._hist[oid]         # 지나갔다 = 정상 주행 복귀
             self._failed.discard(oid)
             self._impossible.discard(oid)
             self._retry_stopped.discard(oid)
@@ -867,7 +947,8 @@ class DetourPolicy:
             # **신호 정지 중에는 얼린다.** 적색 대기열(적색 25초)의 앞차를
             # 영구 정지로 오판하면 안 된다. obstacles가 blocked로 stoplines의
             # MAX_HOLD_S를 얼리는 것과 정확히 대칭이다.
-            if not sig_stopping:
+            # **단 녹색이면 얼리지 않는다** -- 아래 update()의 sig_wait 참고.
+            if not sig_wait:
                 b.acc += dt
 
     def _ready(self, v: float, t: float):
@@ -878,7 +959,12 @@ class DetourPolicy:
             return None
         best = None
         for b in self._blocks.values():
-            if b.acc < self.confirm_s or b.tries >= MAX_TRIES_PER_OBJ:
+            if b.acc < self.confirm_s:
+                continue
+            h = self._hist.get(b.id)
+            # 같은 객체를 여기까지 시도했으면 답이 바뀌지 않는다. **경로를
+            # 갈아 끼워도 이 횟수는 남는다** (_Hist 참고).
+            if h is not None and h.tries >= MAX_TRIES_PER_OBJ:
                 continue
             if b.id in self._impossible:
                 continue
@@ -886,7 +972,7 @@ class DetourPolicy:
             # 반복해 봐야 같은 답이 나오고, 정지 후에는 조건이 달라진다.
             if b.id in self._retry_stopped and v >= STOPPED_MS:
                 continue
-            if b.tries and t - b.last_try < RETRY_MIN_S:
+            if h is not None and h.tries and t - h.last_try < RETRY_MIN_S:
                 continue
             if best is None or b.d < best.d:
                 best = b
@@ -900,6 +986,7 @@ class DetourPolicy:
         node = self.rows[j].node
         z = self.zone_at(b.s)
         if z is not None:
+            self._persist(b.id)
             self._impossible.add(b.id)
             cmd.action = 'impossible'
             cmd.reason = '우회 불가 구간'
@@ -910,8 +997,10 @@ class DetourPolicy:
                 f'obj id={b.id} {b.kind} d={b.d:.1f}m lat={b.lat:+.1f}m)')
             return
 
-        b.tries += 1
-        b.last_try = t
+        h = self._persist(b.id)
+        h.tries += 1
+        h.last_try = t
+        h.gone_s = 0.0
         self._retry_stopped.discard(b.id)
         # 같은 노드를 막은 객체는 함께 피해야 한다 (줄지어 선 정지 차량)
         group = [x for x in self._blocks.values()
@@ -940,7 +1029,8 @@ class DetourPolicy:
                        f'{b.kind} id={b.id} 정지 {b.acc:.1f}s '
                        f'(d={b.d:.1f}m lat={b.lat:+.1f}m, 대상 {len(group)}개) '
                        f'— {sorted(blocked)} 우회 재탐색 '
-                       f'[{self.n_detours + 1}/{MAX_DETOURS}]')
+                       f'[{self.n_detours + 1}/{MAX_DETOURS}, '
+                       f'이 객체 {h.tries}/{MAX_TRIES_PER_OBJ}회]')
         self.planner.request({
             'cps': cps, 'blocked': blocked, 'obs_xy': obs_xy,
             'seg_offset': seg_off, 'obj_ids': list(self._pending),
@@ -979,6 +1069,7 @@ class DetourPolicy:
         self._pending = ()
         if not plan.ok:
             for oid in plan.obj_ids:
+                self._persist(oid)   # 그룹 동승 객체도 정리 대상에 올린다
                 self._failed.add(oid)
                 self._retry_stopped.add(oid)
             self._on_event('detour_failed',
@@ -1023,7 +1114,7 @@ class DetourPolicy:
                            else f'{LD_BOOST_MAX_S:.0f}s 상한 — lookahead 원복')
 
     # -- 최후 안전망 ----------------------------------------------------
-    def _last_resort(self, v: float, dt: float, sig_stopping: bool, obs,
+    def _last_resort(self, v: float, dt: float, sig_wait: bool, obs,
                      finished: bool, cmd: DetourCmd) -> None:
         """우회로 못 푸는 교착에서 저속으로 밀고 통과한다.
 
@@ -1058,9 +1149,15 @@ class DetourPolicy:
                 continue        # 우리를 세우고 있는 것이 이 객체인가
             if stuck is None or b.d < stuck.d:
                 stuck = b
-        # 적색 앞 정상 대기를 막힘으로 오판하면 항목 7 중대 -6점이다.
-        if stuck is None or v >= STOPPED_MS or finished or sig_stopping:
+        if stuck is None or v >= STOPPED_MS or finished:
             self._lr_acc = 0.0
+            return
+        # 적색 앞 정상 대기를 막힘으로 오판하면 항목 7 중대 -6점이다.
+        # **리셋이 아니라 동결이다.** 적색 25초/녹색 25초가 번갈면 리셋으로는
+        # 10초를 채우기 전에 매번 처음으로 돌아가 영영 발동하지 않는다.
+        # 발동 조건은 매 프레임 다시 보므로(그 프레임이 신호 대기면 아래에서
+        # 돌아간다) 얼려 둔 누적값이 적색 통과를 만들지는 않는다.
+        if sig_wait:
             return
         self._lr_acc += dt
         if self._lr_acc < self.last_resort_s:
@@ -1076,7 +1173,7 @@ class DetourPolicy:
             f'{self._lr_acc:.0f}s 정지 — 미완주를 막으려고 '
             f'{LAST_RESORT_V * 3.6:.0f}km/h로 밀고 통과한다 '
             f'({"우회 불가 구간" if stuck.id in self._impossible else "우회 실패"}, '
-            f'신호 정지 아님)')
+            f'신호 대기 아님)')
 
 
 def summary(policy: DetourPolicy) -> list:
@@ -1141,8 +1238,8 @@ def _plan(args) -> int:
         print('[det]' + line)
     if zones:
         print('[det] 위 구간에서 정지 차량에 막히면 최후 안전망'
-              f'({LAST_RESORT_S:.0f}초 뒤 {LAST_RESORT_V * 3.6:.0f}km/h 통과)'
-              '만이 완주 수단이다')
+              f'(정지 {LAST_RESORT_S:.0f}초 뒤 {LAST_RESORT_V * 3.6:.0f}km/h '
+              '통과)만이 완주 수단이다')
     return 0
 
 
@@ -1273,6 +1370,17 @@ def _selftest() -> int:
     check('신호 정지 중: 발동 안 함', not pol.planner.jobs,
           f'{len(pol.planner.jobs)}회 요청 (20초 관측)')
 
+    # 2b. **녹색인데 못 가면 신호 대기가 아니라 객체 교착이다.**
+    #     정지선 35m 앞에서 차량에 막혔는데 sig.stopping이 참이라 확인 타이머가
+    #     얼어붙어 영영 발동하지 못한 적이 있다.
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=400,
+         sig_stopping=True, sig_green=True)
+    check('녹색인데 정지: 발동', bool(pol.planner.jobs),
+          f'{len(pol.planner.jobs)}회 요청')
+    # 4(좌회전 전용) 직진 차로는 stoplines가 _stop으로 보내므로 여기 계약은
+    # sig_stopping=True / sig_green=False다 -- 위 2번과 같은 조합이다.
+
     # 3. 움직이는 객체는 대상이 아니다 (항목 10 중대 -6점 방지)
     _p, pol, rec = _mk(planner=_StubPlanner())
     _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0, speed=3.6, dims=PED)], n=400)
@@ -1311,6 +1419,13 @@ def _selftest() -> int:
     check('우회 불가: 구간 정보를 남긴다',
           det and '단일 차로' in det[0] and 's 0.0~90.0' in det[0],
           det[0] if det else '없음')
+    # 지나치고 나면 그 낙인도 지운다. _hist 항목 없이 집합에만 넣으면 정리
+    # 루프가 닿지 못해 영영 남고, 같은 id가 다시 막아도 시도조차 못 한다.
+    check('우회 불가: 영속 기록을 함께 연다', 1 in pol._hist, f'{list(pol._hist)}')
+    _run(pol, lambda t, s: [], n=int(TRIES_RESET_S / 0.05) + 4)
+    check('우회 불가: 지나치면 낙인을 지운다',
+          not pol._impossible and not pol._hist,
+          f'imp={sorted(pol._impossible)} hist={list(pol._hist)}')
 
     # 8. 최후 안전망 -- 우회 실패 + 20초 정지
     _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
@@ -1321,8 +1436,24 @@ def _selftest() -> int:
     check('최후 안전망: v_floor 5km/h',
           any(abs(r[4] - LAST_RESORT_V) < 1e-6 for r in log))
     fire = [r[0] for r in log if r[2] == 'last_resort']
-    check('최후 안전망: 20초 전에는 안 나온다', fire and fire[0] >= 20.0,
+    check(f'최후 안전망: {LAST_RESORT_S:.0f}초 전에는 안 나온다',
+          fire and fire[0] >= LAST_RESORT_S,
           f'첫 발동 t={fire[0] if fire else float("nan")}')
+
+    # 8c. 적색 정지 중 누적은 **리셋이 아니라 동결이다.** 적색/녹색이 번갈면
+    #     리셋으로는 LAST_RESORT_S를 채우기 전에 매번 처음으로 돌아간다.
+    _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
+    o = lambda t, s: [_Fake(1, 8.0, 0.0)]
+    _l, _s, t1 = _run(pol, o, n=340, obs=obs)                   # 17초: 확인+누적
+    hold = pol._lr_acc
+    _l, _s, t2 = _run(pol, o, n=400, obs=obs, t0=t1,            # 20초 적색 대기
+                      sig_stopping=True)
+    check('적색 대기: 누적 동결', abs(pol._lr_acc - hold) < 1e-9,
+          f'{hold:.2f} -> {pol._lr_acc:.2f}')
+    check('적색 대기: 발동 안 함', 'last_resort_pass' not in rec.kinds())
+    _run(pol, o, n=int((LAST_RESORT_S - hold) / 0.05) + 4, obs=obs, t0=t2)
+    check('적색 해제 후: 이어서 발동', 'last_resort_pass' in rec.kinds(),
+          f'누적 {pol._lr_acc:.1f}s')
 
     # 8b. 게이트를 하나씩 깨면 발동하지 않는다
     for name, kw, ctor in (
@@ -1384,6 +1515,38 @@ def _selftest() -> int:
          n=100, v=0.0, s0=5.0 * (t2 - t1), t0=t2)
     check('실패 후 정지 시: 재시도', len(pol.planner.jobs) == n1 + 1,
           f'{len(pol.planner.jobs)} vs {n1}')
+
+    # 11b. 같은 객체는 MAX_TRIES_PER_OBJ회에서 멈춘다
+    _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
+    car = lambda t, s: [_Fake(1, 40.0, 0.0)]
+    _l, _s, t1 = _run(pol, car, n=1600, v=0.0)          # 80초: 재시도 여유 충분
+    check(f'같은 객체: {MAX_TRIES_PER_OBJ}회에서 멈춘다',
+          len(pol.planner.jobs) == MAX_TRIES_PER_OBJ,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 11c. **경로를 갈아 끼워도 그 횟수는 남는다.** _B에만 두면 우회 성공마다
+    #      0으로 돌아가 같은 객체를 무한히 다시 푼다.
+    pol.rebind(pol.path, pol.rows, pol.zones, pol.bounds)
+    _l, _s, t2 = _run(pol, car, n=800, v=0.0, t0=t1)
+    check('경로 교체 후에도 유지', len(pol.planner.jobs) == MAX_TRIES_PER_OBJ,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 11d. 리셋은 **"그 객체가 후보에서 사라졌을 때"**다 (정상 주행 복귀).
+    _run(pol, lambda t, s: [], n=int(TRIES_RESET_S / 0.05) + 4, v=0.0, t0=t2)
+    check('사라지면 기록을 버린다', not pol._hist and not pol._failed,
+          f'hist={list(pol._hist)} failed={sorted(pol._failed)}')
+    # 확인 8초 + 여유 2초. RETRY_MIN_S(5) 안이라 요청은 정확히 한 번이다.
+    _run(pol, car, n=200, v=0.0, t0=t2 + TRIES_RESET_S + 1.0)
+    check('되돌아오면 다시 시도', len(pol.planner.jobs) == MAX_TRIES_PER_OBJ + 1,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 11e. 전체 상한 -- 3회로 묶었더니 네 번째 차량에서 영구 정지했다
+    check(f'전체 상한 {MAX_DETOURS}회', MAX_DETOURS >= 20, f'{MAX_DETOURS}')
+    _p, pol, _r = _mk(planner=_StubPlanner())
+    pol.n_detours = 3               # 옛 상한
+    _run(pol, car, n=400)
+    check('우회 3회 뒤에도 발동', bool(pol.planner.jobs),
+          f'{len(pol.planner.jobs)}회 요청')
 
     # 12. 실제 경로 -- 계획 단계 실측과 일치해야 한다
     data = _data_dir()

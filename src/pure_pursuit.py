@@ -585,6 +585,10 @@ def run(args) -> None:
                     det = det_policy.update(
                         idx, path.s[idx], v, frame.ego_x, frame.ego_y,
                         frame.objects, t, sig_stopping=sig.stopping,
+                        # 녹색(3/5)인데 못 가고 있으면 신호 대기가 아니라 객체
+                        # 교착이다. 4(좌회전 전용)는 GO_STATES에 없고, 직진
+                        # 차로에서의 4는 stoplines가 이미 _stop으로 보낸다.
+                        sig_green=(sig.state in stoplines.GO_STATES),
                         obs=(None if obs_policy is None else obs),
                         finished=finished)
                     # 최후 안전망. xw.escape와 같은 성격이라 같은 방식으로
