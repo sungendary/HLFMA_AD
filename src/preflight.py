@@ -26,6 +26,7 @@ import time
 from hlvtd_client import (
     Client, FRAME_SIZE, SpeedEstimator, TL_STATE, pack_control,
 )
+import redzone
 
 OK, WARN, BAD = '  [OK]', '  [주의]', '  [실패]'
 
@@ -56,7 +57,7 @@ def check_env(rep: Report, here: str) -> None:
     if (v.major, v.minor) >= (3, 10):
         rep.ok(f'Python {v.major}.{v.minor}.{v.micro}')
     else:
-        rep.bad(f'Python {v.major}.{v.minor} — 3.10 이상이 필요하다 '
+        rep.bad(f'Python {v.major}.{v.minor} ― 3.10 이상이 필요하다 '
                 f'(union 타입 문법). conda activate hlfma 를 했나?')
     # numpy는 확인하지 않는다. 이 PC에서는 앱 제어 정책에 차단돼 있고
     # (import는 통과해도 numpy.linalg에서 DLL 로드 실패), 우리 코드는
@@ -85,7 +86,7 @@ def check_env(rep: Report, here: str) -> None:
         os.remove(probe)
         rep.ok(f'logs/ 쓰기 가능')
     except OSError as exc:
-        rep.bad(f'logs/ 쓰기 불가: {exc} — 세션 로그가 안 남는다')
+        rep.bad(f'logs/ 쓰기 불가: {exc} ― 세션 로그가 안 남는다')
 
 
 def check_reachable(rep: Report, host: str, port: int) -> bool:
@@ -98,7 +99,7 @@ def check_reachable(rep: Report, host: str, port: int) -> bool:
         rep.ok(f'TCP 연결 성공 ({1000 * (time.monotonic() - t0):.0f}ms)')
         return True
     except socket.timeout:
-        rep.bad('타임아웃 — 랜선, IP 설정(nmcli con up hlfma), '
+        rep.bad('타임아웃 ― 랜선, IP 설정(nmcli con up hlfma), '
                 '방화벽 순으로 확인할 것')
     except OSError as exc:
         rep.bad(f'{exc}\n         VTD가 안 떴거나 Setup이 00_HL_VTD가 아니다.\n'
@@ -145,7 +146,7 @@ def check_stream(rep: Report, host: str, port: int, n_frames: int) -> None:
     if 45 <= mean <= 56 and mx < 90:
         rep.ok(line + '  (공칭 50.0ms)')
     else:
-        rep.warn_(line + ' — 20Hz에서 벗어난다. 속도 추정이 흔들릴 수 있다')
+        rep.warn_(line + ' ― 20Hz에서 벗어난다. 속도 추정이 흔들릴 수 있다')
 
     f0, fl = frames[0], frames[-1]
     moved = math.hypot(fl.ego_x - f0.ego_x, fl.ego_y - f0.ego_y)
@@ -162,17 +163,17 @@ def check_stream(rep: Report, host: str, port: int, n_frames: int) -> None:
     print(f'       객체 {min(n_obj)}~{max(n_obj)}개, 서로 다른 id {len(ids)}개'
           + (f' (보행자 판정 {len(peds)}개)' if peds else ''))
     if max(n_obj) >= 30:
-        rep.warn_('30슬롯 상한에 닿았다 — 80m 안에 객체가 가득하다')
+        rep.warn_('30슬롯 상한에 닿았다 ― 80m 안에 객체가 가득하다')
 
     states = {f.tl_state for f in frames}
     print(f'       신호등 id={fl.tl_id} '
           f'state={"/".join(sorted(TL_STATE.get(s, str(s)) for s in states))}')
     if states == {0}:
-        rep.warn_('신호등이 계속 미할당(0)이다 — 교차로에서 떨어져 있으면 정상')
+        rep.warn_('신호등이 계속 미할당(0)이다 ― 교차로에서 떨어져 있으면 정상')
 
 
 def check_lidar(rep: Report, port: int, seconds: float) -> None:
-    step(f'4. LiDAR UDP {port} ({seconds:.0f}초)')
+    step(f'5. LiDAR UDP {port} ({seconds:.0f}초)')
     HDR = struct.Struct('<IHIQdHHIIHBB')
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 22)
@@ -201,14 +202,68 @@ def check_lidar(rep: Report, port: int, seconds: float) -> None:
         s.close()
 
     if not pkts:
-        rep.warn_('패킷 없음 — 실행 순서(랜선 → nmcli → lmgrd → vtdStart.sh)를 '
+        rep.warn_('패킷 없음 ― 실행 순서(랜선 → nmcli → lmgrd → vtdStart.sh)를 '
                   '지켰나. 순서가 틀리면 LiDAR 전송기가 소켓 생성에 실패한다')
         return
     dur = time.monotonic() - t0
     rep.ok(f'패킷 {pkts}개, 프레임 {len(frames_seen)}개 '
            f'({len(frames_seen) / dur:.1f} fps), {8 * byts / dur / 1e6:.1f} Mbps')
     if modes and modes != {1}:
-        rep.warn_(f'coordinate_mode={modes} — 1(월드 좌표)이 아니면 변환이 필요하다')
+        rep.warn_(f'coordinate_mode={modes} ― 1(월드 좌표)이 아니면 변환이 필요하다')
+
+
+def check_camera(rep: Report, host: str, url: str, timeout: float = 8.0) -> None:
+    """붉은 보호구역 판정(redzone.py)의 전제. 전부 주의 수준이다 -- 카메라가
+    안 붙어도 폴백(전 구간 지시속도)으로 완주는 한다."""
+    step(f'4. 카메라 RTSP {redzone.RTSP_PORT}')
+    exe = redzone.find_ffmpeg()
+    if not exe:
+        rep.warn_('ffmpeg 없음 (PATH) ― 붉은 보호구역 판정이 폴백으로 간다. '
+                  'winget install Gyan.FFmpeg 뒤 터미널을 다시 열 것')
+        return
+    rep.ok(f'ffmpeg {exe}')
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    s.settimeout(3.0)
+    try:
+        s.connect((host, redzone.RTSP_PORT))
+        rep.ok(f'{host}:{redzone.RTSP_PORT} TCP 연결 성공')
+    except OSError as exc:
+        rep.warn_(f'{host}:{redzone.RTSP_PORT} 연결 실패: {exc} ― mediamtx(RTSP '
+                  f'서버)가 안 떴다. 판정은 폴백으로 간다')
+        return
+    finally:
+        s.close()
+
+    t0 = time.monotonic()
+    rat = redzone.grab_ratio(url, timeout=timeout)
+    if rat is None:
+        rep.warn_(f'{url} 프레임 수신 실패 ({timeout:.0f}초) ― 경로가 /front인지, '
+                  f'시뮬레이션이 시작됐는지 확인. 판정은 폴백으로 간다')
+        return
+    rep.ok(f'{url} 프레임 1장 ({1000 * (time.monotonic() - t0):.0f}ms)  '
+           f'far={rat[0]:.2f} near={rat[1]:.2f}')
+    if rat[0] >= redzone.ENTER_RATIO or rat[1] >= redzone.EXIT_RATIO:
+        rep.warn_('출발 지점인데 붉은 비율이 임계를 넘는다 ― crop이 노면이 아니거나 '
+                  '임계값 조정이 필요하다. python redzone.py --snapshot 으로 확인할 것')
+
+    # 프레임률. 9/10 실주행이 2.2fps였던 원인(-fflags nobuffer + fps 필터)을 뺐으므로
+    # 입력이 20fps 근처여야 한다. 아니면 VTD 쪽 인코더/렌더 속도다.
+    cam = redzone.CameraReader(url)
+    if cam.start():
+        t1 = time.monotonic()
+        while time.monotonic() - t1 < 3.5:
+            time.sleep(0.1)
+        dec, fr = cam.decoded, cam.frames
+        fi, fe = cam.rates()
+        cam.stop()
+        msg = (f'3.5초 수신 {dec}프레임 / 판정 {fr}프레임 '
+               f'(입력 {fi:.1f}fps / 판정 {fe:.1f}fps)')
+        if dec >= 40:
+            rep.ok(msg)
+        else:
+            rep.warn_(msg + ' ― 20fps면 60 근처여야 한다. VTD 인코더/렌더 속도 의심: '
+                      f'ffprobe -rtsp_transport tcp -show_streams {url}')
 
 
 def main() -> None:
@@ -220,6 +275,10 @@ def main() -> None:
     ap.add_argument('--lidar', action='store_true', help='UDP 9912도 확인')
     ap.add_argument('--lidar-port', type=int, default=9912)
     ap.add_argument('--lidar-seconds', type=float, default=3.0)
+    ap.add_argument('--no-camera', action='store_true',
+                    help='RTSP 8554 카메라 확인을 건너뛴다')
+    ap.add_argument('--rtsp-url', default='',
+                    help=f'기본 rtsp://<host>:{redzone.RTSP_PORT}/{redzone.RTSP_PATH}')
     args = ap.parse_args()
 
     print('=' * 66)
@@ -233,16 +292,21 @@ def main() -> None:
         check_stream(rep, args.host, args.port, args.frames)
     else:
         print('       (연결이 안 되므로 수신 확인은 건너뛴다)')
+    if not args.no_camera:
+        check_camera(rep, args.host, args.rtsp_url or redzone.rtsp_url(args.host))
     if args.lidar:
         check_lidar(rep, args.lidar_port, args.lidar_seconds)
 
     print('\n' + '=' * 66)
     if rep.fail:
-        print(f'  실패 {rep.fail}개, 주의 {rep.warn}개 — 위 항목부터 해결할 것')
+        print(f'  실패 {rep.fail}개, 주의 {rep.warn}개 ― 위 항목부터 해결할 것')
         print('=' * 66)
         sys.exit(1)
 
     print(f'  이상 없음 (주의 {rep.warn}개). 9910 소켓은 닫았다.')
+    if rep.warn:
+        print('  카메라 주의가 있으면 붉은 보호구역 판정이 폴백으로 간다 ― '
+              '항목 2 감점 1회를 받되 완주는 한다')
     print('=' * 66)
     print(f"""
   다음 순서:

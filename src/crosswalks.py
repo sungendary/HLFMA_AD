@@ -3,7 +3,7 @@
 
 기준은 "후륜축이 횡단보도 위에 있는 채 1km/h 이하로 3초 이상"이면 경미 -3점이다.
 
-stoplines.py / obstacles.py와 같은 구조다 — I/O 없는 순수 로직이고 매 프레임
+stoplines.py / obstacles.py와 같은 구조다 ― I/O 없는 순수 로직이고 매 프레임
 결과 하나를 낸다. 다만 **이 모듈만 min()을 깨는 출구를 하나 가진다** (아래 2번).
 
 --- 이 지도에서 무엇이 실제 위험인가 ---
@@ -13,7 +13,7 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O 없는 순수 로직이�
 65.1/56.0/44.5m다. 즉 "정지선 = 횡단보도 앞"이라는 통념은 이 지도에서 틀렸다.
 
 그래서 **신호 정지는 위험하지 않다.** 정지선 앞에 서면 횡단보도는 이미 40m
-넘게 지난 뒤다. 위험은 하나로 좁혀진다 — **보행자·앞차 때문에 서는 경우.**
+넘게 지난 뒤다. 위험은 하나로 좁혀진다 ― **보행자·앞차 때문에 서는 경우.**
 그리고 mid-block 횡단보도는 바로 보행자가 건너는 자리다.
 
 --- 하는 일 두 가지 ---
@@ -21,7 +21,7 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O 없는 순수 로직이�
 1. **예방** (min()으로 합류). stoplines / obstacles가 겨냥한 후륜축 정지
    지점(stop_avail)을 받아, 그 자리가 횡단보도 위면 목표를 구간 **앞**으로
    당긴다. 더 앞에서 서는 것은 언제나 더 낮은 v_limit이므로 기존 min() 합류가
-   그대로 성립한다. 다만 지금 속도로 DECEL_HARD에도 못 서는 거리면 포기한다 —
+   그대로 성립한다. 다만 지금 속도로 DECEL_HARD에도 못 서는 거리면 포기한다 ―
    억지 급제동은 뒤차 추돌을 만들고 결국 횡단보도 위에 서게 된다.
 
 2. **탈출** (min()을 깨는 유일한 지점). 이미 후륜축이 올라가 있으면 저속으로
@@ -29,7 +29,7 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O 없는 순수 로직이�
    아래를 **전부** 만족할 때만 발동한다.
 
      · obstacles가 켜져 있어 front_clear를 받았을 것. 없으면 발동하지 않는다
-       — 전방을 모르는 채로 밀고 나가지 않는다
+       ― 전방을 모르는 채로 밀고 나가지 않는다
      · front_clear >= 빠져나갈 거리 + ESCAPE_GAP  (항목 14 우선)
      · 신호 정지 중이고 정지선이 앞에 있지 않을 것 (항목 7 우선)
 
@@ -38,7 +38,7 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O 없는 순수 로직이�
 --- 구간의 길이는 CSV에 없다 ---
 
 route_path_*_events.csv의 crosswalk 행은 좌표 한 점뿐이고 detail도 비어 있다
-(xodr_graph.py:742-746 — ctrl_id가 있는 정지선만 detail을 받는다).
+(xodr_graph.py:742-746 ― ctrl_id가 있는 정지선만 detail을 받는다).
 xodr_objects.py가 <object>의 length/width를 읽지 않기 때문이다.
 
 원본 xodr을 전수로 확인하면 Rm_Warning_Crosswalk_JPN_03.flt **400개 전부**
@@ -149,12 +149,12 @@ def load_for_path(path, events_csv: str) -> tuple[list, list]:
         resid = math.hypot(path.pts[i][0] - x, path.pts[i][1] - y)
         s_along = float(r.get('s_along', 0.0) or 0.0)
         if resid > SNAP_MAX_M:
-            warn.append(f'횡단보도 s_along={s_along:.1f} 를 버린다 — '
+            warn.append(f'횡단보도 s_along={s_along:.1f} 를 버린다 ― '
                         f'경로에서 {resid:.1f}m (한계 {SNAP_MAX_M:.0f}m)')
             continue
         if resid > SNAP_WARN_M:
             warn.append(f'횡단보도 s_along={s_along:.1f} 스냅 잔차 {resid:.1f}m '
-                        f'— 이벤트 CSV가 이 경로보다 오래됐을 수 있다')
+                        f'― 이벤트 CSV가 이 경로보다 오래됐을 수 있다')
         out.append(Crosswalk(i, path.s[i], x, y, resid,
                              r.get('road_id', ''), r.get('lane_id', ''),
                              s_along))
@@ -234,7 +234,7 @@ class CrosswalkPolicy:
         if on is not self._on_zone:
             if self._on_zone is not None and self._dwell_since is not None:
                 self._on_event('xw_clear',
-                               f'횡단보도 s={self._on_zone.s:.1f}m 벗어남 — '
+                               f'횡단보도 s={self._on_zone.s:.1f}m 벗어남 ― '
                                f'정차 {t - self._dwell_since:.1f}초')
             self._on_zone = on
             self._dwell_since = None
@@ -247,7 +247,7 @@ class CrosswalkPolicy:
         if (self._escape_zone is not None
                 and s_ego > self._escape_zone.s1 + EXIT_M):
             self._on_event('xw_clear',
-                           f'횡단보도 s={self._escape_zone.s:.1f}m 탈출 완료 — '
+                           f'횡단보도 s={self._escape_zone.s:.1f}m 탈출 완료 ― '
                            f'{t - self._escape_since:.1f}초')
             self._escape_zone = None
             self._escape_since = None
@@ -258,7 +258,7 @@ class CrosswalkPolicy:
             if self._dwell_since is None:
                 self._dwell_since = t
                 self._announce((id(on), 'dwell'), 'xw_dwell',
-                               f'횡단보도 s={on.s:.1f}m 위에서 정차 시작 — '
+                               f'횡단보도 s={on.s:.1f}m 위에서 정차 시작 ― '
                                f'{self.escape_after:.1f}초 뒤 탈출을 검토한다 '
                                f'(항목 12는 3초)')
             dwelled = (t - self._dwell_since) >= self.escape_after
@@ -280,7 +280,7 @@ class CrosswalkPolicy:
                        f'{need + ESCAPE_GAP:.1f}m (항목 14 우선)')
             elif (self._escape_since is not None
                   and t - self._escape_since > MAX_ESCAPE_S):
-                why = f'탈출 {MAX_ESCAPE_S:.0f}초 초과 — 포기한다'
+                why = f'탈출 {MAX_ESCAPE_S:.0f}초 초과 ― 포기한다'
 
             if not why:
                 if self._escape_since is None:
@@ -289,7 +289,7 @@ class CrosswalkPolicy:
                     self._on_event(
                         'crosswalk_escape',
                         f'횡단보도 s={on.s:.1f}m 위 정차 '
-                        f'{t - self._dwell_since:.1f}초 — 저속 탈출한다. '
+                        f'{t - self._dwell_since:.1f}초 ― 저속 탈출한다. '
                         f'전방 여유 {front_clear:.1f}m / 필요 '
                         f'{need + ESCAPE_GAP:.1f}m, '
                         f'신호 정지선 {"앞에 있음" if tl_stop_ahead else "없음"}')
@@ -300,7 +300,7 @@ class CrosswalkPolicy:
             # 게이트가 막았다. 래치를 풀어 다음 프레임에 다시 판정한다 —
             # 앞차가 비키면 그때 발동해야 한다.
             self._announce((id(on), 'blocked'), 'xw_escape_blocked',
-                           f'횡단보도 s={on.s:.1f}m 위에서 못 벗어난다 — {why}. '
+                           f'횡단보도 s={on.s:.1f}m 위에서 못 벗어난다 ― {why}. '
                            f'항목 12 -3점을 받아들인다')
             self._escape_since = None
             self._escape_zone = None
@@ -320,14 +320,14 @@ class CrosswalkPolicy:
                         (id(z), 'infeasible'), 'xw_guard_infeasible',
                         f'횡단보도 s={z.s:.1f}m 위에 설 판인데 그 앞 '
                         f'{avail:.1f}m에 못 선다 (v={v * 3.6:.0f}km/h, '
-                        f'{DECEL_HARD:.1f}m/s^2 기준). 급제동하지 않는다 — '
+                        f'{DECEL_HARD:.1f}m/s^2 기준). 급제동하지 않는다 ― '
                         f'올라가면 탈출로 처리한다')
                     break
                 v_limit, accel_limit = _profile(avail, v, 0.0, DECEL_XW)
                 self._announce(
                     (id(z), 'guard'), 'xw_guard',
                     f'정지 목표가 횡단보도 s={z.s:.1f}m 위 '
-                    f'({stop_s - z.s0:+.1f}m) — 구간 앞 {avail:.1f}m로 당긴다')
+                    f'({stop_s - z.s0:+.1f}m) ― 구간 앞 {avail:.1f}m로 당긴다')
                 return CrosswalkCmd(v_limit, 'guard', dist,
                                     f'횡단보도 앞 정지 {avail:.1f}m',
                                     accel_limit)
@@ -364,7 +364,7 @@ def _plan(csv_path: str, segments: list, events_csv: str) -> int:
         print(f'[cw]   *** {w} ***')
 
     sl_list, _w = stoplines.load_for_path(path, events_csv)
-    print('[cw] 정지선과의 거리 — 이 값이 크면 신호 정지는 위험하지 않다')
+    print('[cw] 정지선과의 거리 ― 이 값이 크면 신호 정지는 위험하지 않다')
     for sl in sl_list:
         near = min(zones, key=lambda c: abs(c.s - sl.s)) if zones else None
         if near is None:

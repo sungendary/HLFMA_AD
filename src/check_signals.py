@@ -10,7 +10,7 @@ A 방향지시등 (항목 13, 경미 -3)
     차선변경 구간마다 **구간 시작 직전의 연속 점등 시간**을 잰다. 3초 이상이면
     합격이다. 교차로 회전 구간은 규칙이 강제하지 않으므로 참고로만 낸다.
 
-    구간은 turnsignal.build_zones가 만든 것을 그대로 쓴다 — 제어기가 본 것과
+    구간은 turnsignal.build_zones가 만든 것을 그대로 쓴다 ― 제어기가 본 것과
     같은 구간이어야 판정이 의미가 있다.
 
 B 횡단보도 정차 (항목 12, 경미 -3)
@@ -20,14 +20,14 @@ B 횡단보도 정차 (항목 12, 경미 -3)
     **후륜축 기준이다.** 9910 ego 좌표가 곧 후륜축이므로 보정이 없다.
 
 옛 로그에는 turn / cw_act 컬럼이 없다. 전부 get으로 읽어 그대로 0/빈칸으로
-떨어지게 둔다 — 베이스라인이 "점등 0초"로 나오는 것이 정확한 기록이다.
+떨어지게 둔다 ― 베이스라인이 "점등 0초"로 나오는 것이 정확한 기록이다.
 
 --- 우회 주행 (leg 분할) ---
 
 detour.py가 경로를 갈아 끼우면 **그 뒤로는 원본 경로를 달리지 않는다.** 그런데
 meta.json의 waypoints는 일부러 원본으로 남긴다(우회로로 바꾸면 그 밖의 신호·충돌을
 아예 못 센다). 그래서 원본 경로로만 채점하면 **달린 적도 없는 차선변경이 미점등으로
-찍힌다** — logs/pp_20260909_152624가 실제로 2/2 FAIL로 나왔고, 제어기는 그때
+찍힌다** ― logs/pp_20260909_152624가 실제로 2/2 FAIL로 나왔고, 제어기는 그때
 우회로의 차선변경에 정상 점등하고 있었다.
 
 meta.json의 detours[]가 교체 시각과 CSV를 기록하므로, 주행을 그 시각으로 **leg**로
@@ -113,7 +113,7 @@ def legs_of(session: str, meta: dict, wp: str, ev: str, segs: list) -> list:
 
     meta.detours[]가 없으면 leg 하나 = 예전 동작이다.
 
-    **CSV는 basename으로 세션 디렉터리 안에서 찾는다** — meta에 박힌 절대경로는
+    **CSV는 basename으로 세션 디렉터리 안에서 찾는다** ― meta에 박힌 절대경로는
     로그를 옮기면 깨진다. 이벤트 CSV는 detour_N_events.csv 규약을 그대로 쓴다
     (detour.DetourPlanner._solve).
     """
@@ -129,7 +129,7 @@ def legs_of(session: str, meta: dict, wp: str, ev: str, segs: list) -> list:
         csv_path = os.path.join(session, os.path.basename(d.get('csv') or ''))
         if not os.path.exists(csv_path):
             print(f'      *** detours[{k}]의 {os.path.basename(csv_path)}가 '
-                  f'없다 — 그 leg는 앞 경로로 잰다 ***')
+                  f'없다 ― 그 leg는 앞 경로로 잰다 ***')
             continue
         ev_path = os.path.splitext(csv_path)[0] + '_events.csv'
         legs[-1]['t1'] = t0
@@ -170,12 +170,12 @@ def check_turn(frames: list, zones: list, partial: bool = False) -> list:
     """구간마다 (zone, 선행 점등 시간, 방향 일치, 측정 가능, 앞선 소등).
 
     partial=True면 이 프레임 묶음이 주행의 일부(leg)라는 뜻이다. **점등 방향이
-    맞는데 leg가 구간 시작 3초 앞을 못 덮으면 측정불가다** — 선행 점등이 앞
+    맞는데 leg가 구간 시작 3초 앞을 못 덮으면 측정불가다** ― 선행 점등이 앞
     leg에 걸쳐 있는 것이지 위반이 아니다. 방향이 틀린 것은 그 프레임만 보면
     되므로 leg가 짧아도 판정할 수 있다.
 
     다섯째 값은 **연속 점등 구간 바로 앞의 소등 길이와 그 앞의 같은 방향 점등
-    시간**이다 (없으면 None). 판정에는 쓰지 않는다 — turnsignal의 정차 소등
+    시간**이다 (없으면 None). 판정에는 쓰지 않는다 ― turnsignal의 정차 소등
     (turn_pause)이 선행 3초를 갉아먹었는지 사후에 보려고 낸다.
     """
     out = []
@@ -313,7 +313,7 @@ def report(session: str, waypoints: str, events: str, segments: list,
             if manual else legs_of(session, meta, wp, ev, segs))
 
     print(f'  {name}  {len(frames)}프레임 {frames[-1]["t"]:.1f}초'
-          + (f'  (leg {len(legs)}개 — 우회 {len(legs) - 1}회)'
+          + (f'  (leg {len(legs)}개 ― 우회 {len(legs) - 1}회)'
              if len(legs) > 1 else ''))
 
     from pure_pursuit import load_path
@@ -393,7 +393,7 @@ def report(session: str, waypoints: str, events: str, segments: list,
     if not lc_rows:
         print('      점등 구간 없음')
     if stray > 0.5:
-        print(f'      (구간 밖 점등 {stray:.1f}초 — 감점 항목은 아니다)')
+        print(f'      (구간 밖 점등 {stray:.1f}초 ― 감점 항목은 아니다)')
 
     print('    B 횡단보도 정차 (항목 12)')
     if not xw_rows_all:

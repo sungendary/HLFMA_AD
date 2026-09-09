@@ -22,6 +22,8 @@
       (turnsignal.py, 평가항목 13). --no-turn-signal로 끈다
     · 횡단보도 위에 서게 될 것 같으면 그 앞에 서고, 이미 올라가 있으면
       안전할 때만 빠져나간다 (crosswalks.py, 평가항목 12). --no-crosswalk로 끈다
+    · 전방 카메라(8554 RTSP)가 붉은 노면을 보면 25km/h로 제한한다
+      (redzone.py, 평가항목 2). --no-redzone으로 끈다
     · 리스폰(프레임 간 5m 이상 점프) 감지 시 경로 인덱스를 다시 전역 탐색
 """
 
@@ -32,6 +34,7 @@ import bisect
 import csv
 import math
 import os
+import sys
 import tempfile
 import time
 
@@ -43,14 +46,26 @@ from session_log import SessionLog, default_dir
 import crosswalks
 import detour
 import obstacles
+import redzone
 import stoplines
 import turnsignal
+
+# stdout이 파일·파이프로 리다이렉트되면 Windows에서는 cp949가 된다. cp949에 없는
+# 문자가 이벤트 문자열에 섞이면 print가 UnicodeEncodeError를 내고, 그게 예외
+# 핸들러 안의 print면 제어 루프가 죽는다. 로그가 깨지는 것보다 차가 서는 것이
+# 훨씬 나쁘므로 못 적는 문자는 '?'로 바꿔 출력한다. (콘솔 직접 실행은 UTF-8이라
+# 영향이 없다.)
+for _stream in (sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(errors='replace')
+    except (AttributeError, ValueError):
+        pass
 
 WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 값
 LD_MIN, LD_MAX = 4.0, 10.0  # m, lookahead 범위
 LD_GAIN = 0.9               # lookahead = LD_GAIN * v[m/s]
 
-LAT_ACCEL_MAX = 2.5         # m/s^2, 곡선 구간 감속 기준 횡가속도
+LAT_ACCEL_MAX = 1.5         # m/s^2, 곡선 구간 감속 기준 횡가속도
 SPEED_KP = 1.2              # 속도 오차 -> 목표가속도
 DECEL_END = 1.5             # m/s^2, 경로 끝 감속률
 STOP_SPEED = 0.3            # m/s, 이 아래면 정지로 본다
@@ -230,6 +245,15 @@ def run(args) -> None:
     ev_path = args.events or stoplines.default_events_path(args.waypoints)
     ev_ctx = {'t': 0.0, 'x': float('nan'), 'y': float('nan'), 'v': float('nan')}
 
+    # 붉은 보호구역 소스. 카메라는 경로와 무관하므로 build_policies 밖에서
+    # **한 번만** 만든다 -- 우회 교체마다 ffmpeg를 죽였다 살릴 이유가 없다.
+    rz_on = not args.no_redzone
+    rz_url = ''
+    if rz_on:
+        rz_url = ('stub:' + ';'.join(args.redzone_stub) if args.redzone_stub
+                  else args.redzone_url
+                  or redzone.rtsp_url(args.redzone_host or args.host))
+
     # 세션 로그를 먼저 연다. 원본 프레임을 파싱 전에 받아야 하므로
     # raw_sink를 Client에 물려서 연결한다.
     log = SessionLog(args.session, mode='pp', meta={
@@ -252,6 +276,13 @@ def run(args) -> None:
         'detour': not args.no_detour,
         'detour_confirm_s': args.detour_confirm,
         'last_resort_s': (0.0 if args.no_last_resort else args.last_resort_s),
+        'redzone': rz_on,
+        'redzone_url': rz_url,
+        'zone_speed_kmh': args.zone_speed,
+        'zone_hold_m': args.zone_hold,
+        'redzone_crop': args.redzone_crop,
+        'redzone_enter': args.redzone_enter,
+        'redzone_exit': args.redzone_exit,
     })
     log.copy_input(args.waypoints, 'waypoints.csv')
     log.copy_input(args.route, 'route.csv')   # 현장에서 받은 원본은 반드시 보존
@@ -273,7 +304,7 @@ def run(args) -> None:
         **시작 시와 우회 시가 같은 코드를 쓴다.** detour의 워커 스레드가 새
         경로를 만든 뒤 이것을 그대로 불러 정책까지 통째로 갈아 끼운다.
         stoplines/crosswalks/turnsignal이 전부 (x,y)로 스냅하므로 다른 경로에
-        그대로 다시 붙는다 — 우회를 가능하게 하는 가장 큰 요인이다.
+        그대로 다시 붙는다 ― 우회를 가능하게 하는 가장 큰 요인이다.
 
         CSV 읽기만 하고 소켓·로그는 건드리지 않아 워커 스레드에서 안전하다.
         """
@@ -428,6 +459,32 @@ def run(args) -> None:
                 log.note('detour_off_reason', repr(exc))
                 det_policy = None
 
+    # 붉은 보호구역 (평가항목 2). ffmpeg 파이프는 데몬 스레드가 읽고 루프는
+    # 최신 판정값만 본다. 카메라가 안 붙어도 주행은 그대로 간다 (폴백).
+    rz_policy = None
+    if not rz_on:
+        print('[pp] 붉은 보호구역 판정 비활성 (--no-redzone)')
+    else:
+        try:
+            if args.redzone_stub:
+                rz_src = redzone.StubCamera.from_path(
+                    path, [redzone.parse_rect(r) for r in args.redzone_stub])
+            else:
+                rz_src = redzone.CameraReader(
+                    rz_url, redzone.parse_crop(args.redzone_crop))
+            rz_policy = redzone.RedzonePolicy(
+                rz_src, zone_speed=args.zone_speed / 3.6,
+                enter_ratio=args.redzone_enter, exit_ratio=args.redzone_exit,
+                hold_m=args.zone_hold, on_event=_policy_event)
+            print('[pp] 붉은 보호구역 판정 활성 (항목 2)')
+            for line in redzone.summary(rz_policy):
+                print('[pp]' + line)
+        except Exception as exc:        # 카메라가 안 붙어도 주행은 계속한다
+            print(f'[pp] 붉은 보호구역 판정 비활성: {exc!r}')
+            log.note('redzone', False)
+            log.note('redzone_off_reason', repr(exc))
+            rz_policy = None
+
     client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[pp] {args.host}:{args.port} 연결 시도...')
     client.connect()
@@ -461,12 +518,13 @@ def run(args) -> None:
             xw = crosswalks.CrosswalkCmd()
             turn = turnsignal.TurnCmd()
             det = detour.DetourCmd()
+            rz = redzone.RedzoneCmd()
             try:
                 v = speed_est.update(frame.ego_x, frame.ego_y)
                 ev_ctx.update(t=t, x=frame.ego_x, y=frame.ego_y, v=v)
 
                 if detect_respawn(frame, prev_frame):
-                    print('\n[pp] *** 리스폰 감지 — 경로 인덱스 재탐색 ***')
+                    print('\n[pp] *** 리스폰 감지 ― 경로 인덱스 재탐색 ***')
                     log.respawn(frame, prev_frame, v, t=t)
                     idx = None
                     finished = False
@@ -481,6 +539,8 @@ def run(args) -> None:
                         xw_policy.reset()       # 정차·탈출 타이머를 버린다
                     if det_policy is not None:
                         det_policy.reset()      # 옛 위치 기준 관측을 버린다
+                    if rz_policy is not None:
+                        rz_policy.reset()       # 히스테리시스 카운터를 버린다
                 prev_frame = frame
 
                 # 우회 재탐색 결과. **프레임 맨 위에서 갈아 끼운다** — 한
@@ -554,6 +614,14 @@ def run(args) -> None:
                     v_cmd = min(v_cmd, RECOVER_SPEED)
                 rem = path.remaining(idx)
                 v_cmd = min(v_cmd, math.sqrt(2.0 * DECEL_END * max(0.0, rem - 1.0)))
+
+                # 붉은 보호구역 (항목 2). 카메라 판정이라 다른 정책과 독립이고
+                # 속도 상한 하나뿐이다. 뒤의 xw.escape_v(1.5m/s)·det.v_floor
+                # (5km/h)는 25km/h보다 낮아 max() 합류와 충돌하지 않는다.
+                if rz_policy is not None:
+                    rz = rz_policy.update(v, t, frame.ego_x, frame.ego_y,
+                                          frame.ego_heading)
+                    v_cmd = min(v_cmd, rz.v_limit)
 
                 # 충돌 회피를 신호보다 **먼저** 돌린다. 항목 8 면책과
                 # MAX_HOLD_S 동결에 obs.blocking이 필요하기 때문이다.
@@ -639,7 +707,7 @@ def run(args) -> None:
                     turn = turn_policy.update(path.s[idx], v, t)
                 last_cmd = (steer, accel)
             except Exception as exc:                # 계산 실패해도 루프는 유지
-                print(f'\n[pp] 계산 오류: {exc!r} — 마지막 명령 유지')
+                print(f'\n[pp] 계산 오류: {exc!r} ― 마지막 명령 유지')
                 log.event('error', repr(exc), t=t,
                           ego_x=frame.ego_x, ego_y=frame.ego_y)
                 steer, accel = last_cmd
@@ -651,6 +719,7 @@ def run(args) -> None:
                 xw = crosswalks.CrosswalkCmd(action='error')
                 turn = turnsignal.TurnCmd(action='error')
                 det = detour.DetourCmd(action='error')
+                rz = redzone.RedzoneCmd(action='error')
 
             if not client.send_control(steer, accel, turn.signal):
                 print('\n[pp] 송신 실패. 재연결...')
@@ -669,7 +738,9 @@ def run(args) -> None:
                           ob_id=obs.obj_id, ob_dist=obs.dist, ob_lat=obs.lat,
                           turn=turn.signal, turn_src=turn.src,
                           cw_act=xw.action, cw_dist=xw.dist,
-                          dt_act=det.action, dt_dist=det.dist)
+                          dt_act=det.action, dt_dist=det.dist,
+                          rz_ratio=rz.ratio, rz_far=rz.ratio_far,
+                          rz_in=rz.in_code)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -688,12 +759,16 @@ def run(args) -> None:
                      else f' | XW:{xw.action:6s}{xw.dist:6.1f}m')
                   + ('' if det.action in ('none', 'error')
                      else f' | DT:{det.action:11s}{det.dist:6.1f}m')
+                  + ('' if rz.action in ('error', 'off')
+                     else (' | RZ:lost' if rz.action == 'lost'
+                           else f' | RZ:{rz.ratio_far:.2f}/{rz.ratio:.2f}'
+                                + ('*' if rz.in_zone else '+' if rz.hold else ' ')))
                   + ('' if turn.signal == TURN_OFF
                      else f' | SIG:{turnsignal.SIGNAL_NAME[turn.signal]}')
                   + ('  [완료]' if finished else ''))
 
             if finished:
-                print('\n[pp] 경로 끝 도달 — 정지 완료')
+                print('\n[pp] 경로 끝 도달 ― 정지 완료')
                 log.event('finish', f'{path.length:.1f}m 주행 {n}프레임', t=t,
                           ego_x=frame.ego_x, ego_y=frame.ego_y, speed=v)
                 break
@@ -702,6 +777,9 @@ def run(args) -> None:
         log.event('note', '사용자 종료(Ctrl+C)')
     finally:
         client.close()                              # close()가 감속 명령을 보낸다
+        if rz_policy is not None:
+            log.note('redzone_stats', rz_policy.stats())
+            rz_policy.close()                       # ffmpeg를 확실히 죽인다
         log.close()
         if args.session:
             print(f'[pp] 세션 로그: {args.session}')
@@ -770,6 +848,31 @@ def main() -> None:
                     default=crosswalks.ESCAPE_AFTER_S,
                     help='횡단보도 위 정차 이 시간 뒤 탈출을 검토한다 [s]. '
                          '항목 12 한계는 3초')
+    ap.add_argument('--no-redzone', action='store_true',
+                    help='붉은 보호구역 카메라 판정을 끈다 (회귀 비교용)')
+    ap.add_argument('--redzone-host', default='',
+                    help='RTSP 호스트. 생략하면 --host')
+    ap.add_argument('--redzone-url', default='',
+                    help='RTSP URL 전체를 덮어쓴다 (기본 rtsp://<host>:'
+                         f'{redzone.RTSP_PORT}/{redzone.RTSP_PATH}). '
+                         'lavfi:<spec>도 된다')
+    ap.add_argument('--zone-speed', type=float, default=redzone.ZONE_SPEED_KMH,
+                    help='붉은 구역 지시속도 [km/h]. 평가 기준 30, 오버슈트 감안')
+    ap.add_argument('--redzone-crop',
+                    default=':'.join(str(v) for v in redzone.CROP),
+                    help='카메라 crop W:H:X:Y (1920x1080). '
+                         '위 절반이 진입, 아래 절반이 이탈 판정')
+    ap.add_argument('--redzone-enter', type=float, default=redzone.ENTER_RATIO,
+                    help='진입 임계 (max(far, near) 붉은 비율)')
+    ap.add_argument('--redzone-exit', type=float, default=redzone.EXIT_RATIO,
+                    help='이탈 임계 (near 띠 붉은 비율)')
+    ap.add_argument('--zone-hold', type=float, default=redzone.ZONE_HOLD_M,
+                    help='이탈 뒤 이 주행거리[m]만큼 구간 속도를 유지한다 '
+                         '(붉은 노면이 끊기는 구간 대비). 0이면 끔')
+    ap.add_argument('--redzone-stub', action='append', default=[],
+                    metavar='x0,y0,x1,y1',
+                    help='sim 전용. 카메라 대신 경로 위 두 끝점 사이를 붉은 구역으로 본다. '
+                         '반복하면 회랑이 여러 개 (끊긴 노면 재현)')
     ap.add_argument('--session', '--log', dest='session',
                     default=default_dir('pp'),
                     help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')

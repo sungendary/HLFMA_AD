@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""세션 로그 — 한 번의 주행에서 나온 모든 것을 디렉터리 하나에 남긴다.
+"""세션 로그 ― 한 번의 주행에서 나온 모든 것을 디렉터리 하나에 남긴다.
 
 파싱해서 고른 열만 남기면 "그때 이것도 기록할 걸"이 반드시 나온다. 그래서
 **수신 원본 바이트를 먼저 통째로 남긴다.** 1109B x 20Hz x 120초 = 2.7MB뿐이라
@@ -9,7 +9,7 @@
     logs/<run_id>/
         frames.bin     수신 원본 1109B 프레임. 손실 없음
         drive.csv      프레임당 제어 상태 한 줄
-        objects.csv    프레임당 객체 수만큼 — objects[].id 안정성 판정의 근거
+        objects.csv    프레임당 객체 수만큼 ― objects[].id 안정성 판정의 근거
         events.csv     이산 사건만 (리스폰, 신호 전이, 연결 끊김 ...)
         meta.json      실행 인자, 시작 시각, 커밋, 프레임 수
         route.csv      현장에서 받은 route CSV 원본 복사
@@ -40,7 +40,8 @@ DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'n_obj', 'tl_act', 'tl_dist',
               'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat',
               'turn', 'turn_src', 'cw_act', 'cw_dist',
-              'dt_act', 'dt_dist']
+              'dt_act', 'dt_dist',
+              'rz_ratio', 'rz_far', 'rz_in']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -150,7 +151,9 @@ class SessionLog:
                   ob_dist: float = NAN, ob_lat: float = NAN,
                   turn: int = 0, turn_src: str = '',
                   cw_act: str = '', cw_dist: float = NAN,
-                  dt_act: str = '', dt_dist: float = NAN) -> None:
+                  dt_act: str = '', dt_dist: float = NAN,
+                  rz_ratio: float = NAN, rz_far: float = NAN,
+                  rz_in: int = 0) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -171,7 +174,7 @@ class SessionLog:
                 tl_act, tl_dist,
                 ob_act, ob_kind, ob_id, ob_dist, ob_lat,
                 turn, turn_src, cw_act, cw_dist,
-                dt_act, dt_dist)])
+                dt_act, dt_dist, rz_ratio, rz_far, rz_in)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (
@@ -232,7 +235,11 @@ class SessionLog:
         영구 정지 객체 우회(detour.py)가 내는
         detour_start / detour_done / detour_failed / detour_impossible /
         detour_tight / detour_solid_lc / detour_ld_boost / detour_ld_restore /
-        last_resort_pass / last_resort_clear 중 하나.
+        last_resort_pass / last_resort_clear,
+
+        붉은 보호구역(redzone.py)이 내는
+        redzone_enter / redzone_exit / redzone_hold / redzone_hold_end /
+        redzone_camera_lost / redzone_camera_back / redzone_flapping 중 하나.
         """
         if not self.enabled:
             return
@@ -247,7 +254,7 @@ class SessionLog:
 
     def respawn(self, frame, prev, speed: float = NAN,
                 t: float | None = None) -> None:
-        """리스폰. 이동 전후 위치를 둘 다 남긴다 — 지금은 콘솔에만 찍히고 사라진다."""
+        """리스폰. 이동 전후 위치를 둘 다 남긴다 ― 지금은 콘솔에만 찍히고 사라진다."""
         jump = math.hypot(frame.ego_x - prev.ego_x, frame.ego_y - prev.ego_y)
         self.event('respawn',
                    f'{jump:.1f}m ({prev.ego_x:.2f},{prev.ego_y:.2f})->'

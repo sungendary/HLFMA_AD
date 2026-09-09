@@ -3,7 +3,7 @@
 
 9910이 준 objects[]를 주행 경로에 투영해 매 프레임 속도 상한 하나를 낸다.
 pure_pursuit은 그 값을 기존 v_cmd에 min()으로 섞기만 하면 된다.
-stoplines.py와 같은 구조다 — I/O도 소켓도 없고, hlvtd_client도 import하지
+stoplines.py와 같은 구조다 ― I/O도 소켓도 없고, hlvtd_client도 import하지
 않는다(objects는 덕 타이핑). 순수 로직이라 로그만으로 재현·검증된다.
 
 --- 사전테스트 6세션(2026-09-04) 실측이 이 파일의 상수를 정한다 ---
@@ -24,12 +24,12 @@ stoplines.py와 같은 구조다 — I/O도 소켓도 없고, hlvtd_client도 im
 4. **속도 상한만으로는 부족하다.** pure_pursuit의 가속도는 P 제어라
    sqrt 프로파일을 따라가면 정상상태 오차만큼 위로 달린다. 신호등 정지에서
    실제로 정지선을 0.8m 넘었다. _profile이 감속 피드포워드를 함께 낸다.
-   stoplines._profile에 앞차 속도 항을 더한 일반화다 — v_lead=0이면 같다.
+   stoplines._profile에 앞차 속도 항을 더한 일반화다 ― v_lead=0이면 같다.
 
 5. **장애물(라바콘)에는 정지하지 않는다.** 차로 내 라바콘이면 속도 상한만
    저속으로 걸고 지나간다. 항목 11은 경미 -3이고 완주가 최우선이라, 교착이
    원리적으로 불가능한 쪽을 고른다. 대신 접근 중 최소 횡거리를 이벤트로
-   남긴다 — 실제로 차로 안이었는지가 OBST_LANE_M을 고칠 유일한 근거다.
+   남긴다 ― 실제로 차로 안이었는지가 OBST_LANE_M을 고칠 유일한 근거다.
 
 6. **NPC는 끼어들기·급정지 이벤트를 낸다**고 주최측이 확인했다. 그래서
    정지 프로파일이 신호등(2.0)보다 강한 2.5다.
@@ -156,7 +156,7 @@ def _profile(avail: float, v: float, v_lead: float = 0.0,
     경로 끝 감속·신호 정지 프로파일과 min() 하나로 합쳐진다.
 
     가속도 상한은 P 제어의 정상상태 오차를 메우는 피드포워드다. 프로파일
-    아래에 있을 때는 걸지 않는다 — 안 그러면 멀리서부터 가속을 막는다.
+    아래에 있을 때는 걸지 않는다 ― 안 그러면 멀리서부터 가속을 막는다.
     """
     if avail <= 0.3:
         v_limit = max(0.0, v_lead)
@@ -233,7 +233,7 @@ class ObstaclePolicy:
     """매 프레임 속도 상한 하나를 낸다.
 
     래치하지 않는다. 매 프레임 다시 판정하고, 히스테리시스는 "정지를 풀
-    조건"에만 건다 — 보행자가 대역 경계에서 떨릴 때 가다 서다 하는 것을 막는다.
+    조건"에만 건다 ― 보행자가 대역 경계에서 떨릴 때 가다 서다 하는 것을 막는다.
     """
 
     def __init__(self, path, *, front_overhang: float = FRONT_OVERHANG,
@@ -275,7 +275,7 @@ class ObstaclePolicy:
                     # 108km/h 초과는 불가능하다. 같은 id지만 다른 객체다
                     self._announce(('reuse', o.id), 'obj_id_reuse',
                                    f'id={o.id}가 한 프레임에 {jump:.1f}m 이동 '
-                                   f'(한계 {ID_JUMP_M:.2f}m) — 다른 객체다. '
+                                   f'(한계 {ID_JUMP_M:.2f}m) ― 다른 객체다. '
                                    f'추적을 리셋하고 속도 예측을 끈다')
                     self._ped_ids.discard(o.id)
                     tr = None
@@ -409,18 +409,18 @@ class ObstaclePolicy:
             # 속도 상한을 억지로 끌어올리지는 않는다 — 그러면 앞차를 들이받는다
             v_limit = min(v_limit, OBST_CREEP)
             action = 'creep'
-            reason = f'앞차 간격 {gap:.1f}m — 교착 해제 크립'
+            reason = f'앞차 간격 {gap:.1f}m ― 교착 해제 크립'
         elif v_limit < STOP_SPEED:
             action = 'hold' if v < STOP_SPEED else 'stop'
             self._announce((o.id, 'veh_stop'), 'veh_stop',
                            f'id={o.id} 전방 {d:.1f}m 간격 {gap:.1f}m '
-                           f'앞차 {v_lead * 3.6:.0f}km/h — 정지')
+                           f'앞차 {v_lead * 3.6:.0f}km/h ― 정지')
             reason = f'앞차 정지 간격 {gap:.1f}m'
         else:
             action = 'follow'
             self._announce((o.id, 'veh_follow'), 'veh_follow',
                            f'id={o.id} 전방 {d:.1f}m 간격 {gap:.1f}m '
-                           f'앞차 {v_lead * 3.6:.0f}km/h — 추종 '
+                           f'앞차 {v_lead * 3.6:.0f}km/h ― 추종 '
                            f'상한 {v_limit * 3.6:.0f}km/h')
             reason = f'앞차 추종 간격 {gap:.1f}m'
         # 앞차가 달리고 있어도 그 자리를 정지 후보로 본다. 앞차가 서면
@@ -442,7 +442,7 @@ class ObstaclePolicy:
         band = PED_RELEASE_M if o.id in self._ped_ids else PED_HARD_M
 
         if alat <= band:
-            ev, why = 'ped_stop_actual', f'횡거리 {alat:.1f}m — 대역 안'
+            ev, why = 'ped_stop_actual', f'횡거리 {alat:.1f}m ― 대역 안'
         elif (alat <= PED_WATCH_M and tr is not None and tr.trusted):
             # 경로 쪽으로 다가오는 횡방향 속도 성분 (양수 = 접근)
             vlat = -math.copysign(1.0, lat) * o.speed * math.sin(o.heading - th)
@@ -453,13 +453,13 @@ class ObstaclePolicy:
             if t_ped >= t_ego:
                 return None
             ev = 'ped_stop_predicted'
-            why = (f'예측 — 횡거리 {alat:.1f}m 접근 {vlat:.1f}m/s, '
+            why = (f'예측 ― 횡거리 {alat:.1f}m 접근 {vlat:.1f}m/s, '
                    f'{t_ped:.1f}s 후 대역 진입 (우리 도착 {t_ego:.1f}s)')
         else:
             return None
 
         self._announce((o.id, ev), ev,
-                       f'id={o.id} 전방 {d:.1f}m {why} — 정지')
+                       f'id={o.id} 전방 {d:.1f}m {why} ― 정지')
         if self._creep_id == o.id:
             # 교착 해제. 여기서 갈린다 — **차폭 밖이면 지나갈 수 있다.**
             # 20초를 기다려도 안 비키는 "보행자"는 건너는 중이 아니다.
@@ -469,12 +469,12 @@ class ObstaclePolicy:
             if abs(lat) > PED_CORRIDOR_M:
                 v_limit, accel_limit = OBST_CREEP, float('inf')
                 avail = float('nan')        # 서지 않고 지나간다
-                why += f' (교착 해제 — 차폭({PED_CORRIDOR_M:.1f}m) 밖이라 서행 통과)'
+                why += f' (교착 해제 ― 차폭({PED_CORRIDOR_M:.1f}m) 밖이라 서행 통과)'
             else:
                 avail = d - self.front - CREEP_GAP
                 v_limit, accel_limit = _profile(avail, v)
                 v_limit = min(v_limit, OBST_CREEP)
-                why += ' (교착 해제 — 차폭 안이라 간격까지만)'
+                why += ' (교착 해제 ― 차폭 안이라 간격까지만)'
             return ObstacleCmd(v_limit, 'creep', PEDESTRIAN, o.id, d, lat, why,
                                accel_limit, stop_avail=avail)
 
@@ -494,10 +494,10 @@ class ObstaclePolicy:
             return None
         self._announce(('slow', o.id), 'obstacle_slow',
                        f'id={o.id} 전방 {d:.1f}m 횡거리 {lat:+.2f}m '
-                       f'(h={o.height:.2f} w={o.width:.2f}) — '
+                       f'(h={o.height:.2f} w={o.width:.2f}) ― '
                        f'감속만 한다 (정지하지 않음)')
         return ObstacleCmd(OBST_CREEP, 'slow', OBSTACLE, o.id, d, lat,
-                           f'차로 내 장애물 {abs(lat):.2f}m — 감속만')
+                           f'차로 내 장애물 {abs(lat):.2f}m ― 감속만')
 
     # -- 해제 -----------------------------------------------------------
     def _release_pedestrians(self, ped_stopped: bool) -> None:
@@ -517,7 +517,7 @@ class ObstaclePolicy:
             lats.append(f'{oid}:{tr.lat:+.1f}m' if tr is not None
                         else f'{oid}:시야밖')
         self._on_event('ped_clear',
-                       f'보행자 {", ".join(lats)} — 횡단 완료, 재출발')
+                       f'보행자 {", ".join(lats)} ― 횡단 완료, 재출발')
         self._ped_ids.clear()
         self._ped_clear = 0
         self._hold_since = None
@@ -527,11 +527,11 @@ class ObstaclePolicy:
                   v: float, t: float) -> ObstacleCmd:
         """교착 방지. 완주가 최우선이라 감점을 먹더라도 움직인다.
 
-        크립으로 전환하되 완전히 풀지는 않는다 — 간격을 CREEP_GAP까지만
+        크립으로 전환하되 완전히 풀지는 않는다 ― 간격을 CREEP_GAP까지만
         좁히므로 정말 막혀 있으면 2m 앞에 서지, 들이받지는 않는다.
 
         **해제 조건은 "그 객체가 시야에서 사라졌을 때"다.** "명령이 정지가
-        아니게 됐을 때"로 잡으면 안 된다 — 크립이 간격을 완화해 스스로 정지가
+        아니게 됐을 때"로 잡으면 안 된다 ― 크립이 간격을 완화해 스스로 정지가
         아니게 만들기 때문에 한 프레임 만에 되돌아간다. sim에서 실제로 그랬다:
         30초마다 크립 한 프레임 -> 해제 -> 다시 30초 대기를 반복하며
         s=442.8m에서 400초 내내 못 움직였다.
@@ -560,7 +560,7 @@ class ObstaclePolicy:
         passable = (cmd.kind == PEDESTRIAN and abs(cmd.lat) > PED_CORRIDOR_M)
         self._on_event(f'{"veh" if cmd.kind == VEHICLE else "ped"}_timeout',
                        f'id={cmd.obj_id} {cmd.kind} 횡거리 {cmd.lat:+.2f}m 앞에서 '
-                       f'{limit:.0f}초 정지 — 교착으로 보고 '
+                       f'{limit:.0f}초 정지 ― 교착으로 보고 '
                        f'{OBST_CREEP * 3.6:.0f}km/h로 '
                        + ('서행 통과한다 (차폭 밖)' if passable
                           else f'간격 {CREEP_GAP:.1f}m까지 기어간다 (차폭 안)'))
@@ -715,7 +715,7 @@ def _selftest() -> int:
     fails = []
 
     def check(name, ok, detail=''):
-        print(f'  {"PASS" if ok else "FAIL"}  {name}' + (f'  — {detail}' if detail else ''))
+        print(f'  {"PASS" if ok else "FAIL"}  {name}' + (f'  ― {detail}' if detail else ''))
         if not ok:
             fails.append(name)
 

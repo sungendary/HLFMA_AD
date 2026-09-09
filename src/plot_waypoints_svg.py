@@ -10,7 +10,7 @@ matplotlib이 Windows 앱 제어 정책에 막히는 환경을 위한 대안.
         --base ../data/xodr_reference_lines.csv
 
 --base 는 xodr_parser.py 출력 같은 도로망을 밑그림으로 깔기 위한 것이다.
-좌표 범위 계산에는 넣지 않는다 — 넣으면 825m 궤적이 1500x2400m 전도에 눌려
+좌표 범위 계산에는 넣지 않는다 ― 넣으면 825m 궤적이 1500x2400m 전도에 눌려
 보이지 않는다. 전도를 보려면 --base-bounds 를 준다.
 """
 

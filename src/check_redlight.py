@@ -11,7 +11,7 @@
 
 VTD는 정지선에 닿는 순간 신호를 NONE으로 내린다(사전테스트 6세션 실측:
 이탈 지점이 후륜축 기준 -0.3 ~ +0.4m). 그래서 **교차로를 지나는 프레임의
-tl_state는 이미 0이다.** 통과 시점 상태로 세면 위반이 0으로 나온다 —
+tl_state는 이미 0이다.** 통과 시점 상태로 세면 위반이 0으로 나온다 ―
 실제로 그렇게 세면 9회가 2회로 줄어 보인다. 접근 상태로 재야 한다.
 """
 
@@ -245,7 +245,7 @@ def print_table(results: list, title: str) -> dict:
     order = ['RED_CROSS', 'LINE_OVERRUN', 'YELLOW_CLEAR', 'STOPPED', 'OK']
     parts = [f'{k} {tally[k]}' for k in order if k in tally]
     parts += [f'{k} {v}' for k, v in tally.items() if k not in order]
-    print(f'접근 {len(results)}건 — ' + '  '.join(parts))
+    print(f'접근 {len(results)}건 ― ' + '  '.join(parts))
     return tally
 
 

@@ -64,7 +64,7 @@ class Recorder:
                 return
             if gap > 5.0:
                 self.enabled = False          # 리스폰 — 녹화 자동 중단
-                print(f'\n*** 리스폰 감지 ({gap:.1f}m) — 녹화 중단. '
+                print(f'\n*** 리스폰 감지 ({gap:.1f}m) ― 녹화 중단. '
                       f'이 구간은 버리고 다시 하세요 ***\n')
                 return
         self._writer.writerow([self.segment, self.count, f'{x:.3f}', f'{y:.3f}',
@@ -244,7 +244,7 @@ def main() -> None:
                            fg='red')
         else:
             lbl_rec.config(text=f'○ 정지  [{args.segment}]  {recorder.count}점  '
-                                f'— R키로 시작', fg='gray')
+                                f'― R키로 시작', fg='gray')
         root.after(interval_ms, tick)
 
     root.protocol('WM_DELETE_WINDOW', close)

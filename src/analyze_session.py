@@ -3,7 +3,7 @@
 
     python analyze_session.py ../logs/pp_20260903_101500
 
-무엇을 확인하려고 만들었나 — 미해결 목록에 직접 대응한다.
+무엇을 확인하려고 만들었나 ― 미해결 목록에 직접 대응한다.
 
   · objects[].id 가 프레임 간 안정적인가 (미해결 #4)
     id별 등장 구간과 결손, 그리고 "같은 id인데 위치가 튀는" 경우를 찾는다.
@@ -71,9 +71,9 @@ def check_integrity(d: str, drive: list[dict], objs: list[dict]) -> None:
             # raw_sink는 수신 즉시 호출되고 drive.csv는 제어까지 끝난 프레임만
             # 남는다. 재연결·예외가 있었다면 차이가 나는 것이 정상이다.
             print(f'             drive.csv {len(drive)}행과 {n - len(drive):+d} 차이 '
-                  f'— 재연결/예외로 버려진 프레임 (events.csv 확인)')
+                  f'― 재연결/예외로 버려진 프레임 (events.csv 확인)')
     else:
-        print('frames.bin   없음 — 원본이 안 남았다')
+        print('frames.bin   없음 ― 원본이 안 남았다')
 
     print(f'drive.csv    {len(drive):,}행')
     print(f'objects.csv  {len(objs):,}행')
@@ -132,7 +132,7 @@ def check_object_ids(objs: list[dict], respawns: set[int]) -> None:
     for r in objs:
         per_frame[r['n']] += 1
     print(f'서로 다른 id {len(tracks)}개, 동시 최대 {max(per_frame.values())}개'
-          + ('  *** 30슬롯 상한에 닿았다 — 가려진 객체가 있다 ***'
+          + ('  *** 30슬롯 상한에 닿았다 ― 가려진 객체가 있다 ***'
              if max(per_frame.values()) >= 30 else ''))
 
     print(f'\n{"id":>8} {"등장":>6} {"프레임구간":>13} {"결손":>5} '
@@ -156,7 +156,7 @@ def check_object_ids(objs: list[dict], respawns: set[int]) -> None:
             worst = max(worst, dist / max(dn * FRAME_DT, 1e-6))
         verdict = ''
         if worst > IMPLAUSIBLE_SPEED:
-            verdict = '*** 위치 불연속 — id 재사용 의심'
+            verdict = '*** 위치 불연속 ― id 재사용 의심'
             suspects.append(oid)
         elif gaps:
             verdict = '결손 있음 (80m 밖으로 나갔다 복귀?)'
@@ -169,9 +169,9 @@ def check_object_ids(objs: list[dict], respawns: set[int]) -> None:
         print(f'*** id {", ".join(suspects[:10])} 에서 위치가 튄다. '
               f'id를 그대로 믿고 추적하면 안 된다 ***')
     elif any(p[-1][0] - p[0][0] + 1 != len(p) for p in tracks.values()):
-        print('결손은 있으나 위치는 전부 연속적이다 — id는 유지되는 것으로 보인다')
+        print('결손은 있으나 위치는 전부 연속적이다 ― id는 유지되는 것으로 보인다')
     else:
-        print('모든 id가 끊김 없이 연속적이다 — id 추적 가능')
+        print('모든 id가 끊김 없이 연속적이다 ― id 추적 가능')
 
 
 def check_pedestrian_threshold(objs: list[dict]) -> None:
@@ -191,7 +191,7 @@ def check_pedestrian_threshold(objs: list[dict]) -> None:
     borderline = [o for o, (ln, _w, ht, _p) in dims.items()
                   if 0.9 < ln < 1.6 or 1.9 < ht < 2.5]
     if borderline:
-        print(f'\n*** 임계값 근처 id: {", ".join(borderline)} — 기준을 다시 볼 것 ***')
+        print(f'\n*** 임계값 근처 id: {", ".join(borderline)} ― 기준을 다시 볼 것 ***')
     else:
         print('\n임계값에서 충분히 떨어져 있다')
 

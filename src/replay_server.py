@@ -2,7 +2,7 @@
 """녹화한 frames.bin을 9910에서 다시 흘려보내는 재생 서버.
 
 VTD 없이 수신·기록·이벤트 검출 경로를 통째로 시험하기 위한 것이다.
-사전테스트에서 녹화한 frames.bin이 그대로 집에서의 테스트 벤치가 된다 —
+사전테스트에서 녹화한 frames.bin이 그대로 집에서의 테스트 벤치가 된다 ―
 실제 코스의 신호등 전이와 실제 NPC가 담긴 데이터로 로직을 개발할 수 있다.
 
     python replay_server.py --frames ../archive/frames.bin --loop
@@ -249,12 +249,12 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
         if path.remaining(idx) < 1.5 and ego.v < 0.3:
             if done_since is None:
                 done_since = sim_t
-                print(f'[sim] 경로 끝 도달 — sim {sim_t:.1f}초, {s_ego:.1f}m')
+                print(f'[sim] 경로 끝 도달 ― sim {sim_t:.1f}초, {s_ego:.1f}m')
             elif sim_t - done_since > 2.0:
                 print('[sim] 완주. 연결을 닫는다')
                 break
         if sim_t > args.sim_timeout:
-            print(f'[sim] 제한시간 {args.sim_timeout:.0f}초 초과 — 중단')
+            print(f'[sim] 제한시간 {args.sim_timeout:.0f}초 초과 ― 중단')
             break
 
         now = time.monotonic()

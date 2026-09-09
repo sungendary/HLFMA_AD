@@ -299,7 +299,7 @@ def print_table(results: list, title: str) -> dict:
     print('-' * 104)
     order = ['COLLISION', 'NEAR', 'REACTED', 'OK']
     parts = [f'{k} {tally[k]}' for k in order if k in tally]
-    print(f'객체 {len(results)}개 — ' + '  '.join(parts))
+    print(f'객체 {len(results)}개 ― ' + '  '.join(parts))
     return tally
 
 
@@ -320,7 +320,7 @@ def print_restarts(rows: list) -> None:
     worst = max(r['held_s'] for r in rows)
     n_risk = sum(1 for r in rows if r['risk'])
     print('-' * 104)
-    print(f'정차 {len(rows)}회 — 최장 {worst:.1f}초, 항목 8 위험 {n_risk}회')
+    print(f'정차 {len(rows)}회 ― 최장 {worst:.1f}초, 항목 8 위험 {n_risk}회')
 
 
 def expand(patterns: list) -> list:

@@ -114,7 +114,7 @@ def main() -> int:
 
     print('=' * 60)
     if chunks == 0:
-        print('수신 데이터 없음 — VTD가 참가자에게 아무것도 보내지 않거나,')
+        print('수신 데이터 없음 ― VTD가 참가자에게 아무것도 보내지 않거나,')
         print('시나리오가 재생 중이 아닐 수 있습니다.')
         return 0
 

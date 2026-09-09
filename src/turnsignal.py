@@ -5,31 +5,31 @@
 3번째 바이트는 항상 0(OFF)이었고, 생성 경로에는 차선변경이 실제로 들어 있다
 (경로 1에 3회, 경로 2에 2회). 그대로 나가면 확정 감점이라 이 파일이 생겼다.
 
-stoplines.py / obstacles.py와 같은 구조다 — I/O가 없는 순수 로직이고, 매
+stoplines.py / obstacles.py와 같은 구조다 ― I/O가 없는 순수 로직이고, 매
 프레임 결과 하나(TurnCmd)를 낸다. **다만 이 모듈만 v_limit을 내지 않는다.**
 방향지시등은 속도에 아무 영향이 없으므로 min() 합류에 끼지 않고 CTRL의
 3번째 바이트로만 나간다.
 
 --- 점등 구간을 어디서 얻는가 ---
 
-1. **차선변경** — 생성 경로 CSV의 lc_dir 컬럼. 다만 이것은 **한 행짜리
+1. **차선변경** ― 생성 경로 CSV의 lc_dir 컬럼. 다만 이것은 **한 행짜리
    마커**다(xodr_graph.py:623-636, 노드를 떠나는 마지막 waypoint 한 행).
    실제 기하는 그 행을 **중심으로 ±10m 블렌드**되어 있다
    (LC_BLEND=20.0, xodr_graph.py:53). 그래서 구간은 마커 ± LC_BLEND_M/2다.
    pure_pursuit.load_path는 segment_id/x/y만 읽고 lc_dir을 버리므로
    이 모듈이 같은 CSV를 다시 열어 (x,y)로 스냅한다.
 
-2. **교차로 회전** — 경로 헤딩을 훑어 찾는다. 항목 13이 명시하는 것은 차로
+2. **교차로 회전** ― 경로 헤딩을 훑어 찾는다. 항목 13이 명시하는 것은 차로
    변경뿐이지만 회전에 켜는 쪽이 감점 위험이 없어 기본으로 켠다
    (--no-junction-signal로 끈다).
 
    **경로 CSV의 heading 컬럼은 쓰지 않는다.** 그것은 블렌드된 *차로* 헤딩이라
    차선변경 중 실제 접선과 최대 0.24 rad(14°) 어긋난다. 접선은
    stoplines._path_heading으로 좌표에서 직접 뽑는다 (길이 0 선분을 이미
-   방어한다 — 경로 1에 13개, 경로 2에 15개 있고 그중 3개가 lc_dir 행과 겹친다).
+   방어한다 ― 경로 1에 13개, 경로 2에 15개 있고 그중 3개가 lc_dir 행과 겹친다).
 
    판정은 "헤딩 증분의 부호가 일관된 구간의 누적 변화"다. 이 조건이
-   **차선변경 블렌드를 저절로 걸러낸다** — 블렌드는 +14° 뒤 -14°로 부호가
+   **차선변경 블렌드를 저절로 걸러낸다** ― 블렌드는 +14° 뒤 -14°로 부호가
    뒤집혀 각 run의 누적이 25°에 못 미친다. 반대로 완만한 도로 커브는 누적이
    커질 수 있으므로 길이를 TURN_MAX_M으로 제한한다.
 
@@ -43,7 +43,7 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O가 없는 순수 로직�
   · 반대 방향이면 turn_conflict 이벤트를 남긴다
 
 **구간에 들어간 뒤에는 실제 이동 방향이 이긴다.** 실차에서 99도 좌회전을 도는
-내내 우측 깜빡이가 켜져 있었다 — 경로 1의 차선변경 right[734.3,754.3]이 좌회전
+내내 우측 깜빡이가 켜져 있었다 ― 경로 1의 차선변경 right[734.3,754.3]이 좌회전
 [736.9,767.8] **안에** 87% 들어 있기 때문이다. 램프 하나로 두 기동을 동시에
 알릴 수는 없으므로, 선행 3초를 이미 확보한 뒤에는 눈에 보이는 것(실제 횡이동)을
 따른다. 판정은 _lateral_ahead 하나이고, 넘길 때 turn_takeover를 남긴다.
@@ -69,13 +69,13 @@ turn!=0 이면서 speed<1km/h인 연속 구간). 멈춰 있는데 방향을 알�
 **단 구간 시작이 RELIGHT_M 안이면 끄지 않는다.** 항목 13은 "구간 시작 직전의
 연속 점등 3초"로 채점되므로, 구간 코앞에서 껐다가 재출발하면 그 3초를 잃는다.
 20m는 지령 상한 3.0m/s^2에서도 3.65초가 걸려 재출발 뒤에 3초가 남는다.
-소등/재점등은 turn_pause / turn_resume로 남긴다 — 구간을 지나서 끄는
+소등/재점등은 turn_pause / turn_resume로 남긴다 ― 구간을 지나서 끄는
 turn_off와 구분해야 사후에 헷갈리지 않는다.
 
 --- 차선변경 구간 안의 회전은 버린다 ---
 
 차선변경 블렌드는 헤딩이 ±로 흔들려 한쪽 run이 회전 임계를 넘을 수 있다.
-우회로의 탈출 블렌드가 실제로 그랬다 — detour_2.csv의 turn right 3.1~9.6m
+우회로의 탈출 블렌드가 실제로 그랬다 ― detour_2.csv의 turn right 3.1~9.6m
 (-26도)는 교차로가 아니라 **블렌드가 차로에 다시 정렬되는 구간**이고, 그때
 차는 반대인 좌측으로 움직이고 있었다. **명시적 lc 마커가 있는 구간에서는
 마커가 헤딩 추론보다 우선한다.**
@@ -178,7 +178,7 @@ class TurnCmd:
 def load_lane_changes(path, waypoints_csv: str) -> tuple[list, list]:
     """경로 CSV의 lc_dir 마커를 구간으로 바꾼다. (구간 목록, 경고 목록).
 
-    stoplines.load_for_path와 같은 이유로 **(x,y)로 스냅한다** — --segments가
+    stoplines.load_for_path와 같은 이유로 **(x,y)로 스냅한다** ― --segments가
     부분집합이면 행 순서와 경로 인덱스가 어긋나기 때문이다.
 
     lc_dir 컬럼이 없는 CSV(수동 녹화본 waypoints_*.csv)면 조용히 빈 목록을
@@ -201,7 +201,7 @@ def load_lane_changes(path, waypoints_csv: str) -> tuple[list, list]:
         i = path.nearest(x, y)
         resid = math.hypot(path.pts[i][0] - x, path.pts[i][1] - y)
         if resid > SNAP_MAX_M:
-            warn.append(f'차선변경 마커 ({x:.1f},{y:.1f}) {direction}를 버린다 — '
+            warn.append(f'차선변경 마커 ({x:.1f},{y:.1f}) {direction}를 버린다 ― '
                         f'경로에서 {resid:.1f}m (한계 {SNAP_MAX_M:.0f}m)')
             continue
         if resid > SNAP_WARN_M:
@@ -279,7 +279,7 @@ def _lateral_ahead(path, s_ego: float, span_m: float) -> float:
     헤딩은 stoplines._path_heading을 그대로 쓴다 (길이 0 선분을 이미 방어한다).
 
     이 값이 "다음 3초 안에 실제로 움직일 방향"이다. 차선변경이면 차로폭
-    (3.2m)만큼, 교차로 회전이면 그보다 훨씬 크게 나온다 — 경로 1 실측(창 37m)
+    (3.2m)만큼, 교차로 회전이면 그보다 훨씬 크게 나온다 ― 경로 1 실측(창 37m)
     에서 우측 차선변경이 -2.3~-5.8m, 99도 좌회전이 +22.9~+26.3m다.
     """
     n = len(path.pts)
@@ -412,7 +412,7 @@ class TurnSignalPolicy:
             return
         z = self._active
         self._on_event('turn_off',
-                       f'{KIND_NAME[z.kind]} {z.dir} 소등 — '
+                       f'{KIND_NAME[z.kind]} {z.dir} 소등 ― '
                        f'{t - self._on_t:.1f}초 / {s_ego - self._on_s:.1f}m 점등')
         self._active = None
 
@@ -423,7 +423,7 @@ class TurnSignalPolicy:
         **방향이 같으면 램프는 실제로 꺼지지 않는다.** 그때 소등/점등 이벤트를
         내면 로그에 없는 깜빡임이 있는 것처럼 보이고, 항목 13이 요구하는
         "연속 점등 시간"도 끊겨 보인다. 그래서 구간만 갈아 끼우고 점등 시각은
-        유지한다 — 경로 1의 683.5m / 744.3m 우측 차선변경 두 구간이 이 경우다.
+        유지한다 ― 경로 1의 683.5m / 744.3m 우측 차선변경 두 구간이 이 경우다.
         """
         same = (self._active is not None
                 and self._active.signal == z.signal)
@@ -440,7 +440,7 @@ class TurnSignalPolicy:
             'turn_on',
             f'{KIND_NAME[z.kind]} {z.dir} '
             + ('구간 인계' if same else '점등')
-            + f' — 구간 시작 {z.s_start - s_ego:.1f}m 앞 '
+            + f' ― 구간 시작 {z.s_start - s_ego:.1f}m 앞 '
               f'(v={v * 3.6:.0f}km/h, lead {lead:.1f}m)')
 
     def _takeover(self, best, cands: list, opp: list, s_ego: float,
@@ -478,7 +478,7 @@ class TurnSignalPolicy:
             f'{KIND_NAME[best.kind]} {best.dir}'
             f'[{best.s_start:.1f},{best.s_end:.1f}] -> '
             f'{KIND_NAME[alt.kind]} {alt.dir}'
-            f'[{alt.s_start:.1f},{alt.s_end:.1f}] — '
+            f'[{alt.s_start:.1f},{alt.s_end:.1f}] ― '
             f's={s_ego:.1f}m에서 실제 횡이동 {lat:+.1f}m/{span:.0f}m '
             f'(창 {OVERRIDE_S:.1f}초, v={v * 3.6:.0f}km/h). '
             f'{KIND_NAME[best.kind]} {best.dir} 점등 {lit:.1f}초는 이미 나갔다')
@@ -508,14 +508,14 @@ class TurnSignalPolicy:
         if want:
             self._on_event(
                 'turn_pause',
-                f'{KIND_NAME[best.kind]} {best.dir} 정차 소등 — '
+                f'{KIND_NAME[best.kind]} {best.dir} 정차 소등 ― '
                 f'{held:.1f}초 정지, 구간 시작 {gap:.1f}m 앞'
                 f'(재점등 한계 {RELIGHT_M:.0f}m). '
                 f'{t - self._on_t:.1f}초 점등했다')
         else:
             self._on_event(
                 'turn_resume',
-                f'{KIND_NAME[best.kind]} {best.dir} 재점등 — '
+                f'{KIND_NAME[best.kind]} {best.dir} 재점등 ― '
                 f'{held:.1f}초 정지 뒤 v={v * 3.6:.0f}km/h, '
                 f'구간 시작 {gap:.1f}m 앞')
         self._paused = want
@@ -537,7 +537,7 @@ class TurnSignalPolicy:
             self._finish(t, s_ego)
             if self._carry is not None:
                 self._on_event('turn_off',
-                               f'경로 교체로 이어받은 점등 소등 — '
+                               f'경로 교체로 이어받은 점등 소등 ― '
                                f'{t - self._carry[1]:.1f}초 점등')
                 self._carry = None
             return TurnCmd()
@@ -574,7 +574,7 @@ class TurnSignalPolicy:
                         f'차선변경 {best.dir}'
                         f'[{best.s_start:.1f},{best.s_end:.1f}]이 '
                         f'회전 {other.dir}'
-                        f'[{other.s_start:.1f},{other.s_end:.1f}]을 밀어낸다 — '
+                        f'[{other.s_start:.1f},{other.s_end:.1f}]을 밀어낸다 ― '
                         f'선행 점등 중에는 차선변경이 이긴다(항목 13). '
                         f'구간에 들어간 뒤 실제 이동이 반대면 넘긴다. '
                         f'회전 점등 최대 {max(0.0, lost):.1f}m 손실')
@@ -642,16 +642,16 @@ def _plan(csv_path: str, segments: list, events_csv: str,
                 continue
             lat = _lateral_ahead(path, a.s_start, span)
             if abs(lat) < OVERRIDE_M:
-                verdict = f'횡이동 {lat:+.1f}m — 애매해서 {KIND_NAME[a.kind]} 유지'
+                verdict = f'횡이동 {lat:+.1f}m ― 애매해서 {KIND_NAME[a.kind]} 유지'
             elif (lat > 0.0) == (a.signal == TURN_LEFT):
-                verdict = f'횡이동 {lat:+.1f}m — {KIND_NAME[a.kind]} 유지'
+                verdict = f'횡이동 {lat:+.1f}m ― {KIND_NAME[a.kind]} 유지'
             else:
-                verdict = (f'횡이동 {lat:+.1f}m — 구간 진입 후 '
+                verdict = (f'횡이동 {lat:+.1f}m ― 구간 진입 후 '
                            f'{KIND_NAME[b.kind]} {b.dir}로 넘긴다')
             print(f'[ts]   *** 상충: {KIND_NAME[a.kind]} {a.dir} '
                   f'[{a.s_start:.1f},{a.s_end:.1f}] vs '
                   f'{KIND_NAME[b.kind]} {b.dir} '
-                  f'[{b.s_start:.1f},{b.s_end:.1f}] — {verdict} ***')
+                  f'[{b.s_start:.1f},{b.s_end:.1f}] ― {verdict} ***')
 
     if events_csv and os.path.exists(events_csv):
         import stoplines
@@ -925,8 +925,8 @@ def _selftest() -> int:
     check('경로 교체에서 점등 시각을 이어받는다 (인계)',
           len(offs_c) == 1 and len(offs_n) == 1 and offs_c[0] != offs_n[0]
           and '구간 인계' in ons_c[0] and '구간 인계' not in ons_n[0],
-          f'인계 {offs_c[0].split("— ")[-1]} / 미인계 '
-          f'{offs_n[0].split("— ")[-1]}')
+          f'인계 {offs_c[0].split("― ")[-1]} / 미인계 '
+          f'{offs_n[0].split("― ")[-1]}')
 
     # ------------------------------------------------------------------
     # 19~20. 우회 탈출 블렌드 (detour._blend_start와 같은 기하)

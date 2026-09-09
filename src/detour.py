@@ -338,7 +338,7 @@ def zone_report(path, zones: list, solid_m: float = None) -> list:
     """시작 시 콘솔에 낼 줄들. meta.json에도 같은 내용이 들어간다."""
     tot = sum(z.length for z in zones)
     pct = 100.0 * tot / path.length if path.length > 0 else 0.0
-    out = [f' 우회 불가 구간 {len(zones)}개 / 총 {tot:.1f}m — 경로의 {pct:.1f}%']
+    out = [f' 우회 불가 구간 {len(zones)}개 / 총 {tot:.1f}m ― 경로의 {pct:.1f}%']
     for k, z in enumerate(zones, 1):
         out.append(f'   {k}. s {z.s0:7.1f}~{z.s1:7.1f} {z.length:6.1f}m  '
                    f'{z.label()}')
@@ -691,12 +691,12 @@ class DetourPlanner:
         solid = res.solid_lc
         if label == '실선 폴백' and solid:
             self._on_event('detour_solid_lc',
-                           f'실선 차선변경 {solid}회를 포함한 우회로를 쓴다 — '
+                           f'실선 차선변경 {solid}회를 포함한 우회로를 쓴다 ― '
                            f'항목 6 경미 -3점 예상 (파선 우회로가 없다)')
         elif label == '도착 차로 제약 해제':
             self._on_event('detour_solid_lc',
                            '원래 도착 차로로 돌아오는 우회로가 없어 도착 차로 '
-                           '제약을 풀었다 — 마지막 구간의 차로가 달라진다')
+                           '제약을 풀었다 ― 마지막 구간의 차로가 달라진다')
 
         segments = _renumber(wps, job.get('seg_offset', 0))
 
@@ -985,7 +985,7 @@ class DetourPolicy:
             if math.hypot(x - b.x, y - b.y) > OB.ID_JUMP_M:
                 # 같은 id지만 다른 객체다. 확인 시간을 처음부터 다시 센다.
                 self._announce(('reuse', oid), 'obj_id_reuse',
-                               f'id={oid} 점프 — 우회 확인 시간을 리셋한다')
+                               f'id={oid} 점프 ― 우회 확인 시간을 리셋한다')
                 self._blocks[oid] = _B(oid, x, y, s, lat, d, kind, t)
                 continue
             b.x, b.y, b.s, b.lat, b.d, b.kind = x, y, s, lat, d, kind
@@ -1038,7 +1038,7 @@ class DetourPolicy:
             cmd.reason = '우회 불가 구간'
             self._announce(
                 ('imp', b.id), 'detour_impossible',
-                f'우회 불가 구간에서 막힘 — 크립 유지 '
+                f'우회 불가 구간에서 막힘 ― 크립 유지 '
                 f'(s {z.s0:.1f}~{z.s1:.1f} {z.length:.1f}m, {z.label()}, '
                 f'obj id={b.id} {b.kind} d={b.d:.1f}m lat={b.lat:+.1f}m)')
             return
@@ -1074,7 +1074,7 @@ class DetourPolicy:
         self._on_event('detour_start',
                        f'{b.kind} id={b.id} 정지 {b.acc:.1f}s '
                        f'(d={b.d:.1f}m lat={b.lat:+.1f}m, 대상 {len(group)}개) '
-                       f'— {sorted(blocked)} 우회 재탐색 '
+                       f'― {sorted(blocked)} 우회 재탐색 '
                        f'[{self.n_detours + 1}/{MAX_DETOURS}, '
                        f'이 객체 {h.tries}/{MAX_TRIES_PER_OBJ}회]')
         self.planner.request({
@@ -1119,7 +1119,7 @@ class DetourPolicy:
                 self._failed.add(oid)
                 self._retry_stopped.add(oid)
             self._on_event('detour_failed',
-                           f'{plan.reason} — 기존 거동 유지 '
+                           f'{plan.reason} ― 기존 거동 유지 '
                            f'(obj {plan.obj_ids})')
             return None
         self.n_detours += 1
@@ -1142,7 +1142,7 @@ class DetourPolicy:
             self._on_event(
                 'detour_tight',
                 f'비켜 나갈 여유가 {plan.blend_m:.1f}m뿐이다 '
-                f'(기준 {LC_ROOM_M:.0f}m) — 조향 포화를 막으려고 lookahead '
+                f'(기준 {LC_ROOM_M:.0f}m) ― 조향 포화를 막으려고 lookahead '
                 f'하한을 {DETOUR_LD_M:.0f}m로 올린다')
             self._on_event('detour_ld_boost', f'lookahead >= {DETOUR_LD_M:.0f}m')
         return plan
@@ -1157,9 +1157,9 @@ class DetourPolicy:
         if self._ld_ok >= LD_RESTORE_N or t > self._ld_until:
             self._ld_on = False
             self._on_event('detour_ld_restore',
-                           f'경로 복귀 (이탈 {off:.2f}m) — lookahead 원복'
+                           f'경로 복귀 (이탈 {off:.2f}m) ― lookahead 원복'
                            if self._ld_ok >= LD_RESTORE_N
-                           else f'{LD_BOOST_MAX_S:.0f}s 상한 — lookahead 원복')
+                           else f'{LD_BOOST_MAX_S:.0f}s 상한 ― lookahead 원복')
 
     # -- 최후 안전망 ----------------------------------------------------
     def _last_resort(self, v: float, dt: float, sig_wait: bool, obs,
@@ -1178,7 +1178,7 @@ class DetourPolicy:
                 gone = True
             if gone or finished:
                 self._on_event('last_resort_clear',
-                               f'id={self._lr_id} 통과 — 정상 복귀')
+                               f'id={self._lr_id} 통과 ― 정상 복귀')
                 self._lr_id, self._lr_acc = -1, 0.0
                 return
             cmd.action = 'last_resort'
@@ -1218,7 +1218,7 @@ class DetourPolicy:
         self._on_event(
             'last_resort_pass',
             f'{stuck.kind} id={stuck.id} 앞 {stuck.d:.1f}m에서 '
-            f'{self._lr_acc:.0f}s 정지 — 미완주를 막으려고 '
+            f'{self._lr_acc:.0f}s 정지 ― 미완주를 막으려고 '
             f'{LAST_RESORT_V * 3.6:.0f}km/h로 밀고 통과한다 '
             f'({"우회 불가 구간" if stuck.id in self._impossible else "우회 실패"}, '
             f'신호 대기 아님)')

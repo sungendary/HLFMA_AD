@@ -24,7 +24,7 @@ I/O도 소켓도 없다. 순수 로직이라 로그만으로 재현·검증된�
 4. **딜레마존이 실재한다.** 111610의 s=605.1은 G+L@66m -> YELLOW@19m였다.
    황색은 3초 뒤 적색이 되므로 "설 수 있으면 서고, 못 서면 통과"로 가른다.
    판정은 **정지선까지의 거리**로 하고 DECEL_HARD를 쓴다. 여기에 정지 마진을
-   빼고 재면 설 수 있는데도 통과로 기울어 적색에 걸린다 — sim에서 실제로
+   빼고 재면 설 수 있는데도 통과로 기울어 적색에 걸린다 ― sim에서 실제로
    그랬다(포기하고 통과했는데 정지선 도착 속도가 4.4km/h였다).
    반대로 "황색이면 무조건 정지"도 나쁘다. 범퍼가 정지선을 넘긴 채 선다.
 
@@ -214,11 +214,11 @@ def load_for_path(path, events_csv: str) -> tuple[list, list]:
         s_along = float(r.get('s_along', 0.0) or 0.0)
         if resid > SNAP_MAX_M:
             warn.append(f'정지선 s_along={s_along:.1f} ctrl={"|".join(map(str, sorted(ctrl))) or "-"} '
-                        f'를 버린다 — 경로에서 {resid:.1f}m (한계 {SNAP_MAX_M:.0f}m)')
+                        f'를 버린다 ― 경로에서 {resid:.1f}m (한계 {SNAP_MAX_M:.0f}m)')
             continue
         if resid > 1.5:
             warn.append(f'정지선 s_along={s_along:.1f} 스냅 잔차 {resid:.1f}m '
-                        f'— 이벤트 CSV가 이 경로보다 오래됐을 수 있다')
+                        f'― 이벤트 CSV가 이 경로보다 오래됐을 수 있다')
         out.append(Stopline(i, path.s[i], x, y, ctrl, _maneuver_at(path, i),
                             resid, r.get('road_id', ''), r.get('lane_id', ''),
                             s_along))
@@ -248,7 +248,7 @@ def _profile(avail: float, v: float) -> tuple:
 
     그래서 **지금 속도로 avail 안에 서는 데 필요한 감속을 직접 준다.**
     v^2 = 2*a*avail 을 a에 대해 푼 값이다. 프로파일 아래에 있을 때는
-    걸지 않는다 — 안 그러면 멀리서부터 가속을 막아 버린다.
+    걸지 않는다 ― 안 그러면 멀리서부터 가속을 막아 버린다.
     """
     v_limit = 0.0 if avail <= 0.3 else math.sqrt(2.0 * DECEL_SIGNAL * avail)
     if v <= v_limit:
@@ -327,7 +327,7 @@ class SignalPolicy:
         for d, sl in cands:
             if sl.signalized:
                 self._announce(('fallback', tl_id, id(sl)), 'tl_fallback',
-                               f'tl_id={tl_id}가 경로 정지선의 ctrl에 없다 — '
+                               f'tl_id={tl_id}가 경로 정지선의 ctrl에 없다 ― '
                                f'최근접 신호 정지선(s={sl.s:.1f} '
                                f'ctrl={sl.ctrl_str()}) {d:.1f}m 사용')
                 return sl, d
@@ -382,7 +382,7 @@ class SignalPolicy:
                 # (sim에서 실제로 이 실수가 났다).
                 self._announce((id(sl), 'late'), 'tl_late',
                                f'ctrl={sl.ctrl_str()} 정지선을 {-bumper:.1f}m 넘은 뒤 '
-                               f'적색 v={v * 3.6:.0f}km/h — 교차로를 빠져나간다')
+                               f'적색 v={v * 3.6:.0f}km/h ― 교차로를 빠져나간다')
                 self._release(sl)
                 self._clear_timers()
                 return SignalCmd(state=tl_state, ctrl=tl_id, dist=d,
@@ -394,17 +394,17 @@ class SignalPolicy:
                 # 딜레마존 (docstring 4번). 정지하면 정지선을 침범한다
                 self._announce((id(sl), 'dilemma'), 'tl_yellow_go',
                                f'ctrl={sl.ctrl_str()} 황색 {d:.1f}m '
-                               f'v={v * 3.6:.0f}km/h — 정지에 {need:.1f}m 필요, '
+                               f'v={v * 3.6:.0f}km/h ― 정지에 {need:.1f}m 필요, '
                                f'정지선까지 {bumper:.1f}m. 통과한다')
                 self._release(sl)
                 self._clear_timers()
                 return SignalCmd(state=tl_state, ctrl=tl_id, dist=d,
-                                 action='go', reason='황색 — 정지 불가, 통과')
+                                 action='go', reason='황색 ― 정지 불가, 통과')
             return self._stop(sl, tl_state, tl_id, d, avail, v, t, '황색')
 
         if tl_state == LEFT:
             self._announce((id(sl), LEFT), 'tl_unknown_state',
-                           f'state=4(LEFT) 최초 관측 — ctrl={sl.ctrl_str()} '
+                           f'state=4(LEFT) 최초 관측 ― ctrl={sl.ctrl_str()} '
                            f'기동={sl.maneuver} {d:.1f}m. 사전테스트에 없던 상태다')
             if sl.maneuver == 'left':
                 return self._go(sl, tl_state, tl_id, d, v, t, '좌회전 신호 + 좌회전 기동')
@@ -417,13 +417,13 @@ class SignalPolicy:
 
         if tl_state == FLASHING:
             self._announce((id(sl), FLASHING), 'tl_unknown_state',
-                           f'state=6(FLASHING) 최초 관측 — ctrl={sl.ctrl_str()} '
+                           f'state=6(FLASHING) 최초 관측 ― ctrl={sl.ctrl_str()} '
                            f'{d:.1f}m. 적/황 점멸을 구분할 수 없어 일시정지한다')
             return self._flashing(sl, tl_state, tl_id, d, avail, bumper, v, t)
 
         # 명세에 없는 값. 정지가 안전하다
         self._announce((id(sl), tl_state), 'tl_unknown_state',
-                       f'명세에 없는 state={tl_state} — ctrl={sl.ctrl_str()} '
+                       f'명세에 없는 state={tl_state} ― ctrl={sl.ctrl_str()} '
                        f'{d:.1f}m. 정지로 처리한다')
         if bumper <= 0.0 and v > PASS_THROUGH_MS:
             self._release(sl)
@@ -464,13 +464,13 @@ class SignalPolicy:
                 elif t - self._none_since >= NONE_RELEASE_S:
                     self._on_event('tl_timeout',
                                    f'ctrl={self._cur.ctrl_str()} 정지선 {d:.1f}m 앞에서 '
-                                   f'신호가 {NONE_RELEASE_S:.0f}초간 NONE — 출발한다')
+                                   f'신호가 {NONE_RELEASE_S:.0f}초간 NONE ― 출발한다')
                     self._release(self._cur)
                     self._clear_timers()
                     self._none_since = None
-                    return SignalCmd(action='go', dist=d, reason='NONE 지속 — 해제')
+                    return SignalCmd(action='go', dist=d, reason='NONE 지속 ― 해제')
                 return SignalCmd(v_limit=0.0, action='hold', dist=d,
-                                 reason='신호 NONE — 판정 대기')
+                                 reason='신호 NONE ― 판정 대기')
         self._none_since = None
         self._clear_timers()
         self._green_stuck_since = None
@@ -480,7 +480,7 @@ class SignalPolicy:
         if self._stop_since is not None:
             self._on_event('tl_go',
                            f'ctrl={sl.ctrl_str()} {STATE_NAME.get(state, state)} '
-                           f'— 정지선 {d:.1f}m 앞에서 출발')
+                           f'― 정지선 {d:.1f}m 앞에서 출발')
         self._clear_timers()
 
         # 항목 8: 녹색 + 정지선 30m 이내 + 5초 이상 정차는 감점이다.
@@ -493,7 +493,7 @@ class SignalPolicy:
             elif t - self._green_stuck_since >= GREEN_STUCK_S:
                 self._announce((id(sl), 'stuck'), 'tl_green_stuck',
                                f'ctrl={sl.ctrl_str()} 녹색인데 정지선 {d:.1f}m 앞에서 '
-                               f'{t - self._green_stuck_since:.1f}초 정차 — 항목 8 위험')
+                               f'{t - self._green_stuck_since:.1f}초 정차 ― 항목 8 위험')
         else:
             self._green_stuck_since = None
         return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
@@ -505,7 +505,7 @@ class SignalPolicy:
             self._stop_since = t
             self._on_event('tl_stop',
                            f'ctrl={sl.ctrl_str()} {STATE_NAME.get(state, state)} '
-                           f'{d:.1f}m v={v * 3.6:.0f}km/h — 정지 결정 ({reason})')
+                           f'{d:.1f}m v={v * 3.6:.0f}km/h ― 정지 결정 ({reason})')
 
         v_limit, accel_limit = _profile(avail, v)
 
@@ -518,37 +518,37 @@ class SignalPolicy:
                 # 완주가 최우선이다. -6점을 먹더라도 미완주는 피한다.
                 self._on_event('tl_timeout',
                                f'ctrl={sl.ctrl_str()} {STATE_NAME.get(state, state)}로 '
-                               f'{self.max_hold:.0f}초 대기 — 교착 방지로 출발한다')
+                               f'{self.max_hold:.0f}초 대기 ― 교착 방지로 출발한다')
                 self._release(sl)
                 self._clear_timers()
                 return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
-                                 reason='대기 시간 초과 — 해제')
+                                 reason='대기 시간 초과 ― 해제')
             return SignalCmd(0.0, 'hold', state, tl_id, d, reason,
                              stop_avail=0.0)
         return SignalCmd(v_limit, 'stop', state, tl_id, d, reason, accel_limit,
                          stop_avail=avail)
 
     def _flashing(self, sl, state, tl_id, d, avail, bumper, v, t) -> SignalCmd:
-        """항목 9 — 적색점멸은 정지선 2m 이내 0.5초 이상 정지가 요건이다.
+        """항목 9 ― 적색점멸은 정지선 2m 이내 0.5초 이상 정지가 요건이다.
 
         적/황 점멸을 9910으로는 구분할 수 없다. 황색점멸이었다면 불필요한
         정지지만 감점은 없고, 적색점멸에서 무정차 통과는 중대 -6점이다.
         """
         if id(sl) in self._pause_done:
-            return self._go(sl, state, tl_id, d, v, t, '점멸 — 일시정지 완료')
+            return self._go(sl, state, tl_id, d, v, t, '점멸 ― 일시정지 완료')
         if bumper <= 0.0 and v > PASS_THROUGH_MS:
             self._announce((id(sl), 'pause_late'), 'tl_pause',
-                           f'ctrl={sl.ctrl_str()} 점멸 — 정지선을 {-bumper:.1f}m 넘었다. '
+                           f'ctrl={sl.ctrl_str()} 점멸 ― 정지선을 {-bumper:.1f}m 넘었다. '
                            f'일시정지 못 함 (항목 9 위험)')
             self._release(sl)
             self._clear_timers()
             return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
-                             reason='점멸 — 정지선 통과 후')
+                             reason='점멸 ― 정지선 통과 후')
 
         if self._stop_since is None:
             self._stop_since = t
             self._on_event('tl_stop',
-                           f'ctrl={sl.ctrl_str()} FLASHING {d:.1f}m — '
+                           f'ctrl={sl.ctrl_str()} FLASHING {d:.1f}m ― '
                            f'일시정지 (항목 9)')
 
         if v < STOP_SPEED and bumper <= PAUSE_ZONE_M:
@@ -558,7 +558,7 @@ class SignalPolicy:
                 self._pause_done.add(id(sl))
                 self._on_event('tl_pause',
                                f'ctrl={sl.ctrl_str()} 범퍼 {bumper:.1f}m 앞에서 '
-                               f'{t - self._pause_since:.1f}초 정지 — 항목 9 충족')
+                               f'{t - self._pause_since:.1f}초 정지 ― 항목 9 충족')
                 self._clear_timers()
                 return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
                                  reason='점멸 일시정지 완료')
@@ -566,7 +566,7 @@ class SignalPolicy:
                              stop_avail=0.0)
 
         v_limit, accel_limit = _profile(avail, v)
-        return SignalCmd(v_limit, 'pause', state, tl_id, d, '점멸 — 정지선 접근',
+        return SignalCmd(v_limit, 'pause', state, tl_id, d, '점멸 ― 정지선 접근',
                          accel_limit, stop_avail=avail)
 
 
