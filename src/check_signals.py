@@ -118,7 +118,7 @@ def legs_of(session: str, meta: dict, wp: str, ev: str, segs: list) -> list:
     (detour.DetourPlanner._solve).
     """
     legs = [{'label': os.path.basename(wp) or 'waypoints.csv',
-             'wp': wp, 'ev': ev, 'segs': list(segs),
+             'wp': wp, 'ev': ev, 'segs': list(segs), 'detour': False,
              't0': float('-inf'), 't1': float('inf')}]
     det = meta.get('detours') or []
     for k, d in enumerate(det):
@@ -135,7 +135,8 @@ def legs_of(session: str, meta: dict, wp: str, ev: str, segs: list) -> list:
         legs[-1]['t1'] = t0
         legs.append({'label': os.path.basename(csv_path), 'wp': csv_path,
                      'ev': ev_path if os.path.exists(ev_path) else '',
-                     'segs': [], 't0': t0, 't1': float('inf')})
+                     'segs': [], 'detour': True,
+                     't0': t0, 't1': float('inf')})
     return legs
 
 
@@ -166,19 +167,23 @@ def expand(patterns: list) -> list:
 # A 방향지시등
 
 def check_turn(frames: list, zones: list, partial: bool = False) -> list:
-    """구간마다 (zone, 선행 점등 시간, 방향 일치, 측정 가능).
+    """구간마다 (zone, 선행 점등 시간, 방향 일치, 측정 가능, 앞선 소등).
 
     partial=True면 이 프레임 묶음이 주행의 일부(leg)라는 뜻이다. **점등 방향이
     맞는데 leg가 구간 시작 3초 앞을 못 덮으면 측정불가다** — 선행 점등이 앞
     leg에 걸쳐 있는 것이지 위반이 아니다. 방향이 틀린 것은 그 프레임만 보면
     되므로 leg가 짧아도 판정할 수 있다.
+
+    다섯째 값은 **연속 점등 구간 바로 앞의 소등 길이와 그 앞의 같은 방향 점등
+    시간**이다 (없으면 None). 판정에는 쓰지 않는다 — turnsignal의 정차 소등
+    (turn_pause)이 선행 3초를 갉아먹었는지 사후에 보려고 낸다.
     """
     out = []
     for z in zones:
         hit = next((i for i, f in enumerate(frames) if f['s'] >= z.s_start),
                    None)
         if hit is None:
-            out.append((z, float('nan'), False, True))
+            out.append((z, float('nan'), False, True, None))
             continue
         # 구간 시작 직전의 **연속** 점등만 센다. 중간에 꺼지면 거기서 끊긴다.
         j = hit
@@ -188,8 +193,67 @@ def check_turn(frames: list, zones: list, partial: bool = False) -> list:
         lead = frames[hit]['t'] - frames[j]['t'] if matched else 0.0
         known = not (partial and matched and lead < LEAD_REQ_S
                      and frames[hit]['t'] - frames[0]['t'] < LEAD_REQ_S)
-        out.append((z, lead, matched, known))
+        out.append((z, lead, matched, known, _prior_gap(frames, j, z)))
     return out
+
+
+def _prior_gap(frames: list, j: int, z) -> tuple | None:
+    """연속 점등이 시작된 j 바로 앞의 소등 구간.
+
+    (소등 시간, 그 전의 같은 방향 점등 시간, 소등 시작 t, 소등 끝 t).
+    소등이 없거나 그 앞이 같은 방향이 아니면 None. 앞뒤가 같은 방향이라는
+    조건이 "끊긴 하나의 점등"을 뜻한다 -- 정차 소등(turn_pause)이 선행 3초를
+    갉아먹었는지가 이 값으로 드러난다.
+    """
+    k = j
+    while k > 0 and frames[k - 1]['turn'] == 0:
+        k -= 1
+    if k == j or k == 0 or frames[k - 1]['turn'] != z.signal:
+        return None
+    m = k
+    while m > 0 and frames[m - 1]['turn'] == z.signal:
+        m -= 1
+    return (frames[j]['t'] - frames[k]['t'], frames[k]['t'] - frames[m]['t'],
+            frames[k]['t'], frames[j]['t'])
+
+
+def read_pauses(session: str) -> list:
+    """events.csv의 turn_pause 시각. 없으면 빈 목록.
+
+    소등 구간이 **정차 소등인지** 그냥 두 구간 사이의 정상 소등인지는 이걸로만
+    가른다. 시간 길이로 어림하면 45초짜리 신호 대기 소등과 구분이 안 된다.
+    """
+    out = []
+    p = os.path.join(session, 'events.csv')
+    if not os.path.exists(p):
+        return out
+    try:
+        with io.open(p, newline='', encoding='utf-8') as fh:
+            for r in csv.DictReader(fh):
+                if (r.get('kind') or '') == 'turn_pause':
+                    out.append(float(r['t']))
+    except (OSError, ValueError, KeyError):
+        return []
+    return out
+
+
+def lit_before_moving(frames: list, z, move_ms: float = DWELL_MS) -> float:
+    """차가 처음 움직이기 시작한 프레임까지의 **연속 점등 시간** [s].
+
+    우회 탈출 블렌드는 구간 시작이 경로 원점(s=0)이라 check_turn의 선행이 늘
+    0초로 나온다 -- 교체 프레임이 곧 판정 프레임이기 때문이다. 그 숫자는
+    램프가 아니라 측정의 성질이다. 정지 상태에서 켜 두고 출발했다면 실제로는
+    그만큼 앞서 알린 것이므로 따로 낸다.
+    """
+    mv = next((i for i, f in enumerate(frames) if f['v'] > move_ms), None)
+    if mv is None:
+        return 0.0
+    j = mv
+    while j > 0 and frames[j - 1]['turn'] == z.signal:
+        j -= 1
+    if frames[mv]['turn'] != z.signal:
+        return 0.0
+    return frames[mv]['t'] - frames[j]['t']
 
 
 def stray_signal(frames: list, zones: list) -> float:
@@ -255,8 +319,11 @@ def report(session: str, waypoints: str, events: str, segments: list,
     from pure_pursuit import load_path
     stray = 0.0
     lc_rows, xw_rows_all = [], []
+    leg_frames = {}
+    pauses = read_pauses(session)
     for k, leg in enumerate(legs):
         fr = [f for f in frames if leg['t0'] <= f['t'] < leg['t1']]
+        leg_frames[k] = fr
         lsegs = leg['segs'] or (turnsignal._segments_of(leg['wp'])
                                 if os.path.exists(leg['wp']) else [])
         if not fr or not os.path.exists(leg['wp']) or not lsegs:
@@ -291,8 +358,19 @@ def report(session: str, waypoints: str, events: str, segments: list,
         xw_rows_all.extend((k, r) for r in check_crosswalk(fr, xw_zones))
 
     print('    A 방향지시등 (항목 13)')
-    for k, (z, lead, matched, known) in lc_rows:
+    for k, (z, lead, matched, known, gap) in lc_rows:
         req = (z.kind == 'lc')
+        # 우회 탈출 블렌드 -- 교체와 동시에 결정되는 기동이라 선행 3초가
+        # 원리적으로 불가능하다. 마커가 blend_m/2에 있고 폭이 ±10m라 s_start는
+        # 늘 0으로 잘린다. 합계에서는 측정불가로 빠지지만 **실제로 몇 초
+        # 켰는지는 위에 그대로 찍힌다.**
+        escape = req and legs[k].get('detour') and z.s_start <= 0.01
+        # 소등 구간이 **정차 소등이었는지**는 이벤트로만 가른다. 길이로 어림하면
+        # 두 구간 사이의 정상 소등(위 49.6초 같은 것)까지 섞인다.
+        paused = bool(gap and any(gap[2] - 0.1 <= tp <= gap[3] + 0.1
+                                  for tp in pauses))
+        stopped_lit = (lit_before_moving(leg_frames.get(k) or [], z)
+                       if escape else 0.0)
         if req and known:
             tally['lc_total'] += 1
         bad = req and known and not (matched and lead >= LEAD_REQ_S)
@@ -306,8 +384,12 @@ def report(session: str, waypoints: str, events: str, segments: list,
               + f'{turnsignal.KIND_NAME[z.kind]:6s} {z.dir:5s}  '
                 f'선행 {lead:5.2f}초'
               + ('' if matched else '  ← 미점등/방향 불일치')
+              + (f'  (앞서 정차 소등 {gap[0]:.1f}초 / 그 전 {gap[1]:.1f}초 점등)'
+                 if paused else '')
+              + (f'  ← 우회 탈출 블렌드 (선행 3초 불가, '
+                 f'출발 직전까지 {stopped_lit:.2f}초 점등)' if escape else '')
               + ('  ← leg가 3초 앞을 못 덮는다 (측정불가)'
-                 if req and not known else ''))
+                 if req and not known and not escape else ''))
     if not lc_rows:
         print('      점등 구간 없음')
     if stray > 0.5:

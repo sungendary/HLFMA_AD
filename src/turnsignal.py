@@ -59,6 +59,26 @@ stoplines.py / obstacles.py와 같은 구조다 — I/O가 없는 순수 로직�
 lead가 속도에 비례하므로(3.5초 x v) 접근 중 감속하면 lead가 줄어 껐다 켰다
 한다. **한 번 켜지면 구간이 끝날 때까지 래치해서** 그 채터링을 막는다.
 리스폰 시 reset()으로 버린다.
+
+--- 정차 중 소등 ---
+
+실차에서 **정지한 채 램프가 11~35초 켜져 있었다** (9/9 저녁, drive.csv에서
+turn!=0 이면서 speed<1km/h인 연속 구간). 멈춰 있는데 방향을 알릴 이유가 없고
+잘못된 정보를 준다. 그래서 PAUSE_AFTER_S 이상 정지해 있으면 끈다.
+
+**단 구간 시작이 RELIGHT_M 안이면 끄지 않는다.** 항목 13은 "구간 시작 직전의
+연속 점등 3초"로 채점되므로, 구간 코앞에서 껐다가 재출발하면 그 3초를 잃는다.
+20m는 지령 상한 3.0m/s^2에서도 3.65초가 걸려 재출발 뒤에 3초가 남는다.
+소등/재점등은 turn_pause / turn_resume로 남긴다 — 구간을 지나서 끄는
+turn_off와 구분해야 사후에 헷갈리지 않는다.
+
+--- 차선변경 구간 안의 회전은 버린다 ---
+
+차선변경 블렌드는 헤딩이 ±로 흔들려 한쪽 run이 회전 임계를 넘을 수 있다.
+우회로의 탈출 블렌드가 실제로 그랬다 — detour_2.csv의 turn right 3.1~9.6m
+(-26도)는 교차로가 아니라 **블렌드가 차로에 다시 정렬되는 구간**이고, 그때
+차는 반대인 좌측으로 움직이고 있었다. **명시적 lc 마커가 있는 구간에서는
+마커가 헤딩 추론보다 우선한다.**
 """
 
 from __future__ import annotations
@@ -99,6 +119,13 @@ TAKEOVER_AFTER_M = 2.0      # m, 구간 시작을 이만큼 지난 뒤에 넘긴
                             # (check_signals.check_turn). 그 프레임까지는
                             # 차선변경 방향이 켜져 있어야 선행 점등이 인정된다
 
+# 정차 중 소등 — "멈춰 있는데 방향을 알릴 이유가 없다"
+STOP_MS = 1.0 / 3.6         # m/s, 1km/h. crosswalks.DWELL_MS와 같은 값
+PAUSE_AFTER_S = 3.0         # s, 이만큼 정지해 있으면 끈다
+RELIGHT_M = 20.0            # m, **구간 시작이 이 안이면 끄지 않는다.**
+                            # 정지에서 20m는 지령 상한 3.0m/s^2로도 3.65초라
+                            # 재출발 뒤에도 항목 13의 선행 3초가 남는다
+
 SIGNAL_NAME = {TURN_OFF: 'OFF', TURN_LEFT: 'LEFT', TURN_RIGHT: 'RIGHT'}
 SIGNAL_OF = {'left': TURN_LEFT, 'right': TURN_RIGHT}
 KIND_NAME = {'lc': '차선변경', 'turn': '교차로회전'}
@@ -135,7 +162,7 @@ class TurnCmd:
     def __init__(self, signal=TURN_OFF, action='none', src='',
                  dist=float('nan'), reason=''):
         self.signal = signal        # TURN_OFF / TURN_LEFT / TURN_RIGHT
-        self.action = action        # none / on / error
+        self.action = action        # none / on / pause / error
         self.src = src              # 'lc' / 'turn'
         self.dist = dist            # 구간 시작까지 [m]. 구간 안이면 음수
         self.reason = reason
@@ -286,13 +313,34 @@ def _merge(zones: list) -> list:
     return out
 
 
+def _drop_turns_in_lc(zones: list) -> list:
+    """차선변경 구간 안에 통째로 들어간 회전 구간을 버린다.
+
+    차선변경 블렌드는 헤딩이 ±로 흔들려 한쪽 run이 TURN_RAD를 넘을 수 있다.
+    우회로의 탈출 블렌드가 실제로 그랬다 -- detour_2.csv의 turn right
+    3.1~9.6m(-26도)는 교차로가 아니라 정렬 구간이고, 그때 차는 반대인 좌측으로
+    가고 있었다. **명시적 lc 마커가 그 구간에서는 헤딩 추론보다 우선한다.**
+
+    **완전히 들어간 것만 버린다.** 경로 1의 회전 left[736.9,767.8]은 차선변경
+    right[734.3,754.3]보다 뒤로 삐져나오므로 그대로 남고, 상충 해소 로직이
+    오늘처럼 처리한다.
+    """
+    lc = [z for z in zones if z.kind == 'lc']
+    if not lc:
+        return zones
+    return [z for z in zones
+            if z.kind != 'turn'
+            or not any(a.s_start <= z.s_start and z.s_end <= a.s_end
+                       for a in lc)]
+
+
 def build_zones(path, waypoints_csv: str, *,
                 junction: bool = True) -> tuple[list, list]:
     """점등 구간 전부. (구간 목록, 경고 목록)."""
     zones, warn = load_lane_changes(path, waypoints_csv)
     zones = _merge(zones)
     if junction:
-        zones = zones + _merge(find_turns(path))
+        zones = _drop_turns_in_lc(zones + _merge(find_turns(path)))
     zones.sort(key=lambda z: (z.s_start, 0 if z.kind == 'lc' else 1))
     return zones, warn
 
@@ -338,6 +386,8 @@ class TurnSignalPolicy:
         self._on_t = 0.0
         self._on_s = 0.0
         self._announced = set()
+        self._stop_t = None         # 정지가 시작된 시각. 움직이면 None
+        self._paused = False        # 정차 소등 중인가
 
     def adopt(self, prev, t: float) -> None:
         """경로 교체(우회) 시 직전 정책의 점등 상태를 이어받는다.
@@ -347,8 +397,8 @@ class TurnSignalPolicy:
         끊겨 보인다. _switch의 same 분기와 같은 취지다. 구간(_active)은 옛
         경로의 s 기준이라 가져오지 않고 방향과 시각만 넘겨받는다.
         """
-        if prev is None or prev._active is None:
-            return
+        if prev is None or prev._active is None or prev._paused:
+            return                  # 정차 소등 중이면 램프는 실제로 꺼져 있다
         self._carry = (prev._active.signal, prev._on_t)
 
     def _announce(self, key, kind: str, detail: str) -> None:
@@ -434,6 +484,43 @@ class TurnSignalPolicy:
             f'{KIND_NAME[best.kind]} {best.dir} 점등 {lit:.1f}초는 이미 나갔다')
         return alt
 
+    def _pause(self, best, s_ego: float, v: float, t: float) -> bool:
+        """정차 중이면 램프를 끈다. 껐으면 True.
+
+        실차에서 **정지한 채 램프가 11~35초 켜져 있었다.** 멈춰 있는데 방향을
+        알릴 이유가 없고 잘못된 정보를 준다.
+
+        **구간 시작이 RELIGHT_M 안이면 끄지 않는다.** 항목 13은 "구간 시작
+        직전의 연속 점등 3초"로 채점되므로 구간 코앞에서 껐다가 재출발하면
+        그 3초를 잃는다. 20m는 지령 상한 3.0m/s^2로도 3.65초라 재출발 뒤에
+        3초가 남는다. 실제로 차로를 바꾸려고 서 있는 상태이기도 하다.
+        """
+        if v >= STOP_MS:
+            self._stop_t = None
+        elif self._stop_t is None:
+            self._stop_t = t
+        held = 0.0 if self._stop_t is None else t - self._stop_t
+        want = (held >= PAUSE_AFTER_S
+                and best.s_start - s_ego > RELIGHT_M)
+        if want == self._paused:
+            return self._paused
+        gap = best.s_start - s_ego
+        if want:
+            self._on_event(
+                'turn_pause',
+                f'{KIND_NAME[best.kind]} {best.dir} 정차 소등 — '
+                f'{held:.1f}초 정지, 구간 시작 {gap:.1f}m 앞'
+                f'(재점등 한계 {RELIGHT_M:.0f}m). '
+                f'{t - self._on_t:.1f}초 점등했다')
+        else:
+            self._on_event(
+                'turn_resume',
+                f'{KIND_NAME[best.kind]} {best.dir} 재점등 — '
+                f'{held:.1f}초 정지 뒤 v={v * 3.6:.0f}km/h, '
+                f'구간 시작 {gap:.1f}m 앞')
+        self._paused = want
+        return want
+
     def update(self, s_ego: float, v: float, t: float) -> TurnCmd:
         lead = max(self.lead_s * max(v, self.v_ref), self.lead_min)
 
@@ -446,6 +533,7 @@ class TurnSignalPolicy:
                 cands.append(z)
 
         if not cands:
+            self._paused = False
             self._finish(t, s_ego)
             if self._carry is not None:
                 self._on_event('turn_off',
@@ -491,6 +579,18 @@ class TurnSignalPolicy:
                         f'구간에 들어간 뒤 실제 이동이 반대면 넘긴다. '
                         f'회전 점등 최대 {max(0.0, lost):.1f}m 손실')
                     break
+
+        if self._pause(best, s_ego, v, t):
+            # 소등 중에도 활성 구간은 조용히 따라간다. 지나간 구간이 _active로
+            # 남으면 후보 래치가 오염되고, 점등 시각을 현재로 밀어 두어야
+            # 재점등 뒤의 연속 점등 시간이 그 순간부터 세진다.
+            self._active = best
+            self._on_t, self._on_s = t, s_ego
+            # src를 'pause'로 둔다 -- drive.csv의 turn_src만 보고도 "왜 꺼져
+            # 있나"가 바로 갈린다 (구간이 없어서 0인 것과 구분된다).
+            return TurnCmd(TURN_OFF, 'pause', 'pause',
+                           best.s_start - s_ego,
+                           f'{KIND_NAME[best.kind]} {best.dir} 정차 소등')
 
         if best is not self._active:
             self._switch(best, t, s_ego, v, lead)
@@ -827,6 +927,92 @@ def _selftest() -> int:
           and '구간 인계' in ons_c[0] and '구간 인계' not in ons_n[0],
           f'인계 {offs_c[0].split("— ")[-1]} / 미인계 '
           f'{offs_n[0].split("— ")[-1]}')
+
+    # ------------------------------------------------------------------
+    # 19~20. 우회 탈출 블렌드 (detour._blend_start와 같은 기하)
+
+    def blend_path(lat=3.0, blend=9.0, n=60):
+        """ego가 lat만큼 왼쪽에 있는 상태에서 차로에 붙는 경로. lat>0이면 우측."""
+        pts = []
+        for i in range(n):
+            u = min(1.0, i / blend)
+            pts.append((float(i), lat * (1.0 - u * u * (3.0 - 2.0 * u))))
+        return Path(pts)
+
+    bp = blend_path()
+    raw = find_turns(bp)
+    lcz = TurnZone('lc', 'right', 0.0, 14.5, 0.0, 0.0)
+    inside = [z for z in raw if lcz.s_start <= z.s_start and z.s_end <= lcz.s_end]
+    check('짧은 블렌드는 회전으로 오검출된다 (그래서 필터가 필요하다)',
+          bool(inside), f'{[repr(z) for z in raw]}')
+    kept = _drop_turns_in_lc([lcz] + raw)
+    check('차선변경 구간 안의 회전을 버린다',
+          all(z.kind != 'turn' for z in kept), f'{[repr(z) for z in kept]}')
+
+    rec7 = _Rec()
+    pol7 = TurnSignalPolicy(bp, kept, v_ref=12.5, on_event=rec7)
+    _o7, _r7, hist7 = _run(pol7, {}, lambda t: 12.5, length=40.0)
+    lit = [sig_at(hist7, x) for x in (1.0, 4.0, 8.0, 12.0)]
+    check('블렌드 내내 실제 이동 방향(우)을 켠다',
+          all(g == TURN_RIGHT for g in lit)
+          and not [1 for k, _d in rec7.ev if k == 'turn_takeover'],
+          ' '.join(SIGNAL_NAME[g] for g in lit))
+
+    # ------------------------------------------------------------------
+    # 21~24. 정차 중 소등 (실차에서 정지한 채 11~35초 켜져 있었다)
+
+    def drive(pol, vs, dt=0.05):
+        t, s0, hist = 0.0, 0.0, []
+        for v in vs:
+            cmd = pol.update(s0, v, t)
+            hist.append((t, s0, cmd.signal))
+            s0 += v * dt
+            t += dt
+        return hist
+
+    def pause_case(cruise_steps, stop_steps, tail=None):
+        z = TurnZone('lc', 'left', 150.0, 170.0, 150.0, 0.0)
+        rec = _Rec()
+        pol = TurnSignalPolicy(path, [z], v_ref=12.5, on_event=rec)
+        vs = [12.5] * cruise_steps + [0.0] * stop_steps + (tail or [])
+        return rec, drive(pol, vs)
+
+    rec8, hist8 = pause_case(176, 120)          # s=110 (구간 40m 앞) 에서 6초 정지
+    n_pause = len([1 for k, _d in rec8.ev if k == 'turn_pause'])
+    check('구간 40m 앞에서 정지하면 소등한다',
+          hist8[-1][2] == TURN_OFF and n_pause == 1,
+          f'{SIGNAL_NAME[hist8[-1][2]]} / turn_pause {n_pause}회')
+    check('소등 전까지는 켜져 있다 (PAUSE_AFTER_S 만큼 기다린다)',
+          hist8[176 + 40][2] == TURN_LEFT,      # 정지 2.0초 시점
+          SIGNAL_NAME[hist8[176 + 40][2]])
+
+    rec9, hist9 = pause_case(224, 120)          # s=140 (구간 10m 앞) 에서 6초 정지
+    check('구간 시작 20m 안이면 끄지 않는다 (항목 13 선행 보호)',
+          hist9[-1][2] == TURN_LEFT
+          and not [1 for k, _d in rec9.ev if k == 'turn_pause'],
+          SIGNAL_NAME[hist9[-1][2]])
+
+    # 재출발: 3.0m/s^2 (지령 상한) 로 가속해도 선행 3초가 남아야 한다
+    ramp = [min(12.5, 3.0 * (k + 1) * 0.05) for k in range(600)]
+    rec10, hist10 = pause_case(176, 200, ramp)
+    hit = next(i for i, (_t, ss, _g) in enumerate(hist10) if ss >= 150.0)
+    j = hit
+    while j > 0 and hist10[j - 1][2] == TURN_LEFT:
+        j -= 1
+    lead_t = hist10[hit][0] - hist10[j][0]
+    kinds10 = [k for k, _d in rec10.ev]
+    check('재출발 뒤 선행 점등 3초 이상 (정차 소등이 갉아먹지 않는다)',
+          hist10[hit][2] == TURN_LEFT and lead_t >= 3.0, f'{lead_t:.2f}초')
+    check('turn_pause / turn_resume 가 한 번씩 난다',
+          kinds10.count('turn_pause') == 1 and kinds10.count('turn_resume') == 1,
+          ','.join(kinds10))
+
+    # 미세 이동(0.9km/h)이 섞여도 채터링하지 않는다
+    micro = [0.0 if k % 2 else 0.25 for k in range(240)]
+    rec11, _h11 = pause_case(176, 0, micro)
+    check('정지/미세 이동이 섞여도 소등은 한 번뿐',
+          len([1 for k, _d in rec11.ev if k == 'turn_pause']) == 1,
+          ','.join(k for k, _d in rec11.ev))
 
     print('\n자기검사 ' + ('전부 통과' if ok else '실패 있음'))
     return 0 if ok else 1

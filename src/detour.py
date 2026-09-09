@@ -364,7 +364,8 @@ class Plan:
 
     __slots__ = ('ok', 'reason', 'bundle', 'rows', 'zones', 'csv_path',
                  'ev_path', 'segments', 'tight', 'first_lc_m', 'solid_lc',
-                 'n_lc', 'cost', 'blocked', 'obj_ids', 'start_lat', 'blend_m')
+                 'n_lc', 'cost', 'blocked', 'obj_ids', 'start_lat', 'blend_m',
+                 'blend_dir')
 
     def __init__(self, ok, reason='', **kw):
         self.ok, self.reason = ok, reason
@@ -383,6 +384,7 @@ class Plan:
         self.obj_ids = kw.get('obj_ids') or []
         self.start_lat = kw.get('start_lat', 0.0)
         self.blend_m = kw.get('blend_m', 0.0)
+        self.blend_dir = kw.get('blend_dir', '')
 
 
 def _snapshot(wps: list) -> list:
@@ -425,6 +427,46 @@ def _blend_start(wps: list, ego_x: float, ego_y: float,
         w.x += nx * lat * k
         w.y += ny * lat * k
     return lat
+
+
+LC_MARK_MIN_M = 0.8         # m, 이보다 작은 블렌드는 차로 변경이 아니라 미세 보정
+
+
+def _mark_escape_blend(wps: list, lat: float, blend_m: float) -> str:
+    """탈출 블렌드에 lc_dir 마커를 심는다. 심은 방향, 안 심었으면 ''.
+
+    _blend_start가 붙이는 구간은 **실제 차로 변경이다.** 마커가 없으면
+    turnsignal이 그 기동을 모른다 -- 실차에서 좌회전 점등을 켠 채 우측으로
+    블렌드해 나갔다 (pp_20260909_162539의 detour_4, 횡간격 +3.06m).
+
+    **부호에 주의한다.** lat은 _blend_start가 낸 값이고 **새 경로 기준 ego의
+    횡위치**(좌가 양수)다. lat>0이면 새 차로가 오른쪽에 있다는 뜻이라 차는
+    **우측으로** 움직인다. 실측 3건이 전부 그렇다 (detour_1 +2.95 -> 우,
+    detour_2 -3.01 -> 좌, detour_4 +3.06 -> 우). --selftest가 이 불변식을
+    turnsignal._lateral_ahead와 대조한다.
+
+    마커는 블렌드 한가운데에 둔다. turnsignal이 마커 ±LC_BLEND_M/2(10m)를
+    구간으로 잡으므로 9~20m 블렌드 전체가 덮인다.
+    """
+    if len(wps) < 2 or blend_m <= 0.1 or abs(lat) < LC_MARK_MIN_M:
+        return ''
+    want = blend_m * 0.5
+    c, px, py = 0.0, wps[0].x, wps[0].y
+    best_i, best_d = 0, float('inf')
+    for i, w in enumerate(wps):
+        c += math.hypot(w.x - px, w.y - py)
+        px, py = w.x, w.y
+        d = abs(c - want)
+        if d < best_d:
+            best_i, best_d = i, d
+        if c > want + 1.0:
+            break
+    if wps[best_i].lc_dir:              # 그래프가 준 마커를 덮지 않는다
+        return ''
+    direction = 'right' if lat > 0.0 else 'left'
+    wps[best_i].lc_dir = direction
+    wps[best_i].lc_solid = 0            # 실선인지 모른다. 항목 6 경고를
+    return direction                    # 거짓으로 올리지 않는다
 
 
 def _seg_index(name: str) -> int:
@@ -658,6 +700,20 @@ class DetourPlanner:
 
         segments = _renumber(wps, job.get('seg_offset', 0))
 
+        # **마커를 심기 전에 센다.** 합성 마커까지 세면 first_lc_m이 늘
+        # blend_m/2가 되어 tight가 항상 참이 되고 lookahead 상향이 달라진다.
+        first, acc = float('nan'), 0.0
+        for a, b in zip(wps, wps[1:]):
+            if a.lc_dir:
+                first = acc
+                break
+            acc += math.hypot(b.x - a.x, b.y - a.y)
+        n_lc = sum(1 for w in wps if w.lc_dir)
+        tight = ((abs(lat) > 0.5 and blend_m < LC_ROOM_M)
+                 or ((first == first) and first < LC_ROOM_M))
+
+        blend_dir = _mark_escape_blend(wps, lat, blend_m)
+
         base = os.path.join(self.out_dir, f'detour_{job["n"]}')
         csv_path, ev_path = base + '.csv', base + '_events.csv'
         G.write_waypoints(csv_path, wps)
@@ -677,22 +733,12 @@ class DetourPlanner:
         zones = scan_undetourable(bundle['path'], rows, self.graph,
                                   self.has_lc, self.injunc)
 
-        # 첫 차선변경 마커까지 거리 (블렌드로 처리한 경우 nan)
-        first, acc = float('nan'), 0.0
-        for a, b in zip(wps, wps[1:]):
-            if a.lc_dir:
-                first = acc
-                break
-            acc += math.hypot(b.x - a.x, b.y - a.y)
-        n_lc = sum(1 for w in wps if w.lc_dir)
-        tight = ((abs(lat) > 0.5 and blend_m < LC_ROOM_M)
-                 or ((first == first) and first < LC_ROOM_M))
-
         return Plan(True, '', bundle=bundle, rows=rows, zones=zones,
                     csv_path=csv_path, ev_path=ev_path, segments=segments,
                     tight=tight, first_lc_m=first, solid_lc=solid,
                     n_lc=n_lc, cost=res.cost, blocked=sorted(blocked),
-                    obj_ids=ids, start_lat=lat, blend_m=blend_m)
+                    obj_ids=ids, start_lat=lat, blend_m=blend_m,
+                    blend_dir=blend_dir)
 
 
 # ----------------------------------------------------------------------
@@ -1083,7 +1129,9 @@ class DetourPolicy:
             f'차선변경 {plan.n_lc}회'
             + (f' (실선 {plan.solid_lc}회)' if plan.solid_lc else '')
             + (f', 출발 횡간격 {plan.start_lat:+.2f}m를 {plan.blend_m:.1f}m에 '
-               f'걸쳐 붙인다' if abs(plan.start_lat) > 0.05 else '')
+               f'걸쳐 붙인다'
+               + (f'({plan.blend_dir} 점등)' if plan.blend_dir else '')
+               if abs(plan.start_lat) > 0.05 else '')
             + (f', 첫 차선변경 마커 {plan.first_lc_m:.1f}m 앞'
                if plan.first_lc_m == plan.first_lc_m else '')
             + f' -> {os.path.basename(plan.csv_path)}')
@@ -1547,6 +1595,32 @@ def _selftest() -> int:
     _run(pol, car, n=400)
     check('우회 3회 뒤에도 발동', bool(pol.planner.jobs),
           f'{len(pol.planner.jobs)}회 요청')
+
+    # 11f~11g. 탈출 블렌드 마커의 **부호**. 뒤집으면 실차에서 반대쪽이 켜진다.
+    #          진실은 하나뿐이다 -- 결과 기하의 실제 횡이동 방향.
+    import turnsignal as TS
+    from pure_pursuit import Path
+
+    def blend_case(lat_want):
+        """ego가 새 경로에서 lat_want만큼 떨어진 상황을 합성한다."""
+        import xodr_graph as G
+        wps = [G.Waypoint('p1_to_p2', float(i), 0.0, 0.0, '1', -1, 0,
+                          float(i), 3.2) for i in range(60)]
+        # ego는 새 경로 첫 점 기준 lat_want만큼 왼쪽(양수)에 있다
+        _blend_start(wps, 0.0, lat_want, 12.0)
+        d = _mark_escape_blend(wps, lat_want, 12.0)
+        moved = TS._lateral_ahead(Path([(w.x, w.y) for w in wps]), 0.0, 12.0)
+        return d, moved
+
+    for lat_want, want_dir in ((3.0, 'right'), (-3.0, 'left')):
+        d, moved = blend_case(lat_want)
+        ok_sign = (d == want_dir
+                   and ((moved < -0.3) if want_dir == 'right' else (moved > 0.3)))
+        check(f'탈출 블렌드 마커 부호 (lat {lat_want:+.1f}m -> {want_dir})',
+              ok_sign, f'마커 {d or "없음"} / 실제 횡이동 {moved:+.2f}m')
+
+    d, _m = blend_case(0.3)
+    check('미세 보정에는 마커를 심지 않는다', d == '', f'마커 {d or "없음"}')
 
     # 12. 실제 경로 -- 계획 단계 실측과 일치해야 한다
     data = _data_dir()
