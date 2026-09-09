@@ -38,7 +38,8 @@ NAN = float('nan')
 DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'tgt_x', 'tgt_y', 'ld', 'steer', 'accel', 'tl_id', 'tl_state',
               'n_obj', 'tl_act', 'tl_dist',
-              'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat']
+              'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat',
+              'turn', 'turn_src', 'cw_act', 'cw_dist']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -145,7 +146,9 @@ class SessionLog:
                   steer: float = 0.0, accel: float = 0.0,
                   tl_act: str = '', tl_dist: float = NAN,
                   ob_act: str = '', ob_kind: str = '', ob_id: int = -1,
-                  ob_dist: float = NAN, ob_lat: float = NAN) -> None:
+                  ob_dist: float = NAN, ob_lat: float = NAN,
+                  turn: int = 0, turn_src: str = '',
+                  cw_act: str = '', cw_dist: float = NAN) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -164,7 +167,8 @@ class SessionLog:
                 seg, idx, tgt_x, tgt_y, ld, steer, accel,
                 frame.tl_id, frame.tl_state, len(frame.objects),
                 tl_act, tl_dist,
-                ob_act, ob_kind, ob_id, ob_dist, ob_lat)])
+                ob_act, ob_kind, ob_id, ob_dist, ob_lat,
+                turn, turn_src, cw_act, cw_dist)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (
@@ -213,7 +217,14 @@ class SessionLog:
         충돌 회피(obstacles.py)가 내는
         ped_stop_actual / ped_stop_predicted / ped_clear / ped_timeout /
         veh_follow / veh_stop / veh_timeout / obstacle_slow /
-        obstacle_clear / obj_id_reuse 중 하나.
+        obstacle_clear / obj_id_reuse,
+
+        방향지시등(turnsignal.py)이 내는
+        turn_on / turn_off / turn_conflict,
+
+        횡단보도 정차 금지(crosswalks.py)가 내는
+        xw_guard / xw_guard_infeasible / xw_dwell / crosswalk_escape /
+        xw_escape_blocked / xw_clear 중 하나.
         """
         if not self.enabled:
             return

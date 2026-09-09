@@ -118,11 +118,11 @@ class SignalCmd:
     """한 프레임의 판정 결과."""
 
     __slots__ = ('v_limit', 'action', 'state', 'ctrl', 'dist', 'reason',
-                 'accel_limit')
+                 'accel_limit', 'stop_avail')
 
     def __init__(self, v_limit=float('inf'), action='none', state=NONE,
                  ctrl=0, dist=float('nan'), reason='',
-                 accel_limit=float('inf')):
+                 accel_limit=float('inf'), stop_avail=float('nan')):
         self.v_limit = v_limit      # m/s. inf면 제약 없음
         self.accel_limit = accel_limit  # m/s^2 상한. inf면 제약 없음
         self.action = action        # none / go / stop / hold / pause
@@ -130,6 +130,10 @@ class SignalCmd:
         self.ctrl = ctrl            # 그때 받은 tl_id
         self.dist = dist            # 후륜축 -> 정지선 거리 [m]
         self.reason = reason
+        # 후륜축이 지금부터 몇 m 더 가서 설 작정인가. nan이면 정지 의사 없음.
+        # 횡단보도 정차 금지(crosswalks.py, 항목 12)가 "그 자리가 횡단보도
+        # 위인가"를 판정하는 데 쓴다. 여기 말고 소비자가 없다.
+        self.stop_avail = stop_avail
 
     @property
     def stopping(self) -> bool:
@@ -519,8 +523,10 @@ class SignalPolicy:
                 self._clear_timers()
                 return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
                                  reason='대기 시간 초과 — 해제')
-            return SignalCmd(0.0, 'hold', state, tl_id, d, reason)
-        return SignalCmd(v_limit, 'stop', state, tl_id, d, reason, accel_limit)
+            return SignalCmd(0.0, 'hold', state, tl_id, d, reason,
+                             stop_avail=0.0)
+        return SignalCmd(v_limit, 'stop', state, tl_id, d, reason, accel_limit,
+                         stop_avail=avail)
 
     def _flashing(self, sl, state, tl_id, d, avail, bumper, v, t) -> SignalCmd:
         """항목 9 — 적색점멸은 정지선 2m 이내 0.5초 이상 정지가 요건이다.
@@ -556,11 +562,12 @@ class SignalPolicy:
                 self._clear_timers()
                 return SignalCmd(state=state, ctrl=tl_id, dist=d, action='go',
                                  reason='점멸 일시정지 완료')
-            return SignalCmd(0.0, 'pause', state, tl_id, d, '점멸 일시정지 중')
+            return SignalCmd(0.0, 'pause', state, tl_id, d, '점멸 일시정지 중',
+                             stop_avail=0.0)
 
         v_limit, accel_limit = _profile(avail, v)
         return SignalCmd(v_limit, 'pause', state, tl_id, d, '점멸 — 정지선 접근',
-                         accel_limit)
+                         accel_limit, stop_avail=avail)
 
 
 def summary(stoplines) -> list:

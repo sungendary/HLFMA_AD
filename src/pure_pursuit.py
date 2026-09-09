@@ -18,6 +18,10 @@
       (stoplines.py, 평가항목 7·9)
     · objects[]를 경로에 투영해 보행자·차량·장애물을 피한다
       (obstacles.py, 평가항목 10·11·14). --no-obstacle로 끈다
+    · 차선변경·교차로 회전 3초 전에 방향지시등을 켠다
+      (turnsignal.py, 평가항목 13). --no-turn-signal로 끈다
+    · 횡단보도 위에 서게 될 것 같으면 그 앞에 서고, 이미 올라가 있으면
+      안전할 때만 빠져나간다 (crosswalks.py, 평가항목 12). --no-crosswalk로 끈다
     · 리스폰(프레임 간 5m 이상 점프) 감지 시 경로 인덱스를 다시 전역 탐색
 """
 
@@ -35,8 +39,10 @@ from hlvtd_client import (
     TURN_OFF, STEER_LIMIT, ACCEL_MAX, ACCEL_MIN,
 )
 from session_log import SessionLog, default_dir
+import crosswalks
 import obstacles
 import stoplines
+import turnsignal
 
 WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 값
 LD_MIN, LD_MAX = 4.0, 10.0  # m, lookahead 범위
@@ -180,6 +186,23 @@ def load_path(csv_path: str, segments: list[str]) -> tuple[Path, list[tuple[str,
     return Path(pts), bounds
 
 
+def _stop_target(s_ego: float, sig, obs) -> float:
+    """sig/obs가 겨냥한 후륜축 정지 지점 중 가까운 쪽. 둘 다 없으면 nan.
+
+    stop_avail은 "지금부터 몇 m 더 가서 설 작정인가"라서 s_ego를 더하면 경로
+    누적거리가 된다. 횡단보도 정차 금지(항목 12)가 "그 자리가 횡단보도 위인가"를
+    묻는 데만 쓴다.
+    """
+    best = float('nan')
+    for avail in (sig.stop_avail, obs.stop_avail):
+        if avail != avail:                      # nan = 정지 의사 없음
+            continue
+        s = s_ego + max(0.0, avail)
+        if best != best or s < best:
+            best = s
+    return best
+
+
 def steering_for(ego_x: float, ego_y: float, heading: float,
                  tx: float, ty: float, ld: float, wheelbase: float) -> tuple[float, float]:
     """Pure Pursuit 조향각과 목표점 방위각(alpha)을 계산한다.
@@ -219,15 +242,19 @@ def run(args) -> None:
 
     target_speed = args.speed / 3.6                 # km/h -> m/s
 
+    # 이벤트 CSV는 신호등(정지선)과 횡단보도가 **함께 쓴다.** 그래서 경로
+    # 결정을 --no-signal 바깥에 둔다 — 안에 두면 --no-signal이 횡단보도까지
+    # 조용히 꺼 버린다.
+    ev_path = args.events or stoplines.default_events_path(args.waypoints)
+    ev_ctx = {'t': 0.0, 'x': float('nan'), 'y': float('nan'), 'v': float('nan')}
+
     # 신호등 정지 (평가항목 7·9). --events가 없고 waypoints 옆에 _events.csv도
     # 없으면 비활성이고, 그때는 예전과 완전히 같은 주행이 된다.
-    ev_path = '' if args.no_signal else (
-        args.events or stoplines.default_events_path(args.waypoints))
-    ev_ctx = {'t': 0.0, 'x': float('nan'), 'y': float('nan'), 'v': float('nan')}
+    sig_path = '' if args.no_signal else ev_path
     policy = None
-    if ev_path:
-        sl_list, sl_warn = stoplines.load_for_path(path, ev_path)
-        print(f'[pp] 정지선 {len(sl_list)}개 ({os.path.basename(ev_path)})')
+    if sig_path:
+        sl_list, sl_warn = stoplines.load_for_path(path, sig_path)
+        print(f'[pp] 정지선 {len(sl_list)}개 ({os.path.basename(sig_path)})')
         for line in stoplines.summary(sl_list):
             print('[pp]' + line)
         for w in sl_warn:
@@ -240,6 +267,39 @@ def run(args) -> None:
     # 충돌 회피 (평가항목 10·11·14). --no-obstacle이면 예전과 같은 주행이 된다.
     obs_policy = None
 
+    # 방향지시등 (평가항목 13). 차선변경은 waypoint CSV의 lc_dir에서,
+    # 교차로 회전은 경로 헤딩에서 나온다.
+    turn_policy = None
+    tz_list, tz_warn = [], []
+    if not args.no_turn_signal:
+        tz_list, tz_warn = turnsignal.build_zones(
+            path, args.waypoints, junction=not args.no_junction_signal)
+        n_lc = sum(1 for z in tz_list if z.kind == 'lc')
+        print(f'[pp] 방향지시등 구간 {len(tz_list)}개 '
+              f'(차선변경 {n_lc} / 회전 {len(tz_list) - n_lc}), '
+              f'선행 {args.turn_lead:.1f}초')
+        for line in turnsignal.summary(tz_list):
+            print('[pp]' + line)
+        for w in tz_warn:
+            print(f'[pp]   *** {w} ***')
+    else:
+        print('[pp] 방향지시등 비활성 (--no-turn-signal)')
+
+    # 횡단보도 정차 금지 (평가항목 12). 정지선과 같은 이벤트 CSV를 쓴다.
+    xw_policy = None
+    xw_list, xw_warn = [], []
+    if not args.no_crosswalk and ev_path:
+        xw_list, xw_warn = crosswalks.load_for_path(path, ev_path)
+        print(f'[pp] 횡단보도 {len(xw_list)}개')
+        for line in crosswalks.summary(xw_list):
+            print('[pp]' + line)
+        for w in xw_warn:
+            print(f'[pp]   *** {w} ***')
+    elif args.no_crosswalk:
+        print('[pp] 횡단보도 정차 금지 비활성 (--no-crosswalk)')
+    else:
+        print('[pp] 횡단보도 정차 금지 비활성 (이벤트 CSV 없음)')
+
     # 세션 로그를 먼저 연다. 원본 프레임을 파싱 전에 받아야 하므로
     # raw_sink를 Client에 물려서 연결한다.
     log = SessionLog(args.session, mode='pp', meta={
@@ -250,43 +310,59 @@ def run(args) -> None:
         'path_points': len(path.pts),
         'path_length_m': round(path.length, 2),
         'events': ev_path,
+        'signal': bool(sig_path),
         'front_overhang': args.front_overhang,
         'tl_max_hold_s': args.tl_max_hold,
         'obstacles': not args.no_obstacle,
         'obs_lookahead_m': args.obs_lookahead,
         'obs_max_block_s': args.obs_max_block,
+        'turn_signal': not args.no_turn_signal,
+        'turn_junction': not args.no_junction_signal,
+        'turn_lead_s': args.turn_lead,
+        'turn_zones': len(tz_list),
+        'crosswalk': (not args.no_crosswalk) and bool(ev_path),
+        'cw_escape_after_s': args.cw_escape_after,
+        'crosswalks': len(xw_list),
     })
     log.copy_input(args.waypoints, 'waypoints.csv')
     log.copy_input(args.route, 'route.csv')   # 현장에서 받은 원본은 반드시 보존
 
-    if ev_path:
-        def _sig_event(kind: str, detail: str) -> None:
-            print()
-            print(f'[pp] [{kind}] {detail}')
-            log.event(kind, detail, t=ev_ctx['t'],
-                      ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
+    # 정책이 내는 이벤트는 전부 같은 통로로 나간다. 콘솔에 찍고, 그때의
+    # 위치·시각을 ev_ctx에서 꺼내 events.csv에 남긴다.
+    def _policy_event(kind: str, detail: str) -> None:
+        print()
+        print(f'[pp] [{kind}] {detail}')
+        log.event(kind, detail, t=ev_ctx['t'],
+                  ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
 
-        policy = stoplines.SignalPolicy(
-            path, sl_list, front_overhang=args.front_overhang,
-            max_hold=args.tl_max_hold, on_event=_sig_event)
+    if ev_path:
         log.copy_input(ev_path, 'events_in.csv')
 
-    if not args.no_obstacle:
-        def _obs_event(kind: str, detail: str) -> None:
-            print()
-            print(f'[pp] [{kind}] {detail}')
-            log.event(kind, detail, t=ev_ctx['t'],
-                      ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
+    if sig_path:
+        policy = stoplines.SignalPolicy(
+            path, sl_list, front_overhang=args.front_overhang,
+            max_hold=args.tl_max_hold, on_event=_policy_event)
 
+    if not args.no_obstacle:
         obs_policy = obstacles.ObstaclePolicy(
             path, front_overhang=args.front_overhang,
             lookahead=args.obs_lookahead, max_block=args.obs_max_block,
-            on_event=_obs_event)
+            on_event=_policy_event)
         print('[pp] 충돌 회피 활성 (항목 10·11·14)')
         for line in obstacles.summary(obs_policy):
             print('[pp]' + line)
     else:
         print('[pp] 충돌 회피 비활성 (--no-obstacle)')
+
+    if not args.no_turn_signal:
+        turn_policy = turnsignal.TurnSignalPolicy(
+            path, tz_list, lead_s=args.turn_lead,
+            v_ref=target_speed, on_event=_policy_event)
+
+    if not args.no_crosswalk and ev_path:
+        xw_policy = crosswalks.CrosswalkPolicy(
+            path, xw_list, front_overhang=args.front_overhang,
+            escape_after=args.cw_escape_after, on_event=_policy_event)
 
     client = Client(args.host, args.port, raw_sink=log.raw_sink)
     print(f'[pp] {args.host}:{args.port} 연결 시도...')
@@ -318,6 +394,8 @@ def run(args) -> None:
             t = time.monotonic() - t0
             sig = stoplines.SignalCmd()        # 예외가 나도 로깅이 되게
             obs = obstacles.ObstacleCmd()
+            xw = crosswalks.CrosswalkCmd()
+            turn = turnsignal.TurnCmd()
             try:
                 v = speed_est.update(frame.ego_x, frame.ego_y)
                 ev_ctx.update(t=t, x=frame.ego_x, y=frame.ego_y, v=v)
@@ -332,6 +410,10 @@ def run(args) -> None:
                         policy.reset()
                     if obs_policy is not None:
                         obs_policy.reset()      # 추적도 전부 버린다
+                    if turn_policy is not None:
+                        turn_policy.reset()     # 점등 래치를 버린다
+                    if xw_policy is not None:
+                        xw_policy.reset()       # 정차·탈출 타이머를 버린다
                 prev_frame = frame
 
                 if idx is None:                     # 시작 / 리스폰 후 전역 탐색
@@ -381,6 +463,23 @@ def run(args) -> None:
                                         frame.tl_state, t, blocked=obs.blocking)
                     v_cmd = min(v_cmd, sig.v_limit)
 
+                # 횡단보도(항목 12)는 **신호·객체 뒤에** 돈다. 그 둘이 겨냥한
+                # 정지 지점이 횡단보도 위인지를 봐야 하기 때문이다.
+                if xw_policy is not None:
+                    xw = xw_policy.update(
+                        path.s[idx], v, t,
+                        stop_s=_stop_target(path.s[idx], sig, obs),
+                        tl_stop_ahead=(sig.stopping and sig.dist > 0.0),
+                        front_clear=(None if obs_policy is None
+                                     else obs.front_clear))
+                    v_cmd = min(v_cmd, xw.v_limit)
+                    # **min() 구조를 깨는 유일한 지점이다.** 항목 12(-3)를
+                    # 피하려고 v_cmd를 끌어올린다. 항목 7(-6)·14(-6)이 걸린
+                    # 상황에서는 crosswalks가 escape=False를 내므로 여기 오지
+                    # 않는다. 아래 finished 처리가 이것보다 뒤라 완주가 이긴다.
+                    if xw.escape:
+                        v_cmd = max(v_cmd, xw.escape_v)
+
                 # 경로 끝: pure pursuit 항을 접어두고 마지막 구간 접선을
                 # 유지하는 조향으로 넘긴다. 끝점에 붙을수록 접선 항의 비중이
                 # 커지고, 그 항은 END_STEER_LIMIT로 묶여 있어 포화되지 않는다.
@@ -400,8 +499,14 @@ def run(args) -> None:
                     accel = min(accel, -1.5)
                 # 신호 정지는 속도 상한만으로는 프로파일을 못 따라간다.
                 # P 제어의 정상상태 오차만큼 위로 달려 정지선을 넘는다.
-                accel = min(accel, sig.accel_limit, obs.accel_limit)
+                accel = min(accel, sig.accel_limit, obs.accel_limit,
+                            xw.accel_limit)
                 accel = max(ACCEL_MIN, min(ACCEL_MAX, accel))
+
+                # 방향지시등(항목 13)은 속도에 영향이 없어 위 합류에 끼지
+                # 않는다. CTRL의 3번째 바이트로만 나간다.
+                if turn_policy is not None and not finished:
+                    turn = turn_policy.update(path.s[idx], v, t)
                 last_cmd = (steer, accel)
             except Exception as exc:                # 계산 실패해도 루프는 유지
                 print(f'\n[pp] 계산 오류: {exc!r} — 마지막 명령 유지')
@@ -413,8 +518,10 @@ def run(args) -> None:
                 idx = idx or 0
                 sig = stoplines.SignalCmd(action='error')
                 obs = obstacles.ObstacleCmd(action='error')
+                xw = crosswalks.CrosswalkCmd(action='error')
+                turn = turnsignal.TurnCmd(action='error')
 
-            if not client.send_control(steer, accel, TURN_OFF):
+            if not client.send_control(steer, accel, turn.signal):
                 print('\n[pp] 송신 실패. 재연결...')
                 log.event('disconnect', '송신 실패', t=t,
                           ego_x=frame.ego_x, ego_y=frame.ego_y, speed=v)
@@ -428,7 +535,9 @@ def run(args) -> None:
                           tgt_x=tx, tgt_y=ty, ld=ld, steer=steer, accel=accel,
                           tl_act=sig.action, tl_dist=sig.dist,
                           ob_act=obs.action, ob_kind=obs.kind,
-                          ob_id=obs.obj_id, ob_dist=obs.dist, ob_lat=obs.lat)
+                          ob_id=obs.obj_id, ob_dist=obs.dist, ob_lat=obs.lat,
+                          turn=turn.signal, turn_src=turn.src,
+                          cw_act=xw.action, cw_dist=xw.dist)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -443,6 +552,10 @@ def run(args) -> None:
                   + ('' if obs.action in ('none', 'error')
                      else f' | OB:{obs.action:6s}{obs.kind[:3]}'
                           f'{obs.dist:5.1f}m{obs.lat:+5.1f}')
+                  + ('' if xw.action in ('none', 'error')
+                     else f' | XW:{xw.action:6s}{xw.dist:6.1f}m')
+                  + ('' if turn.signal == TURN_OFF
+                     else f' | SIG:{turnsignal.SIGNAL_NAME[turn.signal]}')
                   + ('  [완료]' if finished else ''))
 
             if finished:
@@ -496,6 +609,18 @@ def main() -> None:
     ap.add_argument('--obs-max-block', type=float,
                     default=obstacles.MAX_BLOCK_S,
                     help='보행자 대기 상한 [s]. 넘으면 교착으로 보고 기어간다')
+    ap.add_argument('--no-turn-signal', action='store_true',
+                    help='방향지시등을 끈다 (회귀 비교용)')
+    ap.add_argument('--no-junction-signal', action='store_true',
+                    help='교차로 회전 점등만 끈다. 차선변경 점등은 남는다')
+    ap.add_argument('--turn-lead', type=float, default=turnsignal.LEAD_S,
+                    help='방향지시등 선행 점등 시간 [s]. 요건은 3초')
+    ap.add_argument('--no-crosswalk', action='store_true',
+                    help='횡단보도 정차 금지를 끈다 (회귀 비교용)')
+    ap.add_argument('--cw-escape-after', type=float,
+                    default=crosswalks.ESCAPE_AFTER_S,
+                    help='횡단보도 위 정차 이 시간 뒤 탈출을 검토한다 [s]. '
+                         '항목 12 한계는 3초')
     ap.add_argument('--session', '--log', dest='session',
                     default=default_dir('pp'),
                     help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')

@@ -196,11 +196,13 @@ class ObstacleCmd:
     """한 프레임의 판정 결과. stoplines.SignalCmd와 같은 모양이다."""
 
     __slots__ = ('v_limit', 'accel_limit', 'action', 'kind', 'obj_id',
-                 'dist', 'lat', 'reason', 'blocking')
+                 'dist', 'lat', 'reason', 'blocking', 'stop_avail',
+                 'front_clear')
 
     def __init__(self, v_limit=float('inf'), action='none', kind='',
                  obj_id=-1, dist=float('nan'), lat=float('nan'), reason='',
-                 accel_limit=float('inf'), blocking=False):
+                 accel_limit=float('inf'), blocking=False,
+                 stop_avail=float('nan'), front_clear=float('inf')):
         self.v_limit = v_limit          # m/s. inf면 제약 없음
         self.accel_limit = accel_limit  # m/s^2 상한. inf면 제약 없음
         self.action = action            # none / follow / slow / stop / hold / creep
@@ -210,6 +212,13 @@ class ObstacleCmd:
         self.lat = lat                  # 경로 기준 부호 횡거리 [m]
         self.reason = reason
         self.blocking = blocking        # 항목 8 면책 — 전방에 차량·보행자
+        # 후륜축이 지금부터 몇 m 더 가서 설 작정인가. nan이면 정지 의사 없음
+        # (장애물 감속처럼 서지 않는 판정, 또는 후보 없음).
+        self.stop_avail = stop_avail
+        # 앞범퍼에서 전방 차로 내 최근접 객체 뒷면까지의 여유 [m]. 후보가
+        # 없으면 lookahead. **횡단보도 탈출(crosswalks.py)의 안전 게이트가
+        # 쓰는 값이고, 이 값 없이는 탈출을 발동하지 않는다.**
+        self.front_clear = front_clear
 
     @property
     def stopping(self) -> bool:
@@ -299,6 +308,9 @@ class ObstaclePolicy:
         cand_ids = set()
         blocking = False
         ped_stopped = False
+        # 앞범퍼에서 전방 차로 내 최근접 객체까지의 여유. 후보가 하나도
+        # 없으면 "lookahead 안에 아무것도 없다"가 그 자체로 결론이다.
+        front_clear = self.lookahead
 
         for o in objects:
             # 프리필터. 여기서 대부분이 걸러져 투영은 몇 개만 돈다
@@ -330,6 +342,13 @@ class ObstaclePolicy:
                     and 0.0 < d <= BLOCKING_M):
                 blocking = True
 
+            # 전방 여유. 종류마다 "차로 안" 기준이 다르므로 각자의 기준을 쓴다.
+            # 라바콘도 넣는다 — 들이받으면 항목 11이다
+            band = OBST_LANE_M if cls == OBSTACLE else VEH_LANE_M
+            if d > 0.0 and abs(lat) <= band:
+                front_clear = min(front_clear,
+                                  max(0.0, d - self.front - o.length * 0.5))
+
             if cls == VEHICLE:
                 cmd = self._vehicle(o, tr, d, lat, th, v)
             elif cls == PEDESTRIAN:
@@ -348,9 +367,10 @@ class ObstaclePolicy:
         if not cands:
             self._hold_since = None
             self._creep_id = None
-            return ObstacleCmd(blocking=blocking)
+            return ObstacleCmd(blocking=blocking, front_clear=front_clear)
 
         best = min(cands, key=lambda c: (c.v_limit, c.dist))
+        best.front_clear = front_clear
         # 실제로 차량·보행자 때문에 서 있다면 횡거리와 무관하게 면책이다.
         # VEH_LANE_M 밖(예: 횡거리 2.5m 보행자)에서 정지하는 경우가 있는데
         # 그때 면책이 없으면 항목 8 경고가 뜨고 MAX_HOLD_S가 돌아 버린다
@@ -372,8 +392,8 @@ class ObstaclePolicy:
 
         gap = d - self.front - o.length * 0.5      # 앞차 뒤범퍼까지
         creeping = (self._creep_id == o.id)
-        v_limit, accel_limit = _profile(
-            gap - (CREEP_GAP if creeping else MIN_GAP), v, v_lead)
+        avail = gap - (CREEP_GAP if creeping else MIN_GAP)
+        v_limit, accel_limit = _profile(avail, v, v_lead)
         # 차간시간 규칙. 넓은 간격에서는 아무 제약도 되지 않는다.
         #
         # **v_lead 아래로는 내리지 않는다.** 우리보다 빠른 차가 같은 차로에서
@@ -403,8 +423,10 @@ class ObstaclePolicy:
                            f'앞차 {v_lead * 3.6:.0f}km/h — 추종 '
                            f'상한 {v_limit * 3.6:.0f}km/h')
             reason = f'앞차 추종 간격 {gap:.1f}m'
+        # 앞차가 달리고 있어도 그 자리를 정지 후보로 본다. 앞차가 서면
+        # 우리가 서는 곳이라, 그 자리가 횡단보도 위인지 미리 봐야 한다.
         return ObstacleCmd(v_limit, action, VEHICLE, o.id, d, lat, reason,
-                           accel_limit)
+                           accel_limit, stop_avail=avail)
 
     def _pedestrian(self, o, tr, d, lat, th, v) -> ObstacleCmd | None:
         """항목 10 (중대 -6). 정적 3m 대역만으로는 제동이 늦다.
@@ -446,18 +468,21 @@ class ObstaclePolicy:
             # 400초를 못 움직였다. 반대로 차폭 안이면 절대 지나가지 않는다.
             if abs(lat) > PED_CORRIDOR_M:
                 v_limit, accel_limit = OBST_CREEP, float('inf')
+                avail = float('nan')        # 서지 않고 지나간다
                 why += f' (교착 해제 — 차폭({PED_CORRIDOR_M:.1f}m) 밖이라 서행 통과)'
             else:
-                v_limit, accel_limit = _profile(d - self.front - CREEP_GAP, v)
+                avail = d - self.front - CREEP_GAP
+                v_limit, accel_limit = _profile(avail, v)
                 v_limit = min(v_limit, OBST_CREEP)
                 why += ' (교착 해제 — 차폭 안이라 간격까지만)'
             return ObstacleCmd(v_limit, 'creep', PEDESTRIAN, o.id, d, lat, why,
-                               accel_limit)
+                               accel_limit, stop_avail=avail)
 
-        v_limit, accel_limit = _profile(d - self.front - PED_GAP, v)
+        avail = d - self.front - PED_GAP
+        v_limit, accel_limit = _profile(avail, v)
         action = 'hold' if (v < STOP_SPEED and v_limit < STOP_SPEED) else 'stop'
         return ObstacleCmd(v_limit, action, PEDESTRIAN, o.id, d, lat, why,
-                           accel_limit)
+                           accel_limit, stop_avail=avail)
 
     def _obstacle(self, o, tr, d, lat) -> ObstacleCmd | None:
         """항목 11 (경미 -3). **정지하지 않는다.**
