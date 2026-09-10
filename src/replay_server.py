@@ -231,16 +231,33 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
     done_since = None
     end_frames = 0          # 종료선 통과 뒤 보낼 ego(0,0) 프레임 수
 
+    # --end-at x,y: 종료선을 실제 경로 끝이 아니라 이 점(끝 접선 방향 반평면)으로
+    end_at = None
+    if args.end_at:
+        ex_, ey_ = (float(v) for v in args.end_at.split(','))
+        end_at = (ex_, ey_, path.end_heading())
+
     while alive.is_set():
         idx = path.nearest(ego.x, ego.y, start=idx)
         s_ego = path.s[idx]
-        # 실제 VTD처럼 후륜축이 종료선(실제 경로 끝)을 넘으면 시뮬레이션을
-        # 끝내고 ego(0,0)을 보낸다. 기본 0이면 예전처럼 정지까지 흘린다
-        if args.end_frames > 0 and s_ego > path.finish_s:
-            print(f'[sim] 종료선 통과 (s={s_ego:.1f} > {path.finish_s:.1f}, '
-                  f'v={ego.v * 3.6:.1f}km/h) ― ego(0,0) {args.end_frames}프레임 송신')
-            end_frames = args.end_frames
-            break
+        # 실제 VTD처럼 후륜축이 종료선(실제 경로 끝 또는 --end-at)을 넘으면
+        # 시뮬레이션을 끝내고 ego(0,0)을 보낸다. 기본 0이면 예전처럼 정지까지 흘린다
+        if args.end_frames > 0:
+            if end_at is not None:
+                # 반평면 판정은 종료선 근처에서만 -- 출발점이 그 반평면에 있을 수 있다
+                crossed = (math.hypot(ego.x - end_at[0], ego.y - end_at[1]) < 30.0
+                           and ((ego.x - end_at[0]) * math.cos(end_at[2])
+                                + (ego.y - end_at[1]) * math.sin(end_at[2])) > 0.0)
+                where = f'({end_at[0]:.1f},{end_at[1]:.1f}) 통과, s={s_ego:.1f}'
+            else:
+                crossed = s_ego > path.finish_s
+                where = f's={s_ego:.1f} > {path.finish_s:.1f}'
+            if crossed:
+                # 넘은 프레임 자체는 보낸다 -- VTD도 받은 상태로 판정할 것이므로
+                # 클라이언트가 lon>0 프레임을 한 번은 본 뒤 ego(0,0)이 온다
+                print(f'[sim] 종료선 통과 ({where}, v={ego.v * 3.6:.1f}km/h) '
+                      f'― 이 프레임 뒤 ego(0,0) {args.end_frames}프레임 송신')
+                end_frames = args.end_frames
         tl_id, tl_state = src.sample(s_ego, sim_t)
         blob = sim_world.overlay(track.at(s_ego, sim_t), injected, ego)
         try:
@@ -249,6 +266,8 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
             print('[sim] 클라이언트가 끊었다')
             break
         n += 1
+        if end_frames:
+            break
 
         # 다음 스텝. 제어 스레드가 갱신한 최신 명령을 쓴다
         steer, accel, _sig = stats.last
@@ -337,7 +356,8 @@ def main() -> None:
     sim.add_argument('--inject-object', action='append', metavar='SPEC',
                      help='경로 위에 합성 정지 객체를 놓는다. 반복 지정 가능. '
                           's=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7] '
-                          '(s=경로 호길이, lat=부호 횡거리 좌가 양수)')
+                          '(s=경로 호길이, lat=부호 횡거리 좌가 양수) 또는 '
+                          'x=,y= 절대 좌표 (경로 꼬리 밖 종료 라바콘)')
     sim.add_argument('--objects', choices=('s', 't', 'none'), default='s',
                      help='objects[] 재생 색인: s=진행거리 t=시간 none=없음')
     sim.add_argument('--objects-from', default='',
@@ -348,6 +368,9 @@ def main() -> None:
     sim.add_argument('--end-frames', type=int, default=0,
                      help='후륜축이 종료선을 넘으면 실제 VTD처럼 ego(0,0) 프레임을 '
                           '이만큼 보내고 닫는다. 0이면 정지까지 흘린다')
+    sim.add_argument('--end-at', default='', metavar='x,y',
+                     help='--end-frames의 종료선을 실제 경로 끝이 아니라 이 점(끝 접선 '
+                          '방향)으로. 종료 라바콘 중점을 넣는다')
 
     args = ap.parse_args()
     args.segments = [x.strip() for x in args.segments.split(',') if x.strip()]

@@ -330,6 +330,10 @@ def report(session: str, waypoints: str, events: str, segments: list,
             print(f'    leg {k + 1} {leg["label"]}: 경로를 복원할 수 없다')
             continue
         path, _bounds = load_path(leg['wp'], list(lsegs))
+        if k == len(legs) - 1:
+            # 런타임 최종 꼬리(라바콘·끝 너머 정지선)로 끝 프레임을 같은 기하로 투영
+            import finish
+            finish.apply_meta_tail(path, meta)
         project(path, fr)
         s_lo = min(f['s'] for f in fr)
         s_hi = max(f['s'] for f in fr)

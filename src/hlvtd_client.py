@@ -63,10 +63,13 @@ class Obj:
     def is_pedestrian(self) -> bool:
         """치수로 보행자를 판별한다. objects[]에 종류 필드가 없어서 필요하다.
 
-        보행자 약 0.5 x 0.5 x 1.7m, 승용차 약 4.8 x 1.9 x 1.5m.
-        실측 로그로 임계값을 조정할 것.
+        기준은 제어가 쓰는 obstacles.classify 하나뿐이다 (height<1.2 장애물 /
+        width<1.2 보행자 / 나머지 차량). 예전의 length<1.2 & height<2.2는 라바콘
+        0.08x0.08x1.05를 보행자로 찍어 objects.csv의 is_ped가 제어와 어긋났다
+        (9/10). 지연 import — obstacles는 이 모듈을 import하지 않는다.
         """
-        return self.length < 1.2 and self.height < 2.2
+        from obstacles import classify
+        return classify(self) == 'pedestrian'
 
     def distance_from(self, x: float, y: float) -> float:
         return math.hypot(self.x - x, self.y - y)

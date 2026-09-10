@@ -730,16 +730,32 @@ def route_events(objs, wps: list[Waypoint],
     if not track:
         return []
 
+    # **마지막 노드는 waypoint 끝 너머도 본다 (정지선만).** 주최측 경유지는 대략적
+    # 위치라 마지막 경유지가 종료 정지선 앞에 찍힌다 (9/10 실차: 끝 15.9m 뒤에
+    # 정지선과 종료 라바콘). 그 정지선은 같은 차로 위인데 위 WP_S_TOL 검사가
+    # 버려서 finish.py가 종료선을 못 잡았다. s_along = 경로 길이 + 지나친 거리로
+    # 싣고 detail에 beyond_end를 붙인다. 다른 kind는 넣지 않는다.
+    w_last = wps[-1]
+    n_last = (w_last.road_id, w_last.section, w_last.lane_id)
+    c_last = track[-1][0]
+
     hits: list[tuple[float, object]] = []
+    beyond: list[tuple[float, object]] = []
     for o in objs:
         n = o.node
         if n is None or n not in table:
             continue
         s_wp, c = min(table[n], key=lambda r: abs(r[0] - o.s))
         if abs(s_wp - o.s) > WP_S_TOL:
+            if (o.kind == 'stopline' and n == n_last
+                    and _u(w_last.lane_id, o.s) > _u(w_last.lane_id, w_last.s)):
+                beyond.append((c_last + abs(o.s - w_last.s), o))
             continue            # 그 노드에서 달리지 않은 구간에 있다
         hits.append((c, o))
     hits.sort(key=lambda r: r[0])
+    beyond.sort(key=lambda r: r[0])
+    beyond_ids = {id(o) for _c, o in beyond}
+    hits.extend(beyond)
 
     # 지도에 같은 정지선이 t 만 몇 cm 다르게 두 번 그려진 곳이 있다
     # (road 420 lane -1 s=56.218 에 t=-1.6 / -1.5 두 개). 하나로 본다.
@@ -756,6 +772,9 @@ def route_events(objs, wps: list[Waypoint],
     for c, o in hits:
         if o.kind in EV_KINDS:
             detail = f'ctrl={o.ctrl_id}' if o.ctrl_id else ''
+            if id(o) in beyond_ids:
+                # 공백 구분 -- stoplines.parse_ctrl이 split()[0]을 쓴다
+                detail = (detail + ' beyond_end').strip()
             out.append((o.kind, c, o.x, o.y, o.road_id, o.lane_id, detail))
 
     # -- 보호구역: 표시 하나하나가 아니라 구간으로 묶는다 ------------------
@@ -885,8 +904,11 @@ def run_route(g: Graph, idx: LaneIndex, route_path: str, out_path: str | None,
 
 def _report_events(path: str, evs: list[tuple]) -> None:
     kinds = Counter(e[0] for e in evs)
+    n_beyond = sum(1 for e in evs if 'beyond_end' in e[6])
     print(f'[graph] {os.path.normpath(path)}: 이벤트 {len(evs)}개  ' +
-          '  '.join(f'{k} {v}' for k, v in sorted(kinds.items())))
+          '  '.join(f'{k} {v}' for k, v in sorted(kinds.items()))
+          + (f'  (경로 끝 너머 정지선 {n_beyond}개 ― 종료선 후보)' if n_beyond else
+             '  (경로 끝 너머 정지선 없음 ― finish.py --plan 확인)'))
     for kind, c, x, y, rid, lid, detail in evs:
         if kind == 'crosswalk':
             continue                # 개수가 많아 요약에서는 뺀다

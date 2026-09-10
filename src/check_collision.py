@@ -109,7 +109,9 @@ def guess_path(session: str):
         return None
     try:
         from pure_pursuit import load_path
+        import finish
         path, _bounds = load_path(wp, list(segs))
+        finish.apply_meta_tail(path, meta)      # 런타임 최종 꼬리 (라바콘·끝 너머 정지선)
         return path
     except Exception:
         return None

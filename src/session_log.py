@@ -241,7 +241,8 @@ class SessionLog:
         redzone_enter / redzone_exit / redzone_hold / redzone_hold_end /
         redzone_camera_lost / redzone_camera_back / redzone_flapping,
 
-        종료선(finish.py)이 내는 finish_line_passed / finish_short,
+        종료선(finish.py)이 내는 finish_line_from_cones / finish_line_passed /
+        finish_creep / finish_creep_giveup / finish_short,
         pure_pursuit이 ego(0,0)에 내는 sim_end / ego_origin,
         obstacles가 종료 구간 라바콘에 내는 finish_zone_ignore 중 하나.
         """

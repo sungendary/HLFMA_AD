@@ -300,8 +300,13 @@ class Injected:
                                  '(s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0)')
             k, val = part.split('=', 1)
             kv[k.strip()] = float(val)
+        if 'x' in kv and 'y' in kv:
+            # 절대 좌표. 경로 꼬리 밖(종료 라바콘)에 놓을 때 쓴다. 헤딩은 끝 접선
+            return cls(int(kv.get('id', oid)), kv['x'], kv['y'], path.end_heading(),
+                       kv.get('v', 0.0), kv.get('l', 4.39), kv.get('w', 1.81),
+                       kv.get('h', 1.35))
         if 's' not in kv:
-            raise SystemExit(f'--inject-object 에는 s= 가 필요하다: {spec!r}')
+            raise SystemExit(f'--inject-object 에는 s= (또는 x=,y=) 가 필요하다: {spec!r}')
 
         s = kv['s']
         lat = kv.get('lat', 0.0)

@@ -11,7 +11,7 @@
   · 신호등 state 전이가 언제 어디서 일어났나
   · 리스폰이 언제 몇 번, 어디서 어디로
   · 수신 주기가 실제로 20Hz인가 (로깅을 추가해 루프가 느려지지 않았는지)
-  · 보행자 판별 임계값(length<1.2, height<2.2)이 실제 치수와 맞는가
+  · 보행자 판별(obstacles.classify: height<1.2 장애물 / width<1.2 보행자)이 실제 치수와 맞는가
 
 표준 라이브러리만 쓴다.
 """
@@ -175,7 +175,7 @@ def check_object_ids(objs: list[dict], respawns: set[int]) -> None:
 
 
 def check_pedestrian_threshold(objs: list[dict]) -> None:
-    section('4. 보행자 판별 임계값  (length < 1.2 and height < 2.2)')
+    section('4. 보행자 판별  (obstacles.classify: height<1.2 장애물 / width<1.2 보행자 / 차량)')
     if not objs:
         print('객체 없음')
         return

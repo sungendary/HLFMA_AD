@@ -173,6 +173,24 @@ class Path:
     def remaining(self, i: int) -> float:
         return self.length - self.s[i]
 
+    def replace_tail(self, tail: list[tuple[float, float]]) -> None:
+        """실제 점(n_real) 뒤의 가상 꼬리를 제자리에서 갈아 끼운다.
+
+        finish.py가 종료선(정지선·라바콘 쌍)에 맞춰 꼬리를 다시 낼 때 쓴다. 모든
+        정책이 같은 Path 객체를 참조하므로 따로 알릴 필요가 없다. n_real /
+        finish_idx / finish_s는 불변이고 앞쪽 s도 그대로다. 호출자는 꼬리를
+        **짧게 만들지 않는다** (꼬리 위 인덱스를 들고 있는 정책이 있다).
+        """
+        base = self.pts[:self.n_real]
+        self.pts = base + list(tail)
+        s = self.s[:self.n_real]
+        for i in range(self.n_real, len(self.pts)):
+            dx = self.pts[i][0] - self.pts[i - 1][0]
+            dy = self.pts[i][1] - self.pts[i - 1][1]
+            s.append(s[-1] + math.hypot(dx, dy))
+        self.s = s
+        self.length = self.s[-1]
+
     def end_heading(self, back_m: float = 3.0) -> float:
         """마지막 구간의 접선 방위. 끝 두 점만 쓰면 녹화 노이즈에 흔들린다."""
         ex, ey = self.pts[-1]
@@ -332,9 +350,18 @@ def run(args) -> None:
         # 끝을 overrun+1m 연장한다. 프로파일이 rem=1에서 0이 되므로 +1이다
         path, bounds = load_path(wp_csv, segments,
                                  extend_m=args.finish_overrun + 1.0)
+        # 종료선 (완주 판정)을 **먼저** 정한다. 종료선이 경로 끝 너머(끝 너머
+        # 정지선)면 꼬리를 거기까지 다시 내고, 그 뒤에 정지선·횡단보도를 스냅해야
+        # 끝 너머 정지선이 정상 정지선으로 붙는다. --no-signal과 무관하게 항상.
+        fl, fl_tail, fl_warn = finish.load_for_path(
+            path, ev_csv, zone_m=args.finish_zone, search_m=args.finish_search,
+            overrun=args.finish_overrun,
+            fallback_overrun=args.finish_fallback_overrun)
+        path.replace_tail(fl_tail)
+        fl.bind(path)
         eh = path.end_heading()
         say(f'[pp] 경로 {path.n_real}점, 길이 {path.finish_s:.1f}m '
-            f'(+ 끝 연장 {path.length - path.finish_s:.1f}m), '
+            f'(+ 끝 꼬리 {path.length - path.finish_s:.1f}m), '
             f'끝 접선 {math.degrees(eh):+.1f}°')
         for k, (name, start) in enumerate(bounds):
             end = bounds[k + 1][1] if k + 1 < len(bounds) else len(path.pts)
@@ -353,11 +380,10 @@ def run(args) -> None:
                'n_tz': 0, 'n_xw': 0, 'n_sl': 0,
                'wp_csv': wp_csv, 'ev_csv': ev_csv, 'segments': list(segments)}
 
-        # 종료선 (완주 판정). --no-signal과 무관하게 항상 만든다 — 이벤트 CSV가
-        # 없으면 경로 끝점을 종료선으로 본다. 속도 상한은 내지 않는다.
-        fl, fl_warn = finish.load_for_path(path, ev_csv, zone_m=args.finish_zone)
+        # 종료선 정책. 속도 상한은 내지 않고 정지 목표(stop_s)·통과·라바콘 쌍만 본다.
         out['finish'] = fl
-        out['fin'] = finish.FinishPolicy(path, fl, zone_m=args.finish_zone,
+        out['fin'] = finish.FinishPolicy(path, fl, overrun=args.finish_overrun,
+                                         zone_m=args.finish_zone,
                                          on_event=_policy_event)
         for line in finish.summary(out['fin'], args.finish_overrun):
             say('[pp]' + line)
@@ -445,14 +471,25 @@ def run(args) -> None:
     def seg_at(i: int) -> str:
         return bounds[bisect.bisect_right(seg_starts, i) - 1][0]
 
-    log.note('path_points', path.n_real)
-    log.note('path_length_m', round(path.finish_s, 2))
-    log.note('path_ext_m', round(path.length - path.finish_s, 2))
-    log.note('finish_line_s', round(bundle['finish'].s, 2))
-    log.note('finish_line_src', bundle['finish'].src)
-    log.note('finish_line_ctrl', bundle['finish'].ctrl_str())
+    def note_finish(p, fp) -> None:
+        """종료선·꼬리 메타. 시작·우회 교체·라바콘 재조준 때마다 다시 쓴다.
+        finish_tail은 check_* 계수기가 같은 기하로 투영하는 데 쓴다."""
+        log.note('path_points', p.n_real)
+        log.note('path_length_m', round(p.finish_s, 2))
+        log.note('path_ext_m', round(p.length - p.finish_s, 2))
+        log.note('finish_line_s', round(fp.line.s, 2))
+        log.note('finish_line_src', fp.line.src)
+        log.note('finish_line_ctrl', fp.line.ctrl_str())
+        log.note('finish_line_xy', [round(fp.line.x, 3), round(fp.line.y, 3)])
+        log.note('finish_stop_s', round(fp.stop_s, 2))
+        log.note('finish_tail', [[round(x, 3), round(y, 3)]
+                                 for x, y in p.pts[p.n_real:]])
+
+    note_finish(path, fin_policy)
     log.note('finish_overrun_m', args.finish_overrun)
     log.note('finish_zone_m', args.finish_zone)
+    log.note('finish_search_m', args.finish_search)
+    log.note('finish_fallback_overrun_m', args.finish_fallback_overrun)
     log.note('stoplines', bundle['n_sl'])
     log.note('turn_zones', bundle['n_tz'])
     log.note('crosswalks', bundle['n_xw'])
@@ -653,7 +690,11 @@ def run(args) -> None:
                         if nb['turn'] is not None:
                             nb['turn'].adopt(turn_policy, t)
                         turn_policy, xw_policy = nb['turn'], nb['xw']
-                        fin_policy = nb['fin']  # 종료 구간에서는 우회를 걸지 않으므로 래치 손실 없음
+                        # 라바콘 종료선을 래치했으면 새 경로에도 이식한다 (우회는
+                        # 끝 30m 앞까지 가능하고 라바콘 탐색은 130m 전부터 열린다)
+                        nb['fin'].adopt(fin_policy)
+                        fin_policy = nb['fin']
+                        end_heading = path.end_heading()
                         det_policy.rebind(path, plan.rows, plan.zones, bounds)
                         idx = None          # 리스폰과 같은 전역 재탐색
                         # **meta의 waypoints/segments는 원본 그대로 둔다.**
@@ -670,10 +711,7 @@ def run(args) -> None:
                         log.note('detours', detours_meta)
                         # 시작 시 값이 남아 있으면 "정책이 재구성되지 않았다"는
                         # 오해의 근거가 된다. 실제로 한 번 그랬다.
-                        log.note('path_points', path.n_real)
-                        log.note('path_length_m', round(path.finish_s, 2))
-                        log.note('finish_line_s', round(nb['finish'].s, 2))
-                        log.note('finish_line_src', nb['finish'].src)
+                        note_finish(path, fin_policy)
                         log.note('stoplines', nb['n_sl'])
                         log.note('turn_zones', nb['n_tz'])
                         log.note('crosswalks', nb['n_xw'])
@@ -709,12 +747,18 @@ def run(args) -> None:
                                     path.pts[idx][1] - frame.ego_y)
                 if offset > OFFSET_SLOW_M:          # 리스폰 직후 등 — 천천히 복귀
                     v_cmd = min(v_cmd, RECOVER_SPEED)
-                rem = path.remaining(idx)
+                # 종료선. 정지 목표 stop_s(종료선 + overrun + 1)까지 남은 거리가
+                # rem이고, 아래 끝 감속·끝 조향 블렌드가 그것을 쓴다. 라바콘 쌍이
+                # 보이면 여기서 꼬리를 갈아 끼우고 종료선을 옮긴다 (retargeted).
+                # obstacles보다 앞이라 finish_zone_ignore와 무관하게 원본 objects를 본다.
+                fin = fin_policy.update(idx, path.s[idx], frame.ego_x, frame.ego_y,
+                                        frame.ego_heading, v, frame.objects, t)
+                if fin.retargeted:
+                    idx = min(idx, len(path.pts) - 1)
+                    end_heading = path.end_heading()
+                    note_finish(path, fin_policy)
+                rem = fin.rem
                 v_cmd = min(v_cmd, math.sqrt(2.0 * DECEL_END * max(0.0, rem - 1.0)))
-                # 종료선 통과 감시. 경로가 끝 접선으로 overrun+1m 연장돼 있어
-                # 위 감속이 그대로 종료선 너머에 세운다. 여기서는 판정만 한다.
-                fin = fin_policy.update(idx, path.s[idx], frame.ego_x,
-                                        frame.ego_y, v, t)
 
                 # 붉은 보호구역 (항목 2). 카메라 판정이라 다른 정책과 독립이고
                 # 속도 상한 하나뿐이다. 뒤의 xw.escape_v(1.5m/s)·det.v_floor
@@ -785,7 +829,11 @@ def run(args) -> None:
                     w = max(0.0, min(1.0, rem / ld))
                     steer = w * steer + (1.0 - w) * hold
 
-                # rem < 1.5 and v < STOP_SPEED — 연장 경로 끝이라 종료선 너머다
+                # 정지 목표에 닿았는데 종료선을 못 넘었으면 끝 접선으로 저속 직진한다
+                # (creep). 최후 안전망과 같은 자리·같은 방식이고 완주가 우선이다.
+                if fin.v_floor > v_cmd:
+                    v_cmd = fin.v_floor
+                # done은 종료선을 넘은 뒤에만 참이다 (creep 포기 시에만 예외)
                 if fin.done:
                     finished = True
 
@@ -868,15 +916,17 @@ def run(args) -> None:
                                 + ('*' if rz.in_zone else '+' if rz.hold else ' ')))
                   + ('' if turn.signal == TURN_OFF
                      else f' | SIG:{turnsignal.SIGNAL_NAME[turn.signal]}')
-                  + (f' | FIN:{fin.lon:+.1f}' if fin.action in ('passed', 'done') else '')
+                  + (f' | FIN:{fin.action[:5]}{fin.lon:+.1f}'
+                     if fin.action in ('passed', 'done', 'creep') else '')
                   + ('  [완료]' if finished else ''))
 
             if finished:
                 print(f'\n[pp] 경로 끝 도달 ― 정지 완료 (종료선 {fin.lon:+.1f}m '
                       + ('통과' if fin.passed else '*** 미통과 ***') + ')')
                 log.event('finish',
-                          f'{path.finish_s:.1f}m 주행 {n}프레임, 종료선 {fin.lon:+.1f}m '
-                          + ('지나 정지' if fin.passed else '― 미통과 정지'), t=t,
+                          f'{path.finish_s:.1f}m 주행 {n}프레임, '
+                          f'종료선({fin_policy.line.label()}) {fin.lon:+.1f}m '
+                          + ('지나 정지' if fin.passed else '― *** 미통과 정지 ***'), t=t,
                           ego_x=frame.ego_x, ego_y=frame.ego_y, speed=v)
                 break
     except KeyboardInterrupt:
@@ -986,7 +1036,13 @@ def main() -> None:
                          '두 라바콘 사이 종료선을 넘어야 완주다')
     ap.add_argument('--finish-zone', type=float, default=finish.FINISH_ZONE_M,
                     help='경로 끝 이 안은 종료 구간 [m] — 장애물(라바콘) 무시, '
-                         '우회 금지')
+                         '우회 금지. 정지선 종료선의 앞쪽 탐색 한계이기도 하다')
+    ap.add_argument('--finish-search', type=float, default=finish.FINISH_SEARCH_M,
+                    help='경로 끝 너머 이 안의 정지선(이벤트 CSV beyond_end)을 '
+                         '종료선으로 본다 [m]')
+    ap.add_argument('--finish-fallback-overrun', type=float,
+                    default=finish.FINISH_FALLBACK_OVERRUN_M,
+                    help='정지선도 라바콘도 없을 때 경로 끝을 이만큼 지나쳐 선다 [m]')
     ap.add_argument('--session', '--log', dest='session',
                     default=default_dir('pp'),
                     help='세션 로그 디렉터리 (빈 문자열이면 기록 안 함)')

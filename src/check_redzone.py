@@ -125,7 +125,9 @@ def report(session: str, waypoints: str, segments: list, zone: tuple,
         print(f'  {name}: 경로를 복원할 수 없다 ({wp}, {segs})')
         return tally
     from pure_pursuit import load_path
+    import finish
     path, _bounds = load_path(wp, list(segs))
+    finish.apply_meta_tail(path, meta)      # 런타임 최종 꼬리 (라바콘·끝 너머 정지선)
     project(path, frames)
     s0, s1, r0, r1 = zone_range(path, zone)
     print(f'  {name}  {len(frames)}프레임 {frames[-1]["t"]:.1f}초  '
