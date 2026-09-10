@@ -66,7 +66,7 @@ WHEELBASE = 2.95            # m, 실차 검증에서 적절하다고 확인된 �
 LD_MIN, LD_MAX = 4.0, 10.0  # m, lookahead 범위
 LD_GAIN = 0.9               # lookahead = LD_GAIN * v[m/s]
 
-LAT_ACCEL_MAX = 1.6         # m/s^2, 곡선 구간 감속 기준 횡가속도
+LAT_ACCEL_MAX = 0.5         # m/s^2, 곡선 구간 감속 기준 횡가속도
 SPEED_KP = 1.2              # 속도 오차 -> 목표가속도
 DECEL_END = 1.5             # m/s^2, 경로 끝 감속률
 STOP_SPEED = 0.3            # m/s, 이 아래면 정지로 본다
