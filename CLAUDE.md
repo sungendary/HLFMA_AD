@@ -49,6 +49,7 @@ VTD 시뮬레이터와 TCP/UDP/RTSP로 통신하며 지정 경로를 자율주�
 | 횡단보도 정차 (항목 12) | **완료.** `crosswalks.py`. 정지 목표 선점 + 안전 조건부 저속 탈출 |
 | 영구 정지 객체 우회 (완주 보장) | **완료.** `detour.py`. 인접 차로 재탐색 + 최후 안전망. sim에서 우회 완주 확인 |
 | 보호구역 (항목 2) | **완료 (9/10 실주행 반영, 재주행 검증 필요).** `redzone.py`. 8554 RTSP -> ffmpeg -> 붉은 비율 히스테리시스 + **이탈 뒤 50m 홀드**. 끊긴 노면 sim(`rz5_gap`)에서 구간 내 최대 25.0km/h, 진입 -11.7m, 끊김 2곳 전부 25km/h 유지. 카메라 없으면 5초 뒤 폴백 |
+| 종료선 통과 (완주 판정) | **완료 (9/10).** `finish.py`. 경로 끝을 접선으로 9m 가상 연장해 종료선(=마지막 정지선) 너머 +8m에 선다. 종료 구간 30m 안 라바콘 무시·우회 금지. `ego(0,0)` 종료 처리 |
 | 규칙 대응 나머지 | 없다. 조향 포화만 남았다 |
 
 ## 네트워크
@@ -154,11 +155,19 @@ if dist(prev_pos, curr_pos) > 30.0 * 0.05:   # 108km/h 초과는 불가능
 - 그 6개에서 신호 정지선 접근 22회 중 **적색 통과 8회 + 황색 통과 1회**
   (`check_redlight.py`로 실측. 예전에 적던 "15회 이상"은 미완주 런까지 센 어림값이다)
 
-### ego(0,0)은 시뮬레이션 종료 신호
+### ego(0,0)은 시뮬레이션 종료 신호 — 9/10 처리됨
 
 완주 후 VTD가 `ego(0,0), heading 0, n_obj 0`을 보낸다.
-**리스폰으로 오판하면 안 된다** — 현재 코드는 경로 인덱스를 재탐색하고
-`accel=3.0`을 계속 송신한다. 종료로 판정해 안전 정지로 전환할 것.
+**리스폰으로 오판하면 안 된다** — 예전 코드는 경로 인덱스를 재탐색하고
+`accel=3.0`을 계속 송신했다. 지금은 `pure_pursuit`이 `detect_respawn` **앞에서**
+원점 프레임을 잡는다 (아래 "종료선 통과 보장" 절).
+
+- **종료선을 지난 뒤(`fin_policy.passed`)면 `sim_end` 이벤트 + 완주 종료.**
+- 지나기 전이면 `ego_origin` 이벤트 1회 + **정지 유지**(steer 0, accel -1.5)만 한다.
+  `prev_frame`/`idx`를 건드리지 않아 뒤에 실제 프레임이 오면 기존 리스폰 처리가 복구한다.
+  "경로 끝 30m 안"으로 닫지 않는 이유는 순간 오류 한 프레임에 종료선 앞에서 서 버리면
+  미완주이기 때문이다 — 오판의 비용이 비대칭이라 `passed`로만 닫는다
+- sim은 원점 프레임을 내지 않으므로 `replay_server.py --sim --end-frames N`으로 흉내낸다
 
 ### 수신 주기
 
@@ -1341,6 +1350,108 @@ python detour.py --selftest
 python detour.py --plan --path ../data/route_path_pt2.csv   # 우회 불가 구간표
 ```
 
+## 종료선 통과 보장 — `finish.py` (완주 판정) — 완료
+
+주최측 공지 (9/10): **경로 종료 지점은 정지선 위의 라바콘 2개로 표시되고, 후륜축이 두
+라바콘 사이의 종료선을 통과해야 완주다.** 9910 ego 좌표는 후륜축이다.
+
+실측으로 확정한 사실 (pt1/pt2/ex 전수)
+
+- **마지막 정지선이 경로 끝점 그 자리다.** 이벤트 CSV의 마지막 stopline을 (x,y)로
+  스냅하면 셋 다 정확히 `path.length`에 떨어지고 끝 접선 기준 종방향 오차 **-0.15m**다
+  (pt1은 옛 CSV라 횡으로 2.85m 어긋나 있지만 종방향은 같다). pt2 종점은 **ctrl=15|16
+  신호 정지선**이다. 기존 경로 끝 감속(`rem-1.0`에 정지)은 후륜축을 종료선 **0~1.5m 앞**에
+  세웠다 — 실주행 로그에서 v=1km/h로 s=750.2에 finish. 못 넘긴 것이다
+- **경로를 그대로 두고 "끝을 지나친 거리"를 따로 계산하는 방식은 안 된다.** 최근접
+  인덱스가 마지막 점에 포화되면 `s_ego`가 `path.length`에 붙어서 (1) 종점 정지선의 `d`가
+  영원히 0이라 stoplines가 거리로 놓아주지 못하고(sim 신호원은 `0<=d`라 NONE도 안 됨 —
+  지나친 뒤 적색이면 2m/s 이하에서 45초 hold), (2) 모든 객체가 `s_obj<=length`로 투영돼
+  지나치는 동안 충돌 회피가 눈을 감고, (3) 목표점이 뒤로 가며 `OFFSET_SLOW_M`이 걸리고,
+  (4) `check_signals.project`가 잔차>6m에서 전역 재탐색해 자기교차 경로에서 꼬리 프레임이 튄다
+
+### 설계 — 경로를 끝 접선으로 가상 연장한다
+
+`load_path(csv, segments, extend_m)`가 실제 점 뒤에 `finish.extend_points`(1m 간격, 끝
+접선은 `Path.end_heading`과 같은 3m 후퇴 규칙)를 붙인다. **기본값이 `FINISH_OVERRUN_M+1`
+(9m)이라 sim 서버·`check_*`·`crosswalks --plan`·`obstacles --replay`가 같은 기하를 본다.**
+`Path.finish_s`/`finish_idx`/`n_real`이 실제 끝이고 `Path.length`는 연장을 포함한다.
+
+- 기존 끝 감속 `sqrt(2·1.5·(rem-1))`·끝 조향 블렌드·`finished` 래치(`rem<1.5 & v<0.3`)·
+  sim 종료 판정이 **한 줄도 안 바뀌고** 그대로 종료선 너머에 세운다. +1m는 프로파일이
+  `rem=1`에서 0이 되기 때문이다. P 제어 오버슈트로 실제 정지는 **overrun+1~2m**다
+- 종료선이 경로 **내부** 점이 되므로 stoplines는 `d<0`으로 정상 해제하고 sim 신호원도
+  NONE을 낸다(실제 VTD와 같다). `check_redlight`의 종점 `LINE_OVERRUN` 산물도 사라진다
+- `detour.check_rows`는 `n_real`과 비교하고 `_checkpoints`는 `pts[finish_idx]`를 끝점으로
+  쓴다 — 가상 점을 경유지로 넣으면 재탐색 스냅이 어긋난다
+
+`finish.py`는 판정만 한다. 속도 상한을 내지 않는다.
+
+- `load_for_path(path, ev_csv)`: `stoplines.load_for_path`를 재사용해 **s 최대 정지선**이
+  경로 끝 `FINISH_ZONE_M` 안이면 종료선(src `stopline`), 아니면 경로 끝점(src `path_end`,
+  경고). 위치는 CSV 좌표가 아니라 **스냅된 경로 점 + 그 접선**이다 (pt1의 횡 2.85m 오차 무시)
+- `FinishPolicy.update` -> `lon` = 후륜축의 접선 기준 종방향 부호 거리(+ = 넘음). `lon>0`
+  최초 프레임에 `finish_line_passed`(종료선 s, 후륜축 s, 여유, 속도). **경로 끝 30m 안 +
+  횡 6m 안에서만 인정한다** — 자기교차 경로는 출발 직후에도 반평면 양쪽에 있을 수 있다.
+  `done` = 기존 래치식. 선을 못 넘고 서면 `finish_short` 경고
+- `drive.csv`에 `fin_lon`, `finish` 이벤트에 `종료선 +N.Nm 지나 정지`, `meta.json`에
+  `finish_line_s / finish_line_src / finish_line_ctrl / finish_overrun_m / finish_zone_m / path_ext_m`
+
+| 상수 | 값 | 근거 |
+|---|---|---|
+| `FINISH_OVERRUN_M` | 8.0 | 1m 격자 + 스냅 0.15m + 오버슈트를 덮고 남는다. `--finish-overrun` |
+| `FINISH_ZONE_M` | 30.0 | obstacle 무시·우회 금지에 공통. `--finish-zone` |
+| `END_STEP_M` / `TANGENT_BACK_M` | 1.0 / 3.0 | 경로 격자 / `Path.end_heading` 규칙 |
+| `LINE_LAT_M` | 6.0 | 통과 인정 횡거리. `check_redlight.LAT_MAX`와 같게 |
+
+### 종료 라바콘은 장애물이 아니다
+
+`obstacles`는 차로 내(|lat|≤1.2) 라바콘에 10km/h 상한을 걸고 `front_clear`를 줄이며,
+`detour`는 분류 무관하게 회랑 1.5m 안 정지 객체를 8초 확인 뒤 우회를 건다. 경로 끝
+감속 중에는 8초가 찰 수 있어 종료 라바콘이 둘 다에 걸린다. 우회하면 종료선을 벗어나
+완주가 아니다.
+
+- `obstacles`: `finish.gate_s(path, zone)` 이상의 **obstacle 분류는 후보에서 뺀다**
+  (`finish_zone_ignore` 이벤트). 차량·보행자는 그대로. 진짜 라바콘이어도 obstacles는
+  피하지 않고 감속만 하므로 충돌 결과는 같다 — 늦게 지나가는 시간만 아낀다
+- `detour`: 같은 기준으로 obstacle 분류를 후보에서 빼고, **그 안의 차량·보행자 막힘은
+  `detour_impossible`(사유 `종료 구간`)로 보내** 기존 우회 불가 경로를 탄다. 그래서
+  최후 안전망(10초, 5km/h)이 그대로 발동해 경로를 벗어나지 않으면서 완주를 지킨다
+
+이벤트: `finish_line_passed / finish_short / sim_end / ego_origin / finish_zone_ignore`.
+
+```
+python finish.py --selftest                                   # 41항목
+python finish.py --plan --path ../data/route_path_pt2.csv     # 종료선 표 — 대회 당일 4단계 전에 볼 것
+```
+
+**`--plan`이 `path_end` 폴백을 내면 route CSV 마지막 점이 정지선에 못 미친 것이다.** 그때는
+라바콘 위치를 현장에서 확인하고 `--finish-overrun`이 그 차이를 덮는지 본다.
+
+### 검증 — 폐루프 sim
+
+`replay_server.py --sim --end-frames N`이 후륜축이 종료선을 넘는 순간 실제 VTD처럼
+`ego(0,0)` 프레임 N개를 보내고 닫는다 (기본 0이면 정지까지 흘린다).
+
+| 런 (`--speed 45 --objects t --tl-seed 3`) | 결과 |
+|---|---|
+| `fin_pt1` 경로 1 무주입 | 종료선(비신호 정지선 s=829.4) **23.0km/h로 통과**, +9.3m에 정지. 완주 115.9s |
+| `fin_pt2` 경로 2 무주입 | 종료선(ctrl=15|16) 황색 딜레마 `tl_yellow_go` → **23.0km/h로 통과**, +9.2m 정지. sim 신호원이 통과 뒤 NONE(실제 VTD와 같음). 완주 106.8s |
+| `fin_pt2_cone10` 라바콘 lat ±1.0 + `--end-frames 40` | `finish_zone_ignore` 2건(59m 전), `obstacle_slow` 0, 우회 0. 통과 +0.3m에서 `ego(0,0)` → **`sim_end` → 즉시 완주 종료** |
+| `fin_pt2_cone15` 라바콘 lat ±1.5 | 위와 같음. +9.2m 정지. `check_collision` NEAR 0.39m (반폭 0.95 + lat 1.5 = 기하 그대로) |
+| `fin_pt2_red` `--tl-force red` | 종점 정지선 포함 4곳 45초 대기 → `tl_timeout` → **17.0km/h로 통과**, +9.1m 정지. 대기 중 `finished` 래치 없음. 완주 287.5s |
+| `fin_pt2_car` 정지 차량 s=745 | `veh_stop` → `detour_impossible(종료 구간)` → `veh_timeout` 크립 → **`last_resort_pass` → 통과** → +9.2m 정지. 우회 요청 0. 완주 157.5s |
+| `fin_pt2_off` `--finish-overrun 0` | 실제 끝 **+0.9m**에 정지 (예전 0~1.5m 앞 → 이제 겨우 넘는다). 기준선 |
+
+- **마지막 30m에서 `ob_act`/`dt_act`/`cw_act`가 전부 `none`** (차량 런 제외). 종료 라바콘이
+  감속도 우회도 만들지 않았다
+- `check_redlight` 적색 통과 **0** (무주입·라바콘·차량 런), `fin_pt2_red`의 `RED_CROSS` 4건은
+  설계된 `tl_timeout` 출발. **종점 `LINE_OVERRUN` 산물이 사라졌다**
+- `check_signals` 항목 13 **0/2**·항목 12 **0/4** 전 런. `check_collision`의 `COLLISION`은
+  lat ±1.0 라바콘(반폭 0.95라 기하상 겹친다)과 최후 안전망이 밀고 지난 차량뿐 — 둘 다 의도
+- 프레임 주기 p95 **51.0~52.3ms**, 65.5ms 초과 0.00~0.30% (3.14 인터프리터)
+- 실제 정지 위치는 프로파일 +8m가 아니라 **+9.1~9.3m**다. P 제어 정상상태 오차라 예상된
+  것이고 선 너머라 무해하다 (`finish.py --selftest`가 6~11m로 잰다)
+
 ## 폐루프 시뮬레이터 — `replay_server.py --sim`
 
 `src/sim_world.py`. 받은 CTRL로 후륜축 자전거 모델을 20Hz로 적분해 ego를 직접
@@ -1363,6 +1474,8 @@ python replay_server.py --sim --path ../data/route_path_pt2.csv
 - **`--inject-object`**: 경로 위에 합성 정지 객체를 놓는다. 반복 지정 가능.
   `s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7]`. **녹화 로그에는 경로를 막는 정지
   차량이 하나도 없어서** 우회를 검증할 방법이 이것뿐이다. 자세한 것은 위 우회 절
+- **`--end-frames N`**: 후륜축이 종료선(실제 경로 끝)을 넘으면 실제 VTD처럼 `ego(0,0)`
+  프레임 N개를 보내고 닫는다. `sim_end` 처리를 sim에서 밟는 유일한 방법이다
 - **`--rate`는 1.0으로 둘 것.** 배속을 걸면 클라이언트 `SpeedEstimator`의 공칭 dt
   스냅이 풀려 속도 추정이 배속만큼 부풀고 제어 판단이 통째로 틀어진다
 - 머신이 절전에 들어가면 벽시계만 뛰어 `MAX_HOLD_S`가 잘못 만료된다.
@@ -1736,6 +1849,7 @@ CLAUDE.md 곳곳의 sim 주기 `p95 50.5ms`는 전부 3.14로 잰 값이다.
 | `src/check_signals.py` | **방향지시등·횡단보도 정차 계수기.** A 선행 점등 시간 / B 구간 위 정차 시간. **우회는 leg로 나눠 실제 달린 경로로 잰다** |
 | `src/redzone.py` | **붉은 보호구역 정책 (항목 2).** ffmpeg RTSP 파이프(데몬 스레드) + far/near 붉은 비율 히스테리시스 + 폴백/flapping. `--selftest` / `--tune` / `--snapshot` |
 | `src/check_redzone.py` | **붉은 보호구역 계수기.** 분리도 / 진입·이탈 시점 / 구간 내 속도 / 카메라·주기 |
+| `src/finish.py` | **종료선 통과 보장 (완주 판정).** 경로 끝 가상 연장 + 종료선 스냅 + 통과 판정·이벤트 + 종료 구간 경계(`gate_s`). 순수 로직. `--selftest` / `--plan` |
 | `src/sim_world.py` | **폐루프 sim 세계.** ego 적분 + 신호 위상표 + objects[] 재생 |
 | `src/hlvtd_client.py` | 9910 파서·클라이언트, `SpeedEstimator`, 리스폰 감지. 단독 실행 시 모니터 |
 | `src/pure_pursuit.py` | Pure Pursuit 경로 추종 |
@@ -1758,6 +1872,10 @@ CLAUDE.md 곳곳의 sim 주기 `p95 50.5ms`는 전부 3.14로 잰 값이다.
   조향 포화를 막는다
 - 목표속도 = `--speed`, 곡률 제한(횡가속도 2.5), 이탈 시 복귀 속도 제한,
   경로 끝 감속 중 최소값
+- **경로 끝은 `load_path`가 접선으로 `--finish-overrun`+1m 가상 연장한다.** 끝 감속이
+  그대로 종료선 너머에 세운다. `Path.finish_s`가 실제 끝, `Path.length`는 연장 포함
+- **`ego(0,0)`은 `detect_respawn` 앞에서 잡는다.** 종료선을 지났으면 완주 종료, 아니면
+  정지 유지
 
 ## 남은 계획
 
@@ -1839,6 +1957,7 @@ lavfi 파이프에서 입력 20.0fps 확인. **현장 재주행 검증이 남았
 | 9/7 **밀림** | **방향표시 페널티 기본값 결정** — A/B 표(40.5 -> 68.7%)를 보고 켤지 판단 |
 | 9/7 **밀림** | **조향 포화 처리** — 곡률 감속 강화. 속도 오버슈트는 신호 정지의 감속 피드포워드가 정공법을 보여줬다 |
 | 9/10 | **붉은 보호구역 현장 튜닝** — 아침 실주행 2회로 결함 2건(진입 지연·끊긴 노면)과 2.2fps 원인을 잡아 고쳤다. **재주행 검증 남음:** `--tune`으로 입력 fps≈20 확인, 경로 2 실주행 + `check_redzone.py`(진입 ≤ +5m, 구간 p95 ≤ 30, 재진입 1~2회, 끊긴 27m·정지선 뒤 s 534에서 25km/h), `--no-redzone` 회귀 |
+| 9/10 **완료** | **종료선 통과 보장** (`finish.py`) — 주최측 공지 대응. 경로 끝 가상 연장 + 종료 라바콘 무시 + `ego(0,0)` 종료 처리. sim 7런으로 검증 |
 | 9/11 | 시나리오 시험, 코드 동결 |
 | 9/12 | 대회 |
 

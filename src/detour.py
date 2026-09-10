@@ -64,6 +64,7 @@ import queue
 import threading
 
 import obstacles as OB
+import finish as FN
 
 # 트리거
 BLOCK_CONFIRM_S = 8.0       # s, 이만큼 연속 관측돼야 "영구 정지"로 본다
@@ -199,8 +200,11 @@ def check_rows(path, rows: list) -> str:
     """rows가 path.pts와 1:1로 맞는가. 어긋나면 사유 문자열, 맞으면 ''."""
     if not rows:
         return '경로 CSV에 road_id/lane_id/section 컬럼이 없다'
-    if len(rows) != len(path.pts):
-        return f'행 수 불일치 ({len(rows)}행 vs 경로 {len(path.pts)}점)'
+    # path.pts는 끝에 가상 연장(finish.extend_points)이 붙어 있다. rows는
+    # CSV 행이라 실제 점(n_real)과만 1:1이다
+    n_real = getattr(path, 'n_real', len(path.pts))
+    if len(rows) != n_real:
+        return f'행 수 불일치 ({len(rows)}행 vs 경로 {n_real}점)'
     worst = 0.0
     for r, (x, y) in zip(rows, path.pts):
         d = math.hypot(r.x - x, r.y - y)
@@ -337,13 +341,14 @@ def scan_undetourable(path, rows: list, g, has_lc: set = None,
 def zone_report(path, zones: list, solid_m: float = None) -> list:
     """시작 시 콘솔에 낼 줄들. meta.json에도 같은 내용이 들어간다."""
     tot = sum(z.length for z in zones)
-    pct = 100.0 * tot / path.length if path.length > 0 else 0.0
+    plen = FN.finish_s(path)            # 실제 길이 (끝 가상 연장 제외)
+    pct = 100.0 * tot / plen if plen > 0 else 0.0
     out = [f' 우회 불가 구간 {len(zones)}개 / 총 {tot:.1f}m ― 경로의 {pct:.1f}%']
     for k, z in enumerate(zones, 1):
         out.append(f'   {k}. s {z.s0:7.1f}~{z.s1:7.1f} {z.length:6.1f}m  '
                    f'{z.label()}')
     if solid_m is not None and solid_m < tot - 0.05:
-        sp = 100.0 * solid_m / path.length if path.length > 0 else 0.0
+        sp = 100.0 * solid_m / plen if plen > 0 else 0.0
         out.append(f'   실선 차선변경 허용 시 {solid_m:.1f}m ({sp:.1f}%)로 줄어든다')
     if not zones:
         out.append('   경로 전 구간에서 옆 차로로 우회할 수 있다')
@@ -799,7 +804,8 @@ class DetourPolicy:
                  confirm_s: float = BLOCK_CONFIRM_S,
                  last_resort_s: float = LAST_RESORT_S,
                  lookahead: float = DETOUR_LOOKAHEAD_M,
-                 use_last_resort: bool = True, on_event=None):
+                 use_last_resort: bool = True,
+                 finish_zone: float = FN.FINISH_ZONE_M, on_event=None):
         self.path = path
         self.rows = rows
         self.zones = zones
@@ -809,6 +815,11 @@ class DetourPolicy:
         self.last_resort_s = last_resort_s
         self.lookahead = lookahead
         self.use_last_resort = use_last_resort
+        # 종료 구간. 여기서 우회하면 종료선을 벗어나 완주가 아니다. 라바콘은
+        # 후보에서 빼고(종료 라바콘), 차량·보행자 막힘은 우회 불가로 보내
+        # 최후 안전망만 남긴다
+        self.finish_zone = finish_zone
+        self._gate_s = FN.gate_s(path, finish_zone)
         self._on_event = on_event or (lambda kind, detail: None)
         self.n_detours = 0
         self.reset()
@@ -863,6 +874,7 @@ class DetourPolicy:
         self.reset()
         self.path, self.rows, self.zones = path, rows, zones
         self.bounds = bounds
+        self._gate_s = FN.gate_s(path, self.finish_zone)
         self._failed, self._impossible = failed, impossible
         self._hist = hist
         self.n_detours = n
@@ -949,7 +961,10 @@ class DetourPolicy:
                 continue
             if abs(o.speed) >= STOPPED_MS:
                 continue            # 움직이는 객체는 대상이 아니다
-            out[o.id] = (o.x, o.y, s_obj, lat, d, OB.classify(o))
+            cls = OB.classify(o)
+            if cls == OB.OBSTACLE and s_obj >= self._gate_s:
+                continue            # 종료 라바콘. obstacles와 같은 기준으로 뺀다
+            out[o.id] = (o.x, o.y, s_obj, lat, d, cls)
         return out
 
     def _track(self, cands: dict, dt: float, sig_wait: bool,
@@ -1031,6 +1046,19 @@ class DetourPolicy:
                 len(self.rows) - 1)
         node = self.rows[j].node
         z = self.zone_at(b.s)
+        if b.s >= self._gate_s:
+            # 종료 구간. 우회하면 종료선을 벗어나 완주가 아니다. 우회 불가
+            # 구간과 같은 경로를 타서 최후 안전망만 남긴다
+            self._persist(b.id)
+            self._impossible.add(b.id)
+            cmd.action = 'impossible'
+            cmd.reason = '종료 구간'
+            self._announce(
+                ('imp', b.id), 'detour_impossible',
+                f'종료 구간에서 막힘 ― 우회하면 종료선을 벗어난다. 크립 유지 '
+                f'(경로 끝 {self.finish_zone:.0f}m 이내, s>={self._gate_s:.1f}, '
+                f'obj id={b.id} {b.kind} d={b.d:.1f}m lat={b.lat:+.1f}m)')
+            return
         if z is not None:
             self._persist(b.id)
             self._impossible.add(b.id)
@@ -1100,8 +1128,11 @@ class DetourPolicy:
                 cps.append(pts[start])
             elif self.path.s[start] <= s_ego:
                 seg_off = max(seg_off, _seg_index(name) - 1)
-        if self.path.length - s_ego > CP_MIN_AHEAD_M:
-            cps.append(pts[-1])
+        # 끝점은 **실제** 끝이다. 가상 연장 점은 차로 밖에 있을 수 있어
+        # 경유지로 넣으면 스냅이 어긋난다
+        fi = FN.finish_index(self.path)
+        if self.path.s[fi] - s_ego > CP_MIN_AHEAD_M:
+            cps.append(pts[fi])
         return cps, seg_off
 
     # -- 결과 수령 ------------------------------------------------------
@@ -1228,7 +1259,8 @@ def summary(policy: DetourPolicy) -> list:
     out = [f' 재탐색 {"활성" if policy.planner else "비활성"}, '
            f'확인 {policy.confirm_s:.0f}s, '
            f'최후 안전망 '
-           + (f'{policy.last_resort_s:.0f}s' if policy.use_last_resort else '꺼짐')]
+           + (f'{policy.last_resort_s:.0f}s' if policy.use_last_resort else '꺼짐')
+           + f', 종료 구간 {policy.finish_zone:.0f}m (우회 금지·라바콘 무시)']
     out.extend(zone_report(policy.path, policy.zones))
     return out
 
@@ -1278,8 +1310,8 @@ def _plan(args) -> int:
     z_solid = scan_undetourable(path, rows, gs, lanechange_nodes(gs), injunc)
     solid_m = sum(z.length for z in z_solid)
 
-    print(f'[det] {os.path.basename(args.path)}  {len(path.pts)}점 '
-          f'{path.length:.1f}m  구간 {len(segs)}개')
+    print(f'[det] {os.path.basename(args.path)}  {path.n_real}점 '
+          f'{path.finish_s:.1f}m  구간 {len(segs)}개')
     print(f'[det] 그래프 노드 {len(pts)} (끝점 이상치 {dropped}점 제거), '
           f'실선 차선변경 엣지 {n_solid}개 합성 가능')
     for line in zone_report(path, zones, solid_m):
@@ -1474,6 +1506,30 @@ def _selftest() -> int:
     check('우회 불가: 지나치면 낙인을 지운다',
           not pol._impossible and not pol._hist,
           f'imp={sorted(pol._impossible)} hist={list(pol._hist)}')
+
+    # 7b. 종료 구간 -- 라바콘은 후보조차 아니고, 차량은 우회 대신 우회 불가로
+    #     보내 최후 안전망만 남긴다. 구간 밖이면 예전처럼 우회를 건다
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    cone = _Fake(1, 290.0, 0.0, dims=CONE)
+    log, _s, _t = _run(pol, lambda t, s: [cone], n=400, s0=280.0)
+    check('종료 구간 라바콘: 후보 아님',
+          all(r[2] == 'none' for r in log) and not pol.planner.jobs,
+          f'{sorted({r[2] for r in log})}')
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    car = _Fake(2, 290.0, 0.0)
+    obs = OB.ObstacleCmd(action='stop', obj_id=2)
+    log, _s, _t = _run(pol, lambda t, s: [car], n=800, s0=280.0, obs=obs)
+    check('종료 구간 차량: 탐색 안 함', not pol.planner.jobs,
+          f'{len(pol.planner.jobs)}회 요청')
+    check('종료 구간 차량: detour_impossible(종료 구간)',
+          any(k == 'detour_impossible' and '종료 구간' in d for k, d in rec.log),
+          ','.join(rec.kinds()))
+    check('종료 구간 차량: 최후 안전망 발동', 'last_resort_pass' in rec.kinds(),
+          ','.join(rec.kinds()))
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(3, 240.0, 0.0)], n=400, s0=230.0)
+    check('종료 구간 밖 차량: 우회 시도', bool(pol.planner.jobs),
+          ','.join(rec.kinds()))
 
     # 8. 최후 안전망 -- 우회 실패 + 20초 정지
     _p, pol, rec = _mk(planner=_StubPlanner(ok=False))

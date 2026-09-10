@@ -41,7 +41,7 @@ DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat',
               'turn', 'turn_src', 'cw_act', 'cw_dist',
               'dt_act', 'dt_dist',
-              'rz_ratio', 'rz_far', 'rz_in']
+              'rz_ratio', 'rz_far', 'rz_in', 'fin_lon']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -153,7 +153,7 @@ class SessionLog:
                   cw_act: str = '', cw_dist: float = NAN,
                   dt_act: str = '', dt_dist: float = NAN,
                   rz_ratio: float = NAN, rz_far: float = NAN,
-                  rz_in: int = 0) -> None:
+                  rz_in: int = 0, fin_lon: float = NAN) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -174,7 +174,7 @@ class SessionLog:
                 tl_act, tl_dist,
                 ob_act, ob_kind, ob_id, ob_dist, ob_lat,
                 turn, turn_src, cw_act, cw_dist,
-                dt_act, dt_dist, rz_ratio, rz_far, rz_in)])
+                dt_act, dt_dist, rz_ratio, rz_far, rz_in, fin_lon)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (
@@ -239,7 +239,11 @@ class SessionLog:
 
         붉은 보호구역(redzone.py)이 내는
         redzone_enter / redzone_exit / redzone_hold / redzone_hold_end /
-        redzone_camera_lost / redzone_camera_back / redzone_flapping 중 하나.
+        redzone_camera_lost / redzone_camera_back / redzone_flapping,
+
+        종료선(finish.py)이 내는 finish_line_passed / finish_short,
+        pure_pursuit이 ego(0,0)에 내는 sim_end / ego_origin,
+        obstacles가 종료 구간 라바콘에 내는 finish_zone_ignore 중 하나.
         """
         if not self.enabled:
             return

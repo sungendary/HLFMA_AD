@@ -194,7 +194,8 @@ def build_sim(args):
                                          sim_world.INJECT_ID_BASE + k)
                 for k, spec in enumerate(args.inject_object or ())]
 
-    print(f'[sim] 경로 {path.length:.1f}m ({len(segs)}구간), '
+    print(f'[sim] 경로 {path.finish_s:.1f}m ({len(segs)}구간, 끝 연장 '
+          f'{path.length - path.finish_s:.1f}m), '
           f'정지선 {len(sl_list)}개 중 신호 {len(src.sl)}개')
     print('[sim] 신호 위상표'
           + (f' (강제 {args.tl_force})' if args.tl_force else ''))
@@ -228,10 +229,18 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
     last_print = 0.0
     sim_t = 0.0
     done_since = None
+    end_frames = 0          # 종료선 통과 뒤 보낼 ego(0,0) 프레임 수
 
     while alive.is_set():
         idx = path.nearest(ego.x, ego.y, start=idx)
         s_ego = path.s[idx]
+        # 실제 VTD처럼 후륜축이 종료선(실제 경로 끝)을 넘으면 시뮬레이션을
+        # 끝내고 ego(0,0)을 보낸다. 기본 0이면 예전처럼 정지까지 흘린다
+        if args.end_frames > 0 and s_ego > path.finish_s:
+            print(f'[sim] 종료선 통과 (s={s_ego:.1f} > {path.finish_s:.1f}, '
+                  f'v={ego.v * 3.6:.1f}km/h) ― ego(0,0) {args.end_frames}프레임 송신')
+            end_frames = args.end_frames
+            break
         tl_id, tl_state = src.sample(s_ego, sim_t)
         blob = sim_world.overlay(track.at(s_ego, sim_t), injected, ego)
         try:
@@ -260,7 +269,7 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
         now = time.monotonic()
         if now - last_print >= 1.0:
             last_print = now
-            print(f'[sim] t={sim_t:6.1f}s s={s_ego:7.1f}/{path.length:.1f}m '
+            print(f'[sim] t={sim_t:6.1f}s s={s_ego:7.1f}/{path.finish_s:.1f}m '
                   f'v={ego.v * 3.6:5.1f}km/h '
                   f'신호 id={tl_id:4d} {TL_STATE.get(tl_state, tl_state):10s} | '
                   f'제어 {stats.count:5d}개 steer={steer:+.3f} accel={accel:+.2f}')
@@ -271,6 +280,16 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
             time.sleep(delay)
         else:
             next_t = time.monotonic()
+
+    # 완주 후 VTD가 보내는 ego(0,0), heading 0, 객체 0, 신호 NONE 프레임
+    zero = sim_world.EgoSim(0.0, 0.0, 0.0, args.wheelbase)
+    for _k in range(end_frames):
+        try:
+            conn.sendall(sim_world.pack_frame(zero, sim_world.EMPTY_OBJECTS,
+                                              0, sim_world.NONE))
+        except OSError:
+            break
+        time.sleep(period)
 
     alive.clear()
     print(f'[sim] 세션 종료: {n}프레임 sim {sim_t:.1f}초, '
@@ -326,6 +345,9 @@ def main() -> None:
     sim.add_argument('--wheelbase', type=float, default=sim_world.WHEELBASE)
     sim.add_argument('--sim-timeout', type=float, default=400.0,
                      help='sim 시간 상한 [s]')
+    sim.add_argument('--end-frames', type=int, default=0,
+                     help='후륜축이 종료선을 넘으면 실제 VTD처럼 ego(0,0) 프레임을 '
+                          '이만큼 보내고 닫는다. 0이면 정지까지 흘린다')
 
     args = ap.parse_args()
     args.segments = [x.strip() for x in args.segments.split(',') if x.strip()]

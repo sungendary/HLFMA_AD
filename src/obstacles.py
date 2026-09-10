@@ -40,6 +40,7 @@ from __future__ import annotations
 import math
 
 from stoplines import FRONT_OVERHANG, STOP_SPEED
+from finish import FINISH_ZONE_M, gate_s
 
 # 분류
 OBSTACLE, PEDESTRIAN, VEHICLE = 'obstacle', 'pedestrian', 'vehicle'
@@ -238,11 +239,15 @@ class ObstaclePolicy:
 
     def __init__(self, path, *, front_overhang: float = FRONT_OVERHANG,
                  lookahead: float = LOOKAHEAD_M, max_block: float = MAX_BLOCK_S,
-                 on_event=None):
+                 finish_zone: float = FINISH_ZONE_M, on_event=None):
         self.path = path
         self.front = front_overhang
         self.lookahead = lookahead
         self.max_block = max_block
+        # 종료 구간. 종료선 위의 라바콘 2개는 장애물이 아니라 완주 표지다.
+        # 이 s 이상의 obstacle 분류는 무시한다 (차량·보행자는 그대로)
+        self.finish_zone = finish_zone
+        self._gate_s = gate_s(path, finish_zone)
         self._on_event = on_event or (lambda kind, detail: None)
         self.reset()
 
@@ -335,6 +340,16 @@ class ObstaclePolicy:
                                    f'({"차로 내" if abs(tr.min_lat) <= OBST_LANE_M else "차로 밖"})')
 
             if d < -BEHIND_M or d > self.lookahead:
+                continue
+
+            # 종료 구간의 장애물은 종료 라바콘이다. 감속도 front_clear 축소도
+            # 하지 않는다. 진짜 라바콘이어도 obstacles는 피하지 않고 감속만
+            # 하므로 충돌 결과는 같다 — 늦게 지나가는 시간만 아낀다
+            if cls == OBSTACLE and s_obj >= self._gate_s:
+                self._announce(('fin', o.id), 'finish_zone_ignore',
+                               f'id={o.id} 장애물 lat={lat:+.2f}m d={d:.1f}m ― '
+                               f'경로 끝 {self.finish_zone:.0f}m 안이라 무시한다 '
+                               f'(종료 라바콘)')
                 continue
 
             # 항목 8 면책 판단용. 전방 차로에 차량·보행자가 "있기만" 해도 면책이다
@@ -577,7 +592,8 @@ def summary(policy: ObstaclePolicy) -> list:
         f'해제 ±{PED_RELEASE_M:.1f}m  교착 {policy.max_block:.0f}s '
         f'(차폭 ±{PED_CORRIDOR_M:.1f}m 밖이면 서행 통과)',
         f'  장애물 ±{OBST_LANE_M:.1f}m 이내면 {OBST_CREEP * 3.6:.0f}km/h '
-        f'감속만 (정지 안 함)',
+        f'감속만 (정지 안 함). 경로 끝 {policy.finish_zone:.0f}m 안은 '
+        f'종료 라바콘으로 보고 무시',
         f'  전방 {policy.lookahead:.0f}m  범퍼 보정 {policy.front:.3f}m',
     ]
 
@@ -796,6 +812,29 @@ def _selftest() -> int:
     stop_gap = (inpath.x - inpath.length * 0.5) - (end + FRONT_OVERHANG)
     check('교착: 차폭 안 보행자는 통과하지 않는다', stop_gap > 0.5,
           f'범퍼-보행자 {stop_gap:.2f}m')
+
+    # 8. 종료 구간 — 경로 끝 30m 안의 라바콘은 종료 라바콘이라 무시한다.
+    #    같은 라바콘이 구간 밖이면 예전처럼 감속한다
+    ev = []
+    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: ev.append(k))
+    gate = [_Fake(7, 297.0, 1.0, dims=CONE), _Fake(8, 297.0, -1.0, dims=CONE)]
+    log, end = _drive(pol, path, lambda t, x: gate, n=600)
+    check('종료 라바콘: 감속 없음',
+          'obstacle_slow' not in ev and all(r[3] == 'none' for r in log),
+          f'{sorted({r[3] for r in log})} {",".join(ev)}')
+    check('종료 라바콘: finish_zone_ignore 2건', ev.count('finish_zone_ignore') == 2,
+          ','.join(ev))
+    check('종료 라바콘: 지나간다', end > 300.0, f'{end:.1f}m 진행')
+    ev = []
+    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: ev.append(k))
+    log, _ = _drive(pol, path, lambda t, x: [_Fake(9, 260.0, 0.4, dims=CONE)], n=600)
+    check('구간 밖 라바콘: 여전히 감속', any(r[3] == 'slow' for r in log)
+          and 'finish_zone_ignore' not in ev, ','.join(ev))
+    ev = []
+    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: ev.append(k))
+    log, end = _drive(pol, path, lambda t, x: [_Fake(10, 290.0, 0.0, dims=CAR)], n=600)
+    check('종료 구간 차량: 그대로 선다', any(r[3] in ('stop', 'hold') for r in log)
+          and end < 290.0, f'{end:.1f}m')
 
     print()
     if fails:
