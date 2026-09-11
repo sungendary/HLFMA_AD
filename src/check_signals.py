@@ -294,8 +294,7 @@ def check_crosswalk(frames: list, zones: list) -> list:
 
 # ----------------------------------------------------------------------
 
-def report(session: str, waypoints: str, events: str, segments: list,
-           junction: bool) -> dict:
+def report(session: str, waypoints: str, events: str, segments: list) -> dict:
     name = os.path.basename(os.path.normpath(session))
     frames = read_drive(session)
     tally = {'lc_fail': 0, 'lc_total': 0, 'lc_unknown': 0,
@@ -342,8 +341,10 @@ def report(session: str, waypoints: str, events: str, segments: list,
                   f's {s_lo:.1f}~{s_hi:.1f}m  '
                   f't {max(0.0, fr[0]["t"]):.1f}~{fr[-1]["t"]:.1f}초')
 
-        all_zones, _w = turnsignal.build_zones(path, leg['wp'],
-                                               junction=junction)
+        # 차선변경 구간만 나온다. 옛 CSV의 뒤집힌 양수 차로 마커는 build_zones가
+        # lane_id로 정정하므로 **옛 로그를 다시 재면 그때의 (틀린) 점등이 방향
+        # 불일치로 찍힌다** — 계수기 결함이 아니라 그때 실제로 틀렸던 것이다
+        all_zones, _w = turnsignal.build_zones(path, leg['wp'])
         # **그 leg에서 실제로 지난 구간만** 채점한다. 우회로 교체 뒤의 옛 경로
         # 구간을 세면 달린 적 없는 차선변경이 미점등으로 찍힌다.
         zones = [z for z in all_zones if s_lo <= z.s_start <= s_hi]
@@ -427,8 +428,6 @@ def main() -> None:
                     help='이벤트 CSV. 생략하면 meta.json / events_in.csv')
     ap.add_argument('--segments', default='',
                     help='쉼표로 구분한 구간 이름. 생략하면 meta.json')
-    ap.add_argument('--no-junction-signal', action='store_true',
-                    help='교차로 회전 구간을 빼고 본다')
     args = ap.parse_args()
     segs = [s.strip() for s in args.segments.split(',') if s.strip()]
 
@@ -439,8 +438,7 @@ def main() -> None:
             return tally
         print(f'\n== {label}')
         for s in expand(sessions):
-            r = report(s, args.path, args.events, segs,
-                       not args.no_junction_signal)
+            r = report(s, args.path, args.events, segs)
             for k in tally:
                 tally[k] += r[k]
         return tally

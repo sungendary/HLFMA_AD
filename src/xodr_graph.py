@@ -639,9 +639,14 @@ def path_to_waypoints(g: Graph, res: RouteResult,
             if _is_lc(n, nx):
                 solid = any(e.to == nx and e.kind == 'lanechange' and e.solid
                             for e in g.out(n))
-                # 바깥(|id| 증가)으로 나가면 음수 차로는 우측, 양수 차로는 좌측이다
+                # 바깥(|id| 증가)은 **부호와 무관하게 우측**이다. 양수 차로는 -s로
+                # 달리므로 참조선에서 먼 쪽(+t)이 운전자의 우측이다. 9/11까지는
+                # 양수 차로를 반대로 봐서 route_path_lt 행 671(road 2467 lane 2->1,
+                # 실제 좌측 이동)이 right로 찍혔다 — 실차에서 좌측 차로변경 중 우측
+                # 점등이 난 원인. 모든 경로 CSV의 양수 차로 마커 5개가 전부 뒤집혀
+                # 있었고, turnsignal.load_lane_changes가 lane_id로 교차검증해 정정한다
                 outward = abs(nx[2]) > abs(lid)
-                direction = ('right' if outward else 'left') if lid < 0 else                             ('left' if outward else 'right')
+                direction = 'right' if outward else 'left'
                 if wps:
                     lc_meta.append((wps[-1].x, wps[-1].y, rid, lid, nx[2],
                                     direction, solid))
