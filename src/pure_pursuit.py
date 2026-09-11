@@ -18,6 +18,8 @@
       (stoplines.py, 평가항목 7·9)
     · objects[]를 경로에 투영해 보행자·차량·장애물을 피한다
       (obstacles.py, 평가항목 10·11·14). --no-obstacle로 끈다
+    · 상대 운동으로 4초 안의 최근접점을 예측해 끼어들기·교차 진입에 미리
+      감속한다 (ttc.py, 평가항목 14 강화). --no-ttc로 끈다
     · 차선변경·교차로 회전 3초 전에 방향지시등을 켠다
       (turnsignal.py, 평가항목 13). --no-turn-signal로 끈다
     · 횡단보도 위에 서게 될 것 같으면 그 앞에 서고, 이미 올라가 있으면
@@ -49,6 +51,7 @@ import finish
 import obstacles
 import redzone
 import stoplines
+import ttc
 import turnsignal
 
 # stdout이 파일·파이프로 리다이렉트되면 Windows에서는 cp949가 된다. cp949에 없는
@@ -306,13 +309,18 @@ def run(args) -> None:
         'obstacles': not args.no_obstacle,
         'obs_lookahead_m': args.obs_lookahead,
         'obs_max_block_s': args.obs_max_block,
+        'ttc': not args.no_ttc,
+        'ttc_dcrit_m': args.ttc_dcrit,
         'turn_signal': not args.no_turn_signal,
         'turn_junction': not args.no_junction_signal,
         'turn_lead_s': args.turn_lead,
         'crosswalk': (not args.no_crosswalk) and bool(ev_path),
         'cw_escape_after_s': args.cw_escape_after,
         'detour': not args.no_detour,
-        'detour_confirm_s': args.detour_confirm,
+        'detour_confirm_s': (args.detour_confirm if args.detour_confirm is not None
+                             else f'{detour.DETOUR_CONFIRM_FAST_S}/'
+                                  f'{detour.DETOUR_CONFIRM_S}/'
+                                  f'{detour.DETOUR_CONFIRM_QUEUE_S}'),
         'last_resort_s': (0.0 if args.no_last_resort else args.last_resort_s),
         'redzone': rz_on,
         'redzone_url': rz_url,
@@ -524,7 +532,9 @@ def run(args) -> None:
                     last_resort_s=args.last_resort_s,
                     use_last_resort=not args.no_last_resort,
                     finish_zone=args.finish_zone,
-                    on_event=_policy_event)
+                    on_event=_policy_event,
+                    stoplines=(policy.stoplines if policy is not None else ()),
+                    injunc=planner.injunc)
                 print('[pp] 우회 활성 (완주 보장)')
                 for line in detour.summary(det_policy):
                     print('[pp]' + line)
@@ -538,6 +548,20 @@ def run(args) -> None:
                 log.note('detour', False)
                 log.note('detour_off_reason', repr(exc))
                 det_policy = None
+
+    # TTC 충돌 예측 (평가항목 14 강화). 트랙·래치가 월드 좌표라 경로와 무관하다.
+    # build_policies 밖에서 **한 번** 만들고 우회 교체 때는 rebind(path)만 한다.
+    ttc_policy = None
+    if args.no_ttc:
+        print('[pp] TTC 충돌 예측 비활성 (--no-ttc)')
+    else:
+        ttc_policy = ttc.TtcPolicy(path, d_crit=args.ttc_dcrit,
+                                   front_overhang=args.front_overhang,
+                                   finish_zone=args.finish_zone,
+                                   on_event=_policy_event)
+        print('[pp] TTC 충돌 예측 활성 (항목 14 강화)')
+        for line in ttc.summary(ttc_policy):
+            print('[pp]' + line)
 
     # 붉은 보호구역 (평가항목 2). ffmpeg 파이프는 데몬 스레드가 읽고 루프는
     # 최신 판정값만 본다. 카메라가 안 붙어도 주행은 그대로 간다 (폴백).
@@ -602,6 +626,7 @@ def run(args) -> None:
             det = detour.DetourCmd()
             rz = redzone.RedzoneCmd()
             fin = finish.FinishCmd()
+            tt = ttc.TtcCmd()
 
             # **ego(0,0)은 시뮬레이션 종료 신호다.** 완주 후 VTD가 ego(0,0),
             # heading 0, 객체 0을 보낸다. 리스폰 감지(5m 점프)로 흘리면 전역
@@ -669,6 +694,8 @@ def run(args) -> None:
                         xw_policy.reset()       # 정차·탈출 타이머를 버린다
                     if det_policy is not None:
                         det_policy.reset()      # 옛 위치 기준 관측을 버린다
+                    if ttc_policy is not None:
+                        ttc_policy.reset()      # 트랙·래치를 버린다
                     if rz_policy is not None:
                         rz_policy.reset()       # 히스테리시스 카운터를 버린다
                     fin_policy.reset()          # 종료선 통과 래치를 버린다
@@ -684,6 +711,10 @@ def run(args) -> None:
                         path, bounds = nb['path'], nb['bounds']
                         end_heading = nb['end_heading']
                         seg_starts = [st for _nm, st in bounds]
+                        # 객체 트랙은 월드 좌표라 새 경로에서도 유효하다. 버리면
+                        # trusted를 다시 채우는 동안 속도 예측이 꺼진다 (9/11)
+                        if nb['obs'] is not None:
+                            nb['obs'].adopt(obs_policy)
                         policy, obs_policy = nb['sig'], nb['obs']
                         # 램프는 교체로 꺼지지 않는다. 방향이 같으면 점등
                         # 시각을 이어받아 로그에 없는 깜빡임을 만들지 않는다.
@@ -695,7 +726,11 @@ def run(args) -> None:
                         nb['fin'].adopt(fin_policy)
                         fin_policy = nb['fin']
                         end_heading = path.end_heading()
-                        det_policy.rebind(path, plan.rows, plan.zones, bounds)
+                        det_policy.rebind(path, plan.rows, plan.zones, bounds,
+                                          stoplines=(policy.stoplines
+                                                     if policy is not None else ()))
+                        if ttc_policy is not None:
+                            ttc_policy.rebind(path)     # 트랙·래치는 월드 좌표라 남긴다
                         idx = None          # 리스폰과 같은 전역 재탐색
                         # **meta의 waypoints/segments는 원본 그대로 둔다.**
                         # check_* 계수기가 그것으로 경로를 되살리는데, 우회
@@ -777,6 +812,17 @@ def run(args) -> None:
                                             frame.ego_heading, frame.objects, t)
                     v_cmd = min(v_cmd, obs.v_limit)
 
+                # TTC 충돌 예측 (항목 14 강화). obstacles가 "지금 경로 위에 있는
+                # 것"을 보는 데 반해 이것은 4초 안의 상대 운동을 본다. 같은 sqrt
+                # 프로파일이라 min()으로 합쳐진다. 신호·우회는 이 값을 쓰지 않는다.
+                # 우회 교체 프레임에는 위에서 rebind(path) + 전역 nearest를 거쳤으므로
+                # idx/s_ego가 새 경로 기준이다.
+                if ttc_policy is not None:
+                    tt = ttc_policy.update(idx, path.s[idx], v,
+                                           frame.ego_x, frame.ego_y,
+                                           frame.ego_heading, frame.objects, t)
+                    v_cmd = min(v_cmd, tt.v_limit)
+
                 # 신호등. 정지 프로파일이 경로 끝 감속과 같은 sqrt 형태라
                 # min() 하나로 합쳐진다. 정지선은 경로 중간이므로 아래
                 # 끝단 조향 인계(rem < ld)와는 무관하다.
@@ -813,6 +859,7 @@ def run(args) -> None:
                         # 교착이다. 4(좌회전 전용)는 GO_STATES에 없고, 직진
                         # 차로에서의 4는 stoplines가 이미 _stop으로 보낸다.
                         sig_green=(sig.state in stoplines.GO_STATES),
+                        sig_state=sig.state, sig_dist=sig.dist,
                         obs=(None if obs_policy is None else obs),
                         finished=finished)
                     # 최후 안전망. xw.escape와 같은 성격이라 같은 방식으로
@@ -848,7 +895,7 @@ def run(args) -> None:
                 # obs.accel_limit은 막은 객체를 향한 감속 피드포워드라
                 # 최후 안전망의 v_floor를 그대로 무력화한다. 그때만 뺀다.
                 if not det.forcing:
-                    accel = min(accel, obs.accel_limit)
+                    accel = min(accel, obs.accel_limit, tt.accel_limit)
                 accel = max(ACCEL_MIN, min(ACCEL_MAX, accel))
 
                 # 방향지시등(항목 13)은 속도에 영향이 없어 위 합류에 끼지
@@ -871,6 +918,7 @@ def run(args) -> None:
                 det = detour.DetourCmd(action='error')
                 rz = redzone.RedzoneCmd(action='error')
                 fin = finish.FinishCmd(action='error')
+                tt = ttc.TtcCmd(action='error')
 
             if not client.send_control(steer, accel, turn.signal):
                 print('\n[pp] 송신 실패. 재연결...')
@@ -891,7 +939,8 @@ def run(args) -> None:
                           cw_act=xw.action, cw_dist=xw.dist,
                           dt_act=det.action, dt_dist=det.dist,
                           rz_ratio=rz.ratio, rz_far=rz.ratio_far,
-                          rz_in=rz.in_code, fin_lon=fin.lon)
+                          rz_in=rz.in_code, fin_lon=fin.lon,
+                          tt_act=tt.action, tt_tcpa=tt.t_cpa, tt_dcpa=tt.d_cpa)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -906,6 +955,8 @@ def run(args) -> None:
                   + ('' if obs.action in ('none', 'error')
                      else f' | OB:{obs.action:6s}{obs.kind[:3]}'
                           f'{obs.dist:5.1f}m{obs.lat:+5.1f}')
+                  + ('' if tt.action in ('none', 'error')
+                     else f' | TT:{tt.action:5s}{tt.t_cpa:4.1f}s{tt.d_cpa:4.1f}m')
                   + ('' if xw.action in ('none', 'error')
                      else f' | XW:{xw.action:6s}{xw.dist:6.1f}m')
                   + ('' if det.action in ('none', 'error')
@@ -978,6 +1029,10 @@ def main() -> None:
     ap.add_argument('--obs-max-block', type=float,
                     default=obstacles.MAX_BLOCK_S,
                     help='보행자 대기 상한 [s]. 넘으면 교착으로 보고 기어간다')
+    ap.add_argument('--no-ttc', action='store_true',
+                    help='TTC 충돌 예측을 끈다 (회귀 비교용)')
+    ap.add_argument('--ttc-dcrit', type=float, default=ttc.D_CRIT,
+                    help='TTC 최근접 거리 임계 [m]. 이 안이면 충돌 경로로 본다')
     ap.add_argument('--no-turn-signal', action='store_true',
                     help='방향지시등을 끈다 (회귀 비교용)')
     ap.add_argument('--no-junction-signal', action='store_true',
@@ -988,9 +1043,10 @@ def main() -> None:
                     help='횡단보도 정차 금지를 끈다 (회귀 비교용)')
     ap.add_argument('--no-detour', action='store_true',
                     help='영구 정지 객체 우회와 최후 안전망을 끈다 (회귀 비교용)')
-    ap.add_argument('--detour-confirm', type=float,
-                    default=detour.BLOCK_CONFIRM_S,
-                    help='막힘 확인 시간 [s]')
+    ap.add_argument('--detour-confirm', type=float, default=None,
+                    help='막힘 확인 시간 [s]. 생략하면 맥락 3단계 '
+                         f'({detour.DETOUR_CONFIRM_FAST_S}/{detour.DETOUR_CONFIRM_S}/'
+                         f'{detour.DETOUR_CONFIRM_QUEUE_S}s). 주면 세 단계 전부 그 값')
     ap.add_argument('--last-resort-s', type=float,
                     default=detour.LAST_RESORT_S,
                     help='최후 안전망 발동까지의 정지 지속 시간 [s]')

@@ -66,14 +66,38 @@ import threading
 import obstacles as OB
 import finish as FN
 
-# 트리거
-BLOCK_CONFIRM_S = 8.0       # s, 이만큼 연속 관측돼야 "영구 정지"로 본다
+# 트리거 -- 확인 시간은 맥락으로 3단계다. 8초 하나로 두면 "신호 대기열 vs 영구
+# 정차"를 시간으로만 가르는 셈이라 앞차 뒤에 선 뒤 총 14초를 잃는다 (실측: 45km/h에서
+# 객체를 보고 5.9초 만에 앞차 뒤에 선다). 아래 _classify 참고.
+DETOUR_CONFIRM_FAST_S = 1.5     # s, 맥락상 명백한 장애물 (녹색인데 정지, 신호 없는 단독)
+DETOUR_CONFIRM_S = 4.0          # s, 판단 애매 (정지선·교차로 근처, 연쇄, 보행자)
+DETOUR_CONFIRM_QUEUE_S = 12.0   # s, 대기열로 보이나 계속 안 움직임
+BLOCK_CONFIRM_S = DETOUR_CONFIRM_S      # 옛 이름
+TIER_FAST, TIER_AMBIG, TIER_QUEUE, TIER_FREEZE = 'fast', 'ambig', 'queue', 'freeze'
+TIER_RANK = {TIER_FAST: 0, TIER_AMBIG: 1, TIER_QUEUE: 2, TIER_FREEZE: 3}
+CONFIRM_BY_TIER = {TIER_FAST: DETOUR_CONFIRM_FAST_S, TIER_AMBIG: DETOUR_CONFIRM_S,
+                   TIER_QUEUE: DETOUR_CONFIRM_QUEUE_S, TIER_FREEZE: float('inf')}
+FREEZE_MAX_S = 60.0         # s, 적색 대기열 동결 상한. 적색은 25초고 stoplines의
+                            # MAX_HOLD_S(45s)는 blocked면 얼어 있어 강제 적색 + 정지
+                            # 차량이면 둘이 서로 기다린다(sim 500초 미완주). 그 뒤는
+                            # 대기열(12s)로 넘겨 완주를 지킨다
+QUEUE_SL_M = 60.0           # m, 객체 앞 이 안에 정지선이 있으면 대기열일 수 있다
+CHAIN_GAP_M = 15.0          # m, 정지 차량이 이 간격 이하로 이어지면 연쇄(대기열)
+JUNCTION_NEAR_M = 30.0      # m, 객체 앞 이 안에 교차로 진입이 있으면 대기열일 수 있다
 BLOCK_CORRIDOR_M = 1.5      # m, 차체가 실제로 쓸어가는 반폭. obstacles.
                             # PED_CORRIDOR_M과 같은 값이다. OBST_LANE_M(1.2)은
                             # "감속할지"의 기준이라 여기 쓰지 않는다
 STOPPED_MS = 0.3            # m/s, 이 아래면 정지. 움직이는 객체는 대상 아니다 --
                             # 횡단 중 보행자를 우회하면 항목 10 중대 -6점이다
 DETOUR_LOOKAHEAD_M = 60.0   # m, 이 안의 객체만 본다 (obstacles.LOOKAHEAD_M과 같게)
+# **옆 차로의 정지 객체도 추적한다** (9/11 실차 sc_jam). 회랑 안 객체만 보면 다익스트라가
+# "가장 싼 옆 차로"를 고르는데 그 차로에도 정지 차량이 있으면 거기로 들어가 다시 막힌다.
+# 3차로 도로에서 2·3차로가 막혔는데 3->2->(다시 3) 우회를 6번 실패하고 안전망이 두 대를
+# 관통했다. 이 안의 정지 객체는 전부 (1) 차로 노드 페널티, (2) 같은 군집이면 여유 검증에 쓴다.
+DETOUR_CLEAR_AHEAD_M = DETOUR_LOOKAHEAD_M   # m, 옆 차로 정지 객체를 추적·페널티하는 전방 거리
+WIDE_LAT_M = 10.0           # m, 옆 차로 추적 횡거리 (3차로 ≈ 6.6m + 여유). 대향 차로는
+                            # 차로 부호로 거른다 (DetourPlanner._lane_node)
+LANE_SNAP_R = 2.5           # m, 옆 차로 객체를 차로 노드에 붙일 반경 (반폭 1.6 + 표본 간격)
 # **제한의 대상은 "총 몇 번 우회했나"가 아니라 "같은 지점에서 같은 답을 반복해서
 # 받나"다.** 처음에 총 3회로 묶었더니 네 번째 정지 차량에서 대응하지 못하고 영구
 # 정지했다 -- 완주 그룹은 미완주 그룹보다 항상 상위라 그쪽이 훨씬 나쁘다.
@@ -87,7 +111,8 @@ RETRY_MIN_S = 5.0           # s, 재시도 사이 최소 간격. 같은 입력�
 
 # 탐색
 BLOCK_PENALTY = 5000.0      # 경로 최대 길이(~1000m)보다 확실히 크게. 차단이
-                            # 아니라 가산이다 -- --arrow-penalty와 같은 원칙
+                            # 아니라 가산이다 -- --arrow-penalty와 같은 원칙.
+                            # **객체 1대당 가산** -- 정지 차량이 적은 차로가 이긴다
 # 새 경로가 막은 객체에서 얼마나 떨어져야 "우회했다"고 볼 것인가.
 # **obstacles가 그 객체를 어떻게 보느냐로 정해야 한다.** 처음에 우리 차폭(1.5m)
 # 으로 잡았더니, 20m 블렌드가 장애물 지점에서 1.93m를 내고 "성공"으로 통과했는데
@@ -112,6 +137,10 @@ LC_ROOM_M = 12.0            # m, 이보다 짧은 블렌드는 촉박한 교체�
 # 3.36m를 8m에 붙였더니 조향이 한계 0.350 rad에 그대로 포화됐다. smoothstep이라
 # 장애물 지점에서 절반만 넘어가 있어도 1.5m는 확보되므로 길게 잡을 여지가 크다.
 BLEND_TRIES = (20.0, 16.0, 12.0, 9.0, 7.0, 5.0)
+# 달리는 중에 발동하면(맥락 판단으로 1.5초 만에 걸린다) 여유가 훨씬 많다. 긴
+# 블렌드부터 넣는다 -- _clears가 여유를 그대로 검사하므로 가까우면 저절로 내려간다
+BLEND_TRIES_MOVING = (35.0, 30.0, 25.0) + BLEND_TRIES
+MOVING_MS = 3.0             # m/s, 이 이상이면 "달리는 중" 사다리
 DETOUR_LD_M = 8.0           # m, 그때 쓸 lookahead 하한 (pure_pursuit.LD_MAX=10 안)
 LD_RESTORE_M = 1.0          # m, 경로 이탈이 이 아래면 복귀로 본다
 LD_RESTORE_N = 5            # 프레임, 연속 이만큼 유지돼야 복원
@@ -370,7 +399,7 @@ class Plan:
     __slots__ = ('ok', 'reason', 'bundle', 'rows', 'zones', 'csv_path',
                  'ev_path', 'segments', 'tight', 'first_lc_m', 'solid_lc',
                  'n_lc', 'cost', 'blocked', 'obj_ids', 'start_lat', 'blend_m',
-                 'blend_dir')
+                 'blend_dir', 'n_wide')
 
     def __init__(self, ok, reason='', **kw):
         self.ok, self.reason = ok, reason
@@ -390,6 +419,7 @@ class Plan:
         self.start_lat = kw.get('start_lat', 0.0)
         self.blend_m = kw.get('blend_m', 0.0)
         self.blend_dir = kw.get('blend_dir', '')
+        self.n_wide = kw.get('n_wide', 0)     # 차로 노드가 풀린 옆 차로 정지 객체 수
 
 
 def _snapshot(wps: list) -> list:
@@ -577,25 +607,46 @@ class DetourPlanner:
                             obj_ids=job.get('obj_ids') or [])
             self._q_out.put(plan)
 
-    def _penalized(self, g, blocked: set):
+    @staticmethod
+    def _penalized(g, blocked: dict):
         """막힌 노드로 들어가는 엣지와 거기서 나가는 직진 엣지에 비용을 더한다.
 
         차단이 아니라 가산이다. 대안이 없으면 페널티를 먹고 원래대로 가고,
         그 경우는 아래 결과 검증에서 걸린다. 탐색이 실패하지 않는 것이 중요하다.
+
+        blocked는 {노드: 정지 객체 수}. **객체 1대당 가산**이라 정지 차량이 적은
+        차로가 이긴다 (3차로에 2·2·1대면 1대짜리로 간다). 차선변경으로 빠져나가는
+        엣지는 그대로 무료다.
         """
-        G = self.G
+        import xodr_graph as G
         edges = {}
         for n, es in g.edges.items():
             out = []
             for e in es:
-                c = e.cost
-                if e.to in blocked:
-                    c += BLOCK_PENALTY
-                if n in blocked and e.kind != 'lanechange':
-                    c += BLOCK_PENALTY
+                c = e.cost + BLOCK_PENALTY * blocked.get(e.to, 0)
+                if e.kind != 'lanechange':
+                    c += BLOCK_PENALTY * blocked.get(n, 0)
                 out.append(G.Edge(e.to, c, e.kind, e.solid))
             edges[n] = out
         return G.Graph(pts=g.pts, edges=edges)
+
+    @staticmethod
+    def _lane_node(index, x: float, y: float, ref_node):
+        """옆 차로 객체 (x,y)가 놓인 차로 노드. 없으면 None.
+
+        같은 도로(ref_node의 road id)의 **같은 부호** 차로 중 최근접만 받는다 --
+        대향 차로(부호 반대)·다른 도로·교차로 연결로에 선 차는 우리 경로 후보가
+        아니거나 판단할 근거가 없으므로 페널티를 주지 않는다. section은 거르지
+        않는다 (같은 s의 경로 행보다 한 섹션 앞뒤일 수 있다).
+        """
+        rid, _sec, lid = ref_node
+        best, best_d = None, float('inf')
+        for n, (dd, _s, _h) in index.near(x, y, LANE_SNAP_R).items():
+            if n[0] != rid or n[2] * lid <= 0:
+                continue
+            if dd < best_d:
+                best, best_d = n, dd
+        return best
 
     @staticmethod
     def _clears(wps: list, obstacles_xy: list) -> tuple:
@@ -629,7 +680,7 @@ class DetourPlanner:
                 ok = False
         return ok, worst
 
-    def _search(self, g, cps, blocked, pin=None):
+    def _search(self, g, cps, blocked: dict, pin=None):
         G = self.G
         g2 = self._penalized(g, blocked)
         res, stuck = G.find_route(g2, self.index, cps, pin=pin)
@@ -652,10 +703,21 @@ class DetourPlanner:
     def _solve(self, job: dict) -> Plan:
         G = self.G
         cps = job['cps']
-        blocked = set(job['blocked'])
-        obs_xy = job['obs_xy']
+        blocked = dict(job['blocked'])
+        obs_xy = list(job['obs_xy'])
         ids = job['obj_ids']
         ex, ey = job['ego_xy']
+        # 옆 차로의 정지 객체 -- 차로 노드를 풀어 페널티에 더하고, 회랑 그룹과
+        # 같은 군집(hard)이면 여유 검증 대상에도 넣는다 (9/11 sc_jam)
+        n_wide = 0
+        for w in job.get('wide_obs', ()):
+            n_at = self._lane_node(self.index, w['x'], w['y'], w['ref_node'])
+            if n_at is None:
+                continue
+            blocked[n_at] = blocked.get(n_at, 0) + 1
+            n_wide += 1
+            if w.get('hard'):
+                obs_xy.append((w['x'], w['y'], w['need'], w['ohdg']))
 
         # **출발 차로를 묶는다.** 안 묶으면 다익스트라가 차선변경 비용을 물지
         # 않고 출발 후보 중 가장 싼 차로를 골라, 실측에서 3차로 건너뛴 경로가
@@ -674,7 +736,9 @@ class DetourPlanner:
                 last_err = err
                 continue
             snap = _snapshot(wps)
-            for blend_m in BLEND_TRIES:     # 긴 것부터 -- 조향이 가장 완만하다
+            tries = (BLEND_TRIES_MOVING if job.get('ego_v', 0.0) >= MOVING_MS
+                     else BLEND_TRIES)
+            for blend_m in tries:           # 긴 것부터 -- 조향이 가장 완만하다
                 _restore(wps, snap)
                 lat = _blend_start(wps, ex, ey, blend_m)
                 ok, gap = self._clears(wps, obs_xy)
@@ -690,7 +754,8 @@ class DetourPlanner:
             if best is not None:
                 break
         if best is None:
-            return Plan(False, last_err, blocked=sorted(blocked), obj_ids=ids)
+            return Plan(False, last_err, blocked=sorted(blocked), obj_ids=ids,
+                        n_wide=n_wide)
 
         label, res, wps, lat, blend_m = best
         solid = res.solid_lc
@@ -734,7 +799,7 @@ class DetourPlanner:
         bad = check_rows(bundle['path'], rows)
         if bad:
             return Plan(False, f'우회로 메타데이터 불일치: {bad}',
-                        blocked=sorted(blocked), obj_ids=ids)
+                        blocked=sorted(blocked), obj_ids=ids, n_wide=n_wide)
         zones = scan_undetourable(bundle['path'], rows, self.graph,
                                   self.has_lc, self.injunc)
 
@@ -743,7 +808,7 @@ class DetourPlanner:
                     tight=tight, first_lc_m=first, solid_lc=solid,
                     n_lc=n_lc, cost=res.cost, blocked=sorted(blocked),
                     obj_ids=ids, start_lat=lat, blend_m=blend_m,
-                    blend_dir=blend_dir)
+                    blend_dir=blend_dir, n_wide=n_wide)
 
 
 # ----------------------------------------------------------------------
@@ -754,13 +819,17 @@ LR_NEAR_M = 15.0            # m, 이 안에 있는 확정 막힘만 최후 안�
 
 
 class _B:
-    """막힘 후보 하나. 확인 시간(acc)이 핵심이다.
+    """추적 중인 정지 객체 하나. 확인 시간(acc)이 핵심이다.
 
-    **경로가 바뀌면 통째로 버린다** -- s/lat/d가 전부 옛 경로 기준이다.
-    경로 교체를 넘어 살아야 하는 것(시도 횟수)은 _Hist에 둔다.
+    **경로 교체(rebind)를 넘어 산다.** x/y는 월드 좌표라 그대로 유효하고 s/lat/d/
+    corridor는 다음 프레임 _track이 새 경로로 재투영한다. 예전엔 rebind가 통째로
+    버려서 옆 차로에서 우회해 들어간 뒤 그 차로의 정지 차량을 0초부터 다시 셌다
+    (9/11 sc_jam). 회랑 밖(옆 차로) 객체도 여기 들어오지만 corridor=False라
+    발동(_ready) 대상은 아니다 -- 페널티·군집 검증·acc 선적립에만 쓴다.
     """
 
-    __slots__ = ('id', 'x', 'y', 's', 'lat', 'd', 'kind', 'acc', 'missing')
+    __slots__ = ('id', 'x', 'y', 's', 'lat', 'd', 'kind', 'acc', 'missing',
+                 'tier', 'confirm', 'why', 'frozen', 'corridor', 'told')
 
     def __init__(self, oid, x, y, s, lat, d, kind, t):
         self.id = oid
@@ -769,14 +838,21 @@ class _B:
         self.kind = kind
         self.acc = 0.0          # 조건을 만족한 누적 시간 [s]
         self.missing = 0        # 안 보인 연속 프레임 수
+        self.tier = TIER_AMBIG  # 맥락 판단 (매 프레임 다시 정한다)
+        self.confirm = DETOUR_CONFIRM_S
+        self.why = ''
+        self.frozen = 0.0       # 적색 대기열로 동결돼 있은 누적 시간 [s]
+        self.corridor = False   # 이번 프레임 회랑(|lat| < BLOCK_CORRIDOR_M) 안인가
+        self.told = False       # detour_context를 한 번이라도 냈나 (회랑 안에서만 낸다)
 
 
 class _Hist:
     """객체별 기록. **경로 교체(rebind)를 넘어 산다.**
 
-    시도 횟수를 _B에 두면 우회에 성공하는 순간 0으로 돌아간다 -- rebind가
-    _B를 통째로 버리기 때문이다. MAX_DETOURS를 20으로 올린 지금 그대로 두면
-    같은 객체가 계속 차폭 안에 남을 때 20회까지 무한 루프를 돈다.
+    시도 횟수를 _B에 두면 그 객체가 잠깐 후보에서 빠지는 순간(드롭아웃 grace
+    초과, 옆 차로로 나갔다 들어옴) 0으로 돌아간다. MAX_DETOURS를 20으로 올린
+    지금 그대로 두면 같은 객체가 계속 차폭 안에 남을 때 20회까지 무한 루프를 돈다.
+    (9/11까지는 rebind가 _B를 통째로 버리는 것이 이 분리의 첫 이유였다.)
 
     **리셋은 "그 객체가 후보에서 사라졌을 때"다** (TRIES_RESET_S). 우회에
     성공하면 그 객체는 필요 여유(2.3/1.8/1.5m) 밖이라 즉시 후보에서 빠진다.
@@ -801,17 +877,29 @@ class DetourPolicy:
 
     def __init__(self, path, rows: list, zones: list, bounds: list, *,
                  planner=None,
-                 confirm_s: float = BLOCK_CONFIRM_S,
+                 confirm_s=None,
                  last_resort_s: float = LAST_RESORT_S,
                  lookahead: float = DETOUR_LOOKAHEAD_M,
                  use_last_resort: bool = True,
-                 finish_zone: float = FN.FINISH_ZONE_M, on_event=None):
+                 finish_zone: float = FN.FINISH_ZONE_M, on_event=None,
+                 stoplines=(), injunc=None):
+        """confirm_s=None이면 맥락 3단계(1.5/4/12s). 값을 주면 **세 단계 전부**
+        그 값이다 (옛 --detour-confirm 명령과 호환). 적색 대기열 동결은 어느
+        쪽이든 그대로다.
+
+        stoplines는 stoplines.Stopline 목록(.s/.signalized), injunc는 교차로
+        내부 노드 집합(detour.junction_nodes). 둘 다 맥락 판단에만 쓴다.
+        """
         self.path = path
         self.rows = rows
         self.zones = zones
         self.bounds = bounds
         self.planner = planner
         self.confirm_s = confirm_s
+        self.stoplines = list(stoplines)
+        if injunc is None:
+            injunc = getattr(planner, 'injunc', None) or set()
+        self.injunc = set(injunc)
         self.last_resort_s = last_resort_s
         self.lookahead = lookahead
         self.use_last_resort = use_last_resort
@@ -859,27 +947,33 @@ class DetourPolicy:
         self._announced.add(key)
         self._on_event(kind, detail)
 
-    def rebind(self, path, rows: list, zones: list, bounds: list) -> None:
-        """경로 교체 후. 옛 경로 기준 관측은 전부 의미가 없다.
+    def rebind(self, path, rows: list, zones: list, bounds: list,
+               stoplines=None) -> None:
+        """경로 교체 후. **경로만 바뀐 것이지 주변 상황이 바뀐 것이 아니다.**
 
-        **lookahead 상향과 최후 안전망 래치는 남긴다.** poll()이 켠 상향을
-        reset()이 곧바로 지워 조향 보정이 한 프레임도 걸리지 않은 적이 있다.
-        **객체별 시도 횟수(_hist)도 남긴다** -- 여기서 버리면 우회 성공마다
-        0으로 돌아가 같은 객체를 무한히 다시 푼다.
+        reset()을 부르지 않는다. 객체 추적(_blocks)은 월드 좌표(x,y)라 그대로
+        유효하고, 경로 좌표계 값(s/lat/d/corridor)은 다음 프레임 _track이 새
+        경로로 재투영한다 -- update() 안에서 _track이 _classify/_last_resort보다
+        먼저 돌고, poll()->rebind()와 update() 사이에 _B.s/lat/d를 읽는 곳이
+        없어 경합이 없다. 새 경로에서 안 잡히는 객체는 missing/TRACK_GRACE로
+        자연히 빠진다.
+
+        예전엔 여기서 reset()을 불러 _blocks를 비웠다. 그래서 옆 차로로 우회해
+        들어간 뒤 그 차로의 정지 차량을 acc 0부터 다시 셌고(AMBIG 4초), 실차에서
+        재우회가 4배 느리거나 안 걸렸다 (9/11 sc_jam). 확인 타이머·맥락(tier)·
+        동결 시간·시도 횟수(_hist)·실패/불가 표시·재시도 게이트·이벤트 중복
+        억제·lookahead 상향·최후 안전망 래치 전부 승계한다.
+
+        최후 안전망 래치(_lr_id)는 예전엔 _blocks가 비어 첫 프레임에 자동
+        해제됐는데 이제 "그 객체를 지났을 때"(b.d < -LR_EXIT_M)로 해제된다 --
+        설계 의도 그대로다.
         """
-        keep_lr = (self._lr_id, self._lr_acc)
-        keep_ld = (self._ld_on, self._ld_until, self._ld_ok)
-        failed, impossible, n = self._failed, self._impossible, self.n_detours
-        hist = self._hist       # 시도 횟수는 경로 교체를 넘어 살아야 한다
-        self.reset()
         self.path, self.rows, self.zones = path, rows, zones
         self.bounds = bounds
+        if stoplines is not None:
+            self.stoplines = list(stoplines)
         self._gate_s = FN.gate_s(path, self.finish_zone)
-        self._failed, self._impossible = failed, impossible
-        self._hist = hist
-        self.n_detours = n
-        self._lr_id, self._lr_acc = keep_lr
-        self._ld_on, self._ld_until, self._ld_ok = keep_ld
+        self._pending = ()      # 이 교체를 만든 요청은 끝났다 (poll이 이미 비웠다)
 
     @property
     def ld_floor(self) -> float:
@@ -896,8 +990,11 @@ class DetourPolicy:
     def update(self, idx: int, s_ego: float, v: float, ego_x: float,
                ego_y: float, objects, t: float, *, sig_stopping: bool = False,
                sig_green: bool = False, obs=None,
-               finished: bool = False) -> DetourCmd:
+               finished: bool = False, sig_state: int = 0,
+               sig_dist: float = float('nan')) -> DetourCmd:
         """sig_green은 **stoplines.GO_STATES = {3 녹색, 5 녹색+좌회전}**이다.
+        sig_state는 받은 신호 상태 원값, sig_dist는 stoplines가 겨냥한 정지선까지의
+        후륜축 거리(정지 명령 중이 아니면 nan). 둘 다 맥락 판단(_classify)에만 쓴다.
 
         4(좌회전 전용)는 여기 들어가지 않는다. 직진 차로에서 4는 실질적으로
         적색이고 그 판단은 stoplines의 기동 분류가 이미 한다 -- 직진이면
@@ -913,8 +1010,19 @@ class DetourPolicy:
         self._last_t = t
         sig_wait = sig_stopping and not sig_green
 
-        cands = self._candidates(idx, s_ego, ego_x, ego_y, objects)
-        self._track(cands, dt, sig_wait, t)
+        cands, moving, wide = self._candidates(idx, s_ego, ego_x, ego_y, objects)
+        self._track(cands, moving, wide, dt, t)
+        ctx = (s_ego, sig_wait, sig_green, sig_state, sig_dist)
+        for b in self._blocks.values():
+            self._classify(b, cands, wide, ctx)
+            if b.id not in wide:
+                continue
+            # 옆 차로에 있는 동안에도 쌓는다 -- 우회해 들어간 차로의 정지 차량은
+            # 이미 정지해 있던 것이고, 회랑에 들어오는 순간 발동 대상이 된다
+            if b.tier == TIER_FREEZE:
+                b.frozen += dt
+            else:
+                b.acc += dt
 
         cmd = DetourCmd()
         self._last_resort(v, dt, sig_wait, obs, finished, cmd)
@@ -933,49 +1041,74 @@ class DetourPolicy:
 
         ready = self._ready(v, t)
         if ready is not None:
-            self._trigger(ready, s_ego, idx, ego_x, ego_y, t, cmd)
-        elif self._blocks:
-            b = max(self._blocks.values(), key=lambda x: x.acc)
-            if b.acc > 0.0:
+            self._trigger(ready, s_ego, idx, ego_x, ego_y, v, t, cmd)
+        else:
+            inside = [x for x in self._blocks.values() if x.corridor]
+            if inside:
+                b = max(inside, key=lambda x: x.acc)
                 cmd.action, cmd.obj_id, cmd.dist, cmd.kind = (
                     'watch', b.id, b.d, b.kind)
-                cmd.reason = f'막힘 확인 {b.acc:.1f}/{self.confirm_s:.0f}s'
+                cmd.reason = (f'막힘 확인 {b.acc:.1f}/{b.confirm:.1f}s '
+                              f'({b.tier}: {b.why})')
         return cmd
 
     # -- 후보 추출 ------------------------------------------------------
     def _candidates(self, idx: int, s_ego: float, ego_x: float,
-                    ego_y: float, objects) -> dict:
-        """정지·차폭 안·전방 조건을 만족하는 객체. obstacles의 투영을 재사용한다."""
-        out = {}
+                    ego_y: float, objects) -> tuple:
+        """(회랑 안 후보, 그 자리에서 움직이는 객체 id, 옆 차로까지 넓힌 정지 객체).
+
+        obstacles의 투영을 재사용한다. 두 번째 집합은 "후보였을 자리인데 지금
+        움직이고 있는" 객체다 -- 그 프레임에 확인 시간을 버린다.
+
+        셋째(wide)는 |lat| < WIDE_LAT_M 안의 정지 객체 전부고 첫째(cands)는 그중
+        |lat| < BLOCK_CORRIDOR_M인 부분집합이다. 발동은 cands만, 페널티·군집
+        검증·acc 선적립은 wide로 한다 (9/11 sc_jam).
+        """
+        out, moving, wide = {}, set(), {}
         if not objects:
-            return out
-        i_lo, i_hi = OB._window(self.path, idx, 2.0, self.lookahead + 10.0)
+            return out, moving, wide
+        ahead = min(self.lookahead, DETOUR_CLEAR_AHEAD_M)
+        i_lo, i_hi = OB._window(self.path, idx, 2.0, ahead + 10.0)
         for o in objects:
-            if math.hypot(o.x - ego_x, o.y - ego_y) > self.lookahead + OB.PREFILTER_M:
+            if math.hypot(o.x - ego_x, o.y - ego_y) > ahead + OB.PREFILTER_M:
                 continue
             s_obj, lat, _th = OB._project(self.path, i_lo, i_hi, o.x, o.y)
             d = s_obj - s_ego
-            if d <= 0.0 or d > self.lookahead:
+            if d <= 0.0 or d > ahead:
                 continue
-            if abs(lat) >= BLOCK_CORRIDOR_M:
+            if abs(lat) >= WIDE_LAT_M:
                 continue
             if abs(o.speed) >= STOPPED_MS:
-                continue            # 움직이는 객체는 대상이 아니다
+                moving.add(o.id)    # 움직이는 객체는 대상이 아니다
+                continue
             cls = OB.classify(o)
             if cls == OB.OBSTACLE and s_obj >= self._gate_s:
                 continue            # 종료 라바콘. obstacles와 같은 기준으로 뺀다
-            out[o.id] = (o.x, o.y, s_obj, lat, d, cls)
-        return out
+            wide[o.id] = (o.x, o.y, s_obj, lat, d, cls)
+            if abs(lat) < BLOCK_CORRIDOR_M:
+                out[o.id] = wide[o.id]
+        return out, moving, wide
 
-    def _track(self, cands: dict, dt: float, sig_wait: bool,
+    def _track(self, cands: dict, moving: set, wide: dict, dt: float,
                t: float) -> None:
         for oid in list(self._blocks):
-            if oid in cands:
+            if oid in wide:
                 continue
             b = self._blocks[oid]
+            if oid in moving:
+                # **움직이면 그 프레임에 버린다.** 조금이라도 움직였으면 곧
+                # 지나갈 상대지 장애물이 아니다 (특히 횡단 중 멈췄던 보행자).
+                # 아래 grace는 검출 드롭아웃용이지 이동용이 아니다.
+                # 옆 차로 객체는 조용히 버린다 -- 알린 적이 없는 대상이다
+                if b.corridor:
+                    self._on_event('detour_context',
+                                   f'{b.kind} id={oid} 이동 감지 (확인 {b.acc:.1f}s '
+                                   f'중) ― 우회 판단을 처음부터 다시 한다')
+                del self._blocks[oid]
+                continue
             b.missing += 1
             if b.missing <= OB.TRACK_GRACE:
-                continue        # 한 프레임 튀었다고 8초 확인을 버리지 않는다
+                continue        # 한 프레임 튀었다고 확인 시간을 버리지 않는다
             del self._blocks[oid]
 
         # 객체별 기록은 _blocks보다 오래 산다. **경로를 갈아 끼우면 _blocks는
@@ -992,25 +1125,118 @@ class DetourPolicy:
             self._failed.discard(oid)
             self._impossible.discard(oid)
             self._retry_stopped.discard(oid)
-        for oid, (x, y, s, lat, d, kind) in cands.items():
+        for oid, (x, y, s, lat, d, kind) in wide.items():
             b = self._blocks.get(oid)
             if b is None:
-                self._blocks[oid] = _B(oid, x, y, s, lat, d, kind, t)
+                b = self._blocks[oid] = _B(oid, x, y, s, lat, d, kind, t)
+                b.corridor = oid in cands
                 continue
             if math.hypot(x - b.x, y - b.y) > OB.ID_JUMP_M:
                 # 같은 id지만 다른 객체다. 확인 시간을 처음부터 다시 센다.
                 self._announce(('reuse', oid), 'obj_id_reuse',
                                f'id={oid} 점프 ― 우회 확인 시간을 리셋한다')
-                self._blocks[oid] = _B(oid, x, y, s, lat, d, kind, t)
+                b = self._blocks[oid] = _B(oid, x, y, s, lat, d, kind, t)
+                b.corridor = oid in cands
                 continue
             b.x, b.y, b.s, b.lat, b.d, b.kind = x, y, s, lat, d, kind
+            b.corridor = oid in cands
             b.missing = 0
-            # **신호 정지 중에는 얼린다.** 적색 대기열(적색 25초)의 앞차를
-            # 영구 정지로 오판하면 안 된다. obstacles가 blocked로 stoplines의
-            # MAX_HOLD_S를 얼리는 것과 정확히 대칭이다.
-            # **단 녹색이면 얼리지 않는다** -- 아래 update()의 sig_wait 참고.
-            if not sig_wait:
-                b.acc += dt
+
+    # -- 맥락 판단 ------------------------------------------------------
+    def _next_stopline(self, s: float):
+        """s 이후(2m 뒤까지) 첫 정지선. 없으면 None."""
+        best = None
+        for sl in self.stoplines:
+            if sl.s >= s - 2.0 and (best is None or sl.s < best.s):
+                best = sl
+        return best
+
+    def _chain(self, b: '_B', cands: dict) -> int:
+        """b가 속한 정지 차량 군집의 크기 (앞뒤로 CHAIN_GAP_M 이하 간격, b 포함).
+
+        앞쪽만 세면 대기열의 **맨 앞 차**가 단독으로 보여 4초 만에 우회를 건다.
+        """
+        ss = sorted(s for _x, _y, s, _lat, _d, kind in cands.values()
+                    if kind == OB.VEHICLE)
+        if not ss:
+            return 0
+        i0 = min(range(len(ss)), key=lambda i: abs(ss[i] - b.s))
+        lo = hi = i0
+        while lo > 0 and ss[lo] - ss[lo - 1] <= CHAIN_GAP_M:
+            lo -= 1
+        while hi < len(ss) - 1 and ss[hi + 1] - ss[hi] <= CHAIN_GAP_M:
+            hi += 1
+        return hi - lo + 1
+
+    def _near_junction(self, s: float) -> bool:
+        """s가 교차로 내부이거나 앞 JUNCTION_NEAR_M 안에 교차로 진입이 있나."""
+        if not self.injunc or not self.rows:
+            return False
+        j = min(max(bisect.bisect_left(self.path.s, s), 0), len(self.rows) - 1)
+        k1 = min(self.path._advance(j, JUNCTION_NEAR_M), len(self.rows) - 1)
+        for k in range(j, k1 + 1):
+            if self.rows[k].node in self.injunc:
+                return True
+        return False
+
+    def _classify(self, b: '_B', cands: dict, wide: dict, ctx: tuple) -> None:
+        """막힘 후보의 티어(확인 시간)를 맥락으로 정한다. 매 프레임 다시 본다.
+
+        FREEZE  적색·황색 정지 명령 중이고 객체가 그 정지선 앞 -- 적색 대기열.
+                타이머를 얼린다 (옛 동작 그대로). 녹색이 되면 아래 FAST로 간다
+        FAST    녹색인데 안 움직인다 / 신호·정지선·교차로 없는 단독 정지
+        QUEUE   신호 정지선 앞인데 신호가 NONE(미획득) / 교차로 근접 연쇄
+        AMBIG   그 밖 -- 정지선·교차로 근처, 연쇄, 보행자
+
+        옆 차로 객체도 티어를 매긴다(회랑에 들어오는 순간 확인 시간이 맞아야
+        한다). 연쇄는 **그 객체의 차로대** 안에서 센다. 다만 detour_context는
+        회랑 안에서만 낸다 -- check_ttc의 지연 측정이 회랑 진입 시점부터다.
+        """
+        s_ego, sig_wait, sig_green, sig_state, sig_dist = ctx
+        sl = self._next_stopline(b.s)
+        near_sl = sl is not None and sl.s - b.s <= QUEUE_SL_M
+        if b.corridor:
+            pool = cands
+        else:
+            pool = {k: v for k, v in wide.items()
+                    if abs(v[3] - b.lat) < BLOCK_CORRIDOR_M}
+        chain = self._chain(b, pool)
+        junc = self._near_junction(b.s)
+        sl_txt = (f'{"신호" if sl.signalized else "비신호"} 정지선 {sl.s - b.s:.0f}m 앞'
+                  if near_sl else '정지선 없음')
+        if (sig_wait and (sig_dist != sig_dist or b.s <= s_ego + sig_dist + 2.0)
+                and b.frozen < FREEZE_MAX_S):
+            tier, why = TIER_FREEZE, f'적색 대기열 ({sl_txt}, 앞차 {chain}대 연쇄, 대기)'
+        elif sig_wait and b.frozen >= FREEZE_MAX_S:
+            tier, why = TIER_QUEUE, (f'적색 대기열 동결 {FREEZE_MAX_S:.0f}s 초과 '
+                                     f'({sl_txt}, 앞차 {chain}대 연쇄)')
+        elif sig_green:
+            tier, why = TIER_FAST, f'녹색인데 정지 ({sl_txt}, 앞차 {chain}대)'
+        elif near_sl and sl.signalized and sig_state == 0:
+            tier, why = TIER_QUEUE, f'신호 미획득 ({sl_txt}, 앞차 {chain}대 연쇄)'
+        elif junc and chain >= 2:
+            tier, why = TIER_QUEUE, f'교차로 근접 연쇄 (앞차 {chain}대)'
+        elif near_sl or junc or chain >= 2:
+            tier, why = TIER_AMBIG, (f'{sl_txt}, 앞차 {chain}대'
+                                     + (', 교차로 근접' if junc else ''))
+        else:
+            tier, why = TIER_FAST, f'신호 없음, 앞차 단독, {b.d:.0f}m 전방'
+        if b.kind == OB.PEDESTRIAN and TIER_RANK[tier] < TIER_RANK[TIER_AMBIG]:
+            tier, why = TIER_AMBIG, f'정지 보행자 ({why})'
+        confirm = CONFIRM_BY_TIER[tier]
+        if self.confirm_s is not None and tier != TIER_FREEZE:
+            confirm = self.confirm_s
+        if b.corridor and (tier != b.tier or not b.told):
+            label = {TIER_FREEZE: '대기열 판정', TIER_QUEUE: '대기열 판정',
+                     TIER_AMBIG: '판단 애매', TIER_FAST: '장애물 판정'}[tier]
+            self._announce(('ctx', b.id, tier), 'detour_context',
+                           f'{label} ― {b.kind} id={b.id} {why}'
+                           + (f' (확인 {confirm:.1f}s)' if confirm != float('inf')
+                              else '')
+                           + (f' [옆 차로에서 {b.acc:.1f}s 선적립]'
+                              if not b.told and b.acc > 0.0 else ''))
+            b.told = True
+        b.tier, b.confirm, b.why = tier, confirm, why
 
     def _ready(self, v: float, t: float):
         """재탐색을 걸 대상. 없으면 None."""
@@ -1020,8 +1246,8 @@ class DetourPolicy:
             return None
         best = None
         for b in self._blocks.values():
-            if b.acc < self.confirm_s:
-                continue
+            if not b.corridor or b.acc < b.confirm:
+                continue        # 옆 차로 객체는 발동 대상이 아니다 (추적만)
             h = self._hist.get(b.id)
             # 같은 객체를 여기까지 시도했으면 답이 바뀌지 않는다. **경로를
             # 갈아 끼워도 이 횟수는 남는다** (_Hist 참고).
@@ -1040,11 +1266,12 @@ class DetourPolicy:
         return best
 
     def _trigger(self, b: _B, s_ego: float, idx: int, ego_x: float,
-                 ego_y: float, t: float, cmd: DetourCmd) -> None:
+                 ego_y: float, v: float, t: float, cmd: DetourCmd) -> None:
         cmd.obj_id, cmd.dist, cmd.kind = b.id, b.d, b.kind
-        j = min(max(bisect.bisect_left(self.path.s, b.s), 0),
-                len(self.rows) - 1)
-        node = self.rows[j].node
+        if b.tier == TIER_QUEUE:
+            self._announce(('ctx-late', b.id), 'detour_context',
+                           f'대기열이었으나 {b.acc:.1f}초 경과 ― 우회 시도 '
+                           f'({b.kind} id={b.id} {b.why})')
         z = self.zone_at(b.s)
         if b.s >= self._gate_s:
             # 종료 구간. 우회하면 종료선을 벗어나 완주가 아니다. 우회 불가
@@ -1076,22 +1303,46 @@ class DetourPolicy:
         h.last_try = t
         h.gone_s = 0.0
         self._retry_stopped.discard(b.id)
-        # 같은 노드를 막은 객체는 함께 피해야 한다 (줄지어 선 정지 차량)
+        # 같은 노드를 막은 객체는 함께 피해야 한다 (줄지어 선 정지 차량).
+        # **노드당 객체 수**를 센다 -- 페널티가 객체 1대당 가산이라 정지 차량이
+        # 적은 차로가 이긴다
         group = [x for x in self._blocks.values()
-                 if x.acc >= self.confirm_s or x.id == b.id]
-        blocked = {node}
+                 if x.corridor and (x.acc >= x.confirm or x.id == b.id)]
+        blocked: dict = {}
         obs_xy = []
         for x in group:
-            k = min(max(bisect.bisect_left(self.path.s, x.s), 0),
-                    len(self.rows) - 1)
-            blocked.add(self.rows[k].node)
-            # 객체 헤딩은 그 자리의 경로 접선으로 본다 (차로 안의 차량이다).
-            j0 = max(0, min(k, len(self.path.pts) - 2))
-            ohdg = math.atan2(self.path.pts[j0 + 1][1] - self.path.pts[j0][1],
-                              self.path.pts[j0 + 1][0] - self.path.pts[j0][0])
+            n_at, ohdg = self._at_s(x.s)
+            blocked[n_at] = blocked.get(n_at, 0) + 1
             obs_xy.append((x.x, x.y,
                            CLEAR_BY_KIND.get(x.kind, OB.VEH_LANE_M + 0.3),
                            ohdg))
+
+        # **옆 차로의 정지 객체.** 회랑 그룹과 같은 군집(s 간격 CHAIN_GAP_M 이하로
+        # 이어짐)이면 새 경로가 그것도 비켜 가야 한다(hard). 군집 밖은 페널티만 --
+        # 60m 앞 주차 차량 하나 때문에 모든 해가 실패하면 안 되고, 그 차는
+        # 회랑에 들어오는 순간 (acc가 이미 차 있어) 곧바로 재우회된다.
+        # 차로 노드는 워커가 LaneIndex로 푼다 (다른 도로·대향 차로면 페널티 없음)
+        rest = [x for x in self._blocks.values() if not x.corridor]
+        cluster = [x.s for x in group]
+        hard = set()
+        grew = True
+        while grew:
+            grew = False
+            for x in rest:
+                if x.id in hard:
+                    continue
+                if any(abs(x.s - s0) <= CHAIN_GAP_M for s0 in cluster):
+                    hard.add(x.id)
+                    cluster.append(x.s)
+                    grew = True
+        wide_obs = []
+        for x in rest:
+            n_at, ohdg = self._at_s(x.s)
+            wide_obs.append({'id': x.id, 'x': x.x, 'y': x.y, 's': x.s,
+                             'lat': x.lat, 'kind': x.kind, 'ref_node': n_at,
+                             'ohdg': ohdg,
+                             'need': CLEAR_BY_KIND.get(x.kind, OB.VEH_LANE_M + 0.3),
+                             'hard': x.id in hard})
 
         cps, seg_off = self._checkpoints(s_ego, idx)
         if len(cps) < 2:
@@ -1099,18 +1350,32 @@ class DetourPolicy:
             return
         self._pending = tuple(x.id for x in group)
         cmd.action, cmd.reason = 'search', '재탐색 요청'
+        # check_ttc가 첫 `id=`, `v=..km/h`, `({tier}:`를 정규식으로 읽는다
         self._on_event('detour_start',
-                       f'{b.kind} id={b.id} 정지 {b.acc:.1f}s '
-                       f'(d={b.d:.1f}m lat={b.lat:+.1f}m, 대상 {len(group)}개) '
-                       f'― {sorted(blocked)} 우회 재탐색 '
-                       f'[{self.n_detours + 1}/{MAX_DETOURS}, '
+                       f'{b.kind} id={b.id} 정지 {b.acc:.1f}s/{b.confirm:.1f}s '
+                       f'({b.tier}: {b.why}; d={b.d:.1f}m lat={b.lat:+.1f}m, '
+                       f'대상 {len(group)}개, v={v * 3.6:.1f}km/h) '
+                       f'― {dict(sorted(blocked.items()))} 우회 재탐색'
+                       + (f', 옆 차로 정지 {len(wide_obs)}대'
+                          f'(군집 {len(hard)}대 검증)' if wide_obs else '')
+                       + f' [{self.n_detours + 1}/{MAX_DETOURS}, '
                        f'이 객체 {h.tries}/{MAX_TRIES_PER_OBJ}회]')
         self.planner.request({
             'cps': cps, 'blocked': blocked, 'obs_xy': obs_xy,
+            'wide_obs': wide_obs,
             'seg_offset': seg_off, 'obj_ids': list(self._pending),
-            'ego_xy': (ego_x, ego_y),
+            'ego_xy': (ego_x, ego_y), 'ego_v': v,
             'ego_node': self.rows[min(idx, len(self.rows) - 1)].node,
             'goal_node': self.rows[-1].node})
+
+    def _at_s(self, s: float) -> tuple:
+        """경로 s의 (노드, 접선 헤딩). 객체 헤딩은 그 자리의 경로 접선으로 본다
+        (차로 안의 차량이다 -- 옆 차로도 같은 도로라 같은 접선이다)."""
+        k = min(max(bisect.bisect_left(self.path.s, s), 0), len(self.rows) - 1)
+        j0 = max(0, min(k, len(self.path.pts) - 2))
+        ohdg = math.atan2(self.path.pts[j0 + 1][1] - self.path.pts[j0][1],
+                          self.path.pts[j0 + 1][0] - self.path.pts[j0][0])
+        return self.rows[k].node, ohdg
 
     def _checkpoints(self, s_ego: float, idx: int) -> tuple:
         """[현재 위치] + [남은 구간 경계] + [경로 끝].
@@ -1165,6 +1430,7 @@ class DetourPolicy:
                if abs(plan.start_lat) > 0.05 else '')
             + (f', 첫 차선변경 마커 {plan.first_lc_m:.1f}m 앞'
                if plan.first_lc_m == plan.first_lc_m else '')
+            + (f', 옆 차로 정지 {plan.n_wide}대 반영' if plan.n_wide else '')
             + f' -> {os.path.basename(plan.csv_path)}')
         if plan.tight:
             self._ld_on = True
@@ -1256,8 +1522,11 @@ class DetourPolicy:
 
 
 def summary(policy: DetourPolicy) -> list:
-    out = [f' 재탐색 {"활성" if policy.planner else "비활성"}, '
-           f'확인 {policy.confirm_s:.0f}s, '
+    conf = (f'확인 {policy.confirm_s:.1f}s (균일)' if policy.confirm_s is not None
+            else f'확인 {DETOUR_CONFIRM_FAST_S:.1f}/{DETOUR_CONFIRM_S:.1f}/'
+                 f'{DETOUR_CONFIRM_QUEUE_S:.1f}s (장애물/애매/대기열, 적색 동결)')
+    out = [f' 재탐색 {"활성" if policy.planner else "비활성"}, {conf}, '
+           f'정지선 {len(policy.stoplines)}개·교차로 노드 {len(policy.injunc)}개 참조, '
            f'최후 안전망 '
            + (f'{policy.last_resort_s:.0f}s' if policy.use_last_resort else '꺼짐')
            + f', 종료 구간 {policy.finish_zone:.0f}m (우회 금지·라바콘 무시)']
@@ -1330,8 +1599,8 @@ def _plan(args) -> int:
 class _Straight:
     """300m 직선. obstacles._Straight와 같은 계약(pts/s/length/_advance)."""
 
-    def __init__(self, n=1000, step=0.3):
-        self.pts = [(i * step, 0.0) for i in range(n)]
+    def __init__(self, n=1000, step=0.3, y0=0.0):
+        self.pts = [(i * step, y0) for i in range(n)]      # y0: 옆 차로 경로
         self.s = [i * step for i in range(n)]
         self.length = self.s[-1]
 
@@ -1400,12 +1669,29 @@ class _StubPlanner:
         return self._out.pop(0) if self._out else None
 
 
-def _mk(zones=(), planner=None, **kw):
+class _SL:
+    """stoplines.Stopline 중 맥락 판단이 보는 것만."""
+
+    __slots__ = ('s', 'signalized')
+
+    def __init__(self, s, signalized=True):
+        self.s, self.signalized = s, signalized
+
+
+def _mk(zones=(), planner=None, stoplines=(), junc_s=None, **kw):
+    """junc_s=(s0, s1)이면 그 구간을 교차로 내부 노드(road '9')로 만든다."""
     path = _Straight()
     rows = [Row(x, y, '1', 0, -1) for x, y in path.pts]
+    injunc = None
+    if junc_s is not None:
+        for i, (x, y) in enumerate(path.pts):
+            if junc_s[0] <= x <= junc_s[1]:
+                rows[i] = Row(x, y, '9', 0, -1)
+        injunc = {('9', 0, -1)}
     rec = _Rec()
     pol = DetourPolicy(path, rows, list(zones), [('p1_to_p2', 0)],
-                       planner=planner, on_event=rec, **kw)
+                       planner=planner, on_event=rec, stoplines=stoplines,
+                       injunc=injunc, **kw)
     return path, pol, rec
 
 
@@ -1432,17 +1718,21 @@ def _selftest() -> int:
         print(f'  {"OK  " if ok else "FAIL"} {name}'
               + (f'   {detail}' if detail and not ok else ''))
 
-    # 1. 확인 시간 -- 8초 미만이면 발동하지 않는다
+    # 1. 확인 시간 -- 신호·정지선·교차로 없는 단독 정지 차량은 FAST(1.5s)
     _p, pol, rec = _mk(planner=_StubPlanner())
     car = _Fake(1, 40.0, 0.0)
-    _run(pol, lambda t, s: [car], n=100)          # 5.0초
+    _run(pol, lambda t, s: [car], n=20)           # 1.0초
     check('확인 미달: 발동 안 함', not pol.planner.jobs,
           f'{len(pol.planner.jobs)}회 요청')
-    _run(pol, lambda t, s: [car], n=100)          # 누적 10.0초
+    check('장애물 판정 이벤트', any(k == 'detour_context' and '장애물 판정' in d
+                                for k, d in rec.log), ','.join(rec.kinds()))
+    _run(pol, lambda t, s: [car], n=20)           # 누적 2.0초
     check('확인 초과: 발동', len(pol.planner.jobs) == 1,
           f'{len(pol.planner.jobs)}회 요청')
     check('확인 초과: detour_start 발화', 'detour_start' in rec.kinds(),
           ','.join(rec.kinds()))
+    check('detour_start에 속도 기록', any(k == 'detour_start' and 'v=' in d
+                                      for k, d in rec.log))
 
     # 2. 신호 정지 중에는 타이머가 얼어붙는다 (적색 대기열 오탐 방지)
     _p, pol, rec = _mk(planner=_StubPlanner())
@@ -1482,8 +1772,8 @@ def _selftest() -> int:
     # 6. id 재사용 -- 같은 id가 튀면 확인 시간을 다시 센다
     _p, pol, rec = _mk(planner=_StubPlanner())
     def jumpy(t, s):
-        return [_Fake(1, 40.0 if t < 7.0 else 25.0, 0.0)]
-    _run(pol, jumpy, n=280)                       # 14초
+        return [_Fake(1, 40.0 if t < 1.0 else 25.0, 0.0)]
+    _run(pol, jumpy, n=40)                        # 2.0초 (1.0 + 1.0 < 1.5)
     check('id 재사용: 확인 리셋', not pol.planner.jobs,
           f'{len(pol.planner.jobs)}회 요청')
     check('id 재사용: obj_id_reuse 발화', 'obj_id_reuse' in rec.kinds())
@@ -1548,7 +1838,7 @@ def _selftest() -> int:
     #     리셋으로는 LAST_RESORT_S를 채우기 전에 매번 처음으로 돌아간다.
     _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
     o = lambda t, s: [_Fake(1, 8.0, 0.0)]
-    _l, _s, t1 = _run(pol, o, n=340, obs=obs)                   # 17초: 확인+누적
+    _l, _s, t1 = _run(pol, o, n=120, obs=obs)                   # 6초: 확인 1.5 + 누적 4.5
     hold = pol._lr_acc
     _l, _s, t2 = _run(pol, o, n=400, obs=obs, t0=t1,            # 20초 적색 대기
                       sig_stopping=True)
@@ -1639,8 +1929,8 @@ def _selftest() -> int:
     _run(pol, lambda t, s: [], n=int(TRIES_RESET_S / 0.05) + 4, v=0.0, t0=t2)
     check('사라지면 기록을 버린다', not pol._hist and not pol._failed,
           f'hist={list(pol._hist)} failed={sorted(pol._failed)}')
-    # 확인 8초 + 여유 2초. RETRY_MIN_S(5) 안이라 요청은 정확히 한 번이다.
-    _run(pol, car, n=200, v=0.0, t0=t2 + TRIES_RESET_S + 1.0)
+    # 확인 1.5초 + 여유 1.5초. RETRY_MIN_S(5) 안이라 요청은 정확히 한 번이다.
+    _run(pol, car, n=60, v=0.0, t0=t2 + TRIES_RESET_S + 1.0)
     check('되돌아오면 다시 시도', len(pol.planner.jobs) == MAX_TRIES_PER_OBJ + 1,
           f'{len(pol.planner.jobs)}회 요청')
 
@@ -1677,6 +1967,249 @@ def _selftest() -> int:
 
     d, _m = blend_case(0.3)
     check('미세 보정에는 마커를 심지 않는다', d == '', f'마커 {d or "없음"}')
+
+    # 13. 맥락 판단 -- 적색 정지선 앞 정지 차량은 대기열이라 동결한다
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(30.0)])
+    _run(pol, lambda t, s: [_Fake(1, 20.0, 0.0)], n=400,
+         sig_stopping=True, sig_state=1, sig_dist=30.0)
+    check('적색 대기열: 20초 동결', not pol.planner.jobs,
+          f'{len(pol.planner.jobs)}회 요청')
+    check('적색 대기열: detour_context 대기열 판정',
+          any(k == 'detour_context' and '적색 대기열' in d for k, d in rec.log),
+          ','.join(rec.kinds()))
+
+    # 13a'. 동결은 FREEZE_MAX_S에서 끝난다 -- 강제 적색 + 정지 차량 교착 방지
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(30.0)])
+    o = lambda t, s: [_Fake(1, 20.0, 0.0)]
+    kw = dict(sig_stopping=True, sig_state=1, sig_dist=30.0)
+    _l, _s, t1 = _run(pol, o, n=int(FREEZE_MAX_S / 0.05) + 200, **kw)   # 70초
+    check('동결 상한: 70초 미발동 (QUEUE 12초 진행 중)', not pol.planner.jobs
+          and pol._blocks[1].tier == TIER_QUEUE,
+          f'{len(pol.planner.jobs)}회, tier={pol._blocks[1].tier if 1 in pol._blocks else "?"}')
+    _run(pol, o, n=100, t0=t1, **kw)                                       # 75초
+    check('동결 상한: 60+12초 뒤 발동', len(pol.planner.jobs) == 1,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 13b. 녹색인데 정지 -- 정지선이 코앞이어도 FAST(1.5s)
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(30.0)])
+    _run(pol, lambda t, s: [_Fake(1, 20.0, 0.0)], n=40,
+         sig_stopping=True, sig_green=True, sig_state=3, sig_dist=30.0)
+    check('녹색인데 정지: 2초 안에 발동', len(pol.planner.jobs) == 1,
+          f'{len(pol.planner.jobs)}회 요청')
+    check('녹색인데 정지: 사유 기록',
+          any(k == 'detour_context' and '녹색인데 정지' in d for k, d in rec.log))
+
+    # 13c. **적색 대기 중 앞차가 사라지면** 정상 복귀한다 (옆으로 빠졌거나 지나감)
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(30.0)])
+    _l, _s, t1 = _run(pol, lambda t, s: [_Fake(1, 20.0, 0.0)], n=100,
+                      sig_stopping=True, sig_state=1, sig_dist=30.0)
+    log, _s, t2 = _run(pol, lambda t, s: [], n=100, t0=t1,
+                       sig_stopping=True, sig_state=1, sig_dist=30.0)
+    check('앞차 소멸: 후보 비움', not pol._blocks and log[-1][2] == 'none',
+          f'blocks={list(pol._blocks)} act={log[-1][2]}')
+    check('앞차 소멸: 기록 정리', not pol._hist, f'{list(pol._hist)}')
+    _run(pol, lambda t, s: [], n=60, t0=t2, sig_green=True, sig_state=3)
+    check('앞차 소멸 후 녹색: 발동 없음', not pol.planner.jobs,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 13d. 정지 차량 3대 연쇄 + 교차로 진입 20m 앞 -> QUEUE(12s)
+    _p, pol, rec = _mk(planner=_StubPlanner(), junc_s=(60.0, 80.0))
+    cars = [_Fake(1, 40.0, 0.0), _Fake(2, 50.0, 0.0), _Fake(3, 58.0, 0.0)]
+    _run(pol, lambda t, s: cars, n=220)           # 11초
+    check('교차로 연쇄: 11초 미발동', not pol.planner.jobs,
+          f'{len(pol.planner.jobs)}회 요청 (tier={pol._blocks[1].tier if 1 in pol._blocks else "?"})')
+    _run(pol, lambda t, s: cars, n=40)            # 13초
+    # 스텁 플래너는 늘 실패하므로 나머지 두 대가 곧바로 재시도한다. 첫 요청이
+    # 세 대를 한 그룹으로 묶었는지만 본다
+    check('교차로 연쇄: 12초 뒤 발동 (3대 한 그룹)', pol.planner.jobs
+          and len(pol.planner.jobs[0]['obj_ids']) == 3,
+          f'{len(pol.planner.jobs)}회 요청 '
+          f'{[j["obj_ids"] for j in pol.planner.jobs[:1]]}')
+    check('교차로 연쇄: 대기열 경과 사유',
+          any(k == 'detour_context' and '대기열이었으나' in d for k, d in rec.log),
+          ','.join(rec.kinds()))
+
+    # 13e. 신호 정지선 앞인데 신호가 NONE(미획득) -> QUEUE
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(60.0, True)])
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=220, sig_state=0)
+    check('신호 미획득: 11초 미발동', not pol.planner.jobs)
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=40, sig_state=0)
+    check('신호 미획득: 12초 뒤 발동', len(pol.planner.jobs) == 1)
+
+    # 13f. 비신호 정지선 근처 단독 -> AMBIG(4s)
+    _p, pol, rec = _mk(planner=_StubPlanner(), stoplines=[_SL(60.0, False)])
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=60)   # 3초
+    check('비신호 정지선 근처: 3초 미발동', not pol.planner.jobs)
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=30)   # 4.5초
+    check('비신호 정지선 근처: 4초 뒤 발동', len(pol.planner.jobs) == 1)
+
+    # 13g. 60m 앞 정지 차량을 **달리는 중**에 건다 -- 블렌드 여유가 남는다
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    log, s_end, _t = _run(pol, lambda t, s: [_Fake(1, 70.0, 0.0)], n=80, v=12.5)
+    fired = next((r for r in log if r[2] == 'search'), None)
+    check('주행 중 발동: 요청', fired is not None and len(pol.planner.jobs) == 1,
+          f'{len(pol.planner.jobs)}회 요청')
+    check('주행 중 발동: 객체 30m 이상 앞에서',
+          fired is not None and 70.0 - fired[1] >= 30.0,
+          f's={fired[1] if fired else None}')
+    check('주행 중 발동: 속도가 워커에 전달', pol.planner.jobs
+          and abs(pol.planner.jobs[0].get('ego_v', 0.0) - 12.5) < 1e-6)
+    check('주행 중 사다리는 35m부터', BLEND_TRIES_MOVING[0] == 35.0
+          and BLEND_TRIES_MOVING[-len(BLEND_TRIES):] == BLEND_TRIES)
+
+    # 13h. 정지 보행자는 맥락과 무관하게 최소 AMBIG(4s)
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0, dims=PED)], n=60)     # 3초
+    check('정지 보행자: 3초 미발동', not pol.planner.jobs)
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0, dims=PED)], n=30)     # 4.5초
+    check('정지 보행자: 4초 뒤 발동', len(pol.planner.jobs) == 1)
+
+    # 13i. 보행자가 3초에 한 프레임이라도 움직이면 확인 시간을 버린다
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    def twitch(t, s):
+        sp = 0.5 if 3.0 <= t < 3.05 else 0.0
+        return [_Fake(1, 40.0, 0.0, speed=sp, dims=PED)]
+    _run(pol, twitch, n=80)                        # 4.0초
+    check('보행자 이동: 4초 미발동', not pol.planner.jobs,
+          f'{len(pol.planner.jobs)}회 요청')
+    check('보행자 이동: 리셋 이벤트',
+          any(k == 'detour_context' and '이동 감지' in d for k, d in rec.log))
+    _run(pol, twitch, n=70, t0=4.0)                # 7.5초 (3.05 + 4.0 = 7.05)
+    check('보행자 이동: 다시 4초 뒤 발동', len(pol.planner.jobs) == 1,
+          f'{len(pol.planner.jobs)}회 요청')
+
+    # 13j. --detour-confirm 값을 주면 세 단계 전부 그 값 (옛 명령 호환)
+    _p, pol, rec = _mk(planner=_StubPlanner(), confirm_s=30.0)
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=400)
+    check('균일 오버라이드: 20초 미발동', not pol.planner.jobs
+          and pol._blocks[1].confirm == 30.0,
+          f'{len(pol.planner.jobs)}회, confirm={pol._blocks[1].confirm if 1 in pol._blocks else "?"}')
+
+    # 14. 옆 차로의 정지 객체 (9/11 실차 sc_jam -- 3차로 도로에서 2·3차로가 막혔는데
+    #     3->2->(다시 3) 우회를 6번 실패하고 안전망이 두 대를 관통했다)
+    # 14a. 옆 차로 객체가 job에 실린다 -- 회랑 그룹은 obj_ids/blocked, 옆 차로는 wide_obs
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0), _Fake(2, 42.0, 3.3)], n=40)
+    job = pol.planner.jobs[0] if pol.planner.jobs else {}
+    w = [x for x in job.get('wide_obs', ()) if x['id'] == 2]
+    check('옆 차로: 회랑 그룹만 obj_ids', job.get('obj_ids') == [1],
+          f'{job.get("obj_ids")}')
+    check('옆 차로: blocked는 노드당 개수', job.get('blocked') == {('1', 0, -1): 1},
+          f'{job.get("blocked")}')
+    check('옆 차로: wide_obs에 실림 (군집, need 2.3)',
+          len(w) == 1 and w[0]['hard'] and abs(w[0]['need'] - 2.3) < 1e-9
+          and w[0]['ref_node'] == ('1', 0, -1),
+          f'{w}')
+    check('옆 차로: 회랑 객체만 detour_context',
+          all('id=1' in d for k, d in rec.log if k == 'detour_context'),
+          f'{[d for k, d in rec.log if k == "detour_context"]}')
+
+    # 14b. 옆 차로 객체만으로는 발동하지 않는다 -- 추적·acc 선적립만
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(2, 40.0, 3.3)], n=400)
+    check('옆 차로 단독: 미발동', not pol.planner.jobs and 2 in pol._blocks
+          and not pol._blocks[2].corridor,
+          f'{len(pol.planner.jobs)}회, {2 in pol._blocks}')
+    check('옆 차로 단독: acc 선적립', 2 in pol._blocks
+          and pol._blocks[2].acc > DETOUR_CONFIRM_FAST_S,
+          f'{pol._blocks[2].acc if 2 in pol._blocks else "?"}')
+    check('옆 차로 단독: 이벤트 없음', 'detour_context' not in rec.kinds(),
+          ','.join(rec.kinds()))
+
+    # 14c. 군집 판정 -- 회랑 그룹에서 CHAIN_GAP_M 이하로 이어지면 hard, 아니면 페널티만
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 20.0, 0.0), _Fake(2, 30.0, 3.3),
+                            _Fake(3, 55.0, 3.3)], n=40)
+    hard = {x['id']: x['hard'] for x in pol.planner.jobs[0]['wide_obs']}
+    check('군집: 10m 앞 옆 차로는 hard, 35m 앞은 soft',
+          hard == {2: True, 3: False}, f'{hard}')
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 20.0, 0.0), _Fake(2, 30.0, 3.3),
+                            _Fake(3, 42.0, 3.3), _Fake(4, 54.0, 6.6)], n=40)
+    hard = {x['id']: x['hard'] for x in pol.planner.jobs[0]['wide_obs']}
+    check('군집: 12m 간격으로 이어지면 전부 hard (반복 확장)',
+          hard == {2: True, 3: True, 4: True}, f'{hard}')
+
+    # 14d. 확인 시간이 rebind를 넘는다 -- 1.0초 보고 교체, 0.7초 뒤 발동 (합 1.7 >= 1.5)
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=20)
+    check('rebind 승계: 교체 전 미발동', not pol.planner.jobs)
+    pol.rebind(pol.path, pol.rows, pol.zones, pol.bounds)
+    check('rebind 승계: _blocks 유지', 1 in pol._blocks
+          and abs(pol._blocks[1].acc - 0.95) < 1e-6,
+          f'{pol._blocks[1].acc if 1 in pol._blocks else "없음"}')
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 0.0)], n=14, t0=1.0)
+    check('rebind 승계: 교체 뒤 0.7초 만에 발동', bool(pol.planner.jobs),
+          f'acc={pol._blocks[1].acc if 1 in pol._blocks else "?"}')
+
+    # 14e. 회랑 승격 -- 옆 차로에서 3초 추적한 차가 새 경로(그 차로)에서는 회랑 안이다.
+    #      교체 뒤 3프레임 안에 발동해야 한다 (목표: 감지 후 2초 이내)
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 3.3)], n=60)
+    check('회랑 승격: 교체 전 알림 없음', 'detour_context' not in rec.kinds())
+    p2 = _Straight(y0=3.3)
+    rows2 = [Row(x, y, '1', 0, -2) for x, y in p2.pts]
+    pol.rebind(p2, rows2, [], pol.bounds)
+    _run(pol, lambda t, s: [_Fake(1, 40.0, 3.3)], n=3, t0=3.0)
+    ctx = [d for k, d in rec.log if k == 'detour_context']
+    check('회랑 승격: 3프레임 안에 발동', len(pol.planner.jobs) == 1,
+          f'{len(pol.planner.jobs)}회')
+    check('회랑 승격: detour_context 1건, 선적립 표기',
+          len(ctx) == 1 and '선적립' in ctx[0], f'{ctx}')
+    check('회랑 승격: 새 경로 노드로 페널티',
+          pol.planner.jobs and pol.planner.jobs[0]['blocked'] == {('1', 0, -2): 1},
+          f'{pol.planner.jobs[0]["blocked"] if pol.planner.jobs else "?"}')
+
+    # 14f. 옆 차로 객체가 움직이면 조용히 버린다
+    _p, pol, rec = _mk(planner=_StubPlanner())
+    _run(pol, lambda t, s: [_Fake(2, 40.0, 3.3, speed=(1.0 if t > 1.0 else 0.0))],
+         n=30)
+    check('옆 차로 이동: 추적에서 제거', 2 not in pol._blocks)
+    check('옆 차로 이동: 이벤트 없음', 'detour_context' not in rec.kinds(),
+          ','.join(rec.kinds()))
+
+    # 14g. _penalized -- 객체 1대당 가산, 차선변경 이탈은 무료
+    import xodr_graph as G
+    A, B, A2, B2 = ('1', 0, -1), ('1', 0, -2), ('1', 1, -1), ('1', 1, -2)
+    g = G.Graph(pts={}, edges={A: [G.Edge(B, 25.0, 'lanechange'),
+                                   G.Edge(A2, 10.0, 'section')],
+                               B: [G.Edge(A, 25.0, 'lanechange'),
+                                   G.Edge(B2, 10.0, 'section')]})
+    g2 = DetourPlanner._penalized(g, {B: 2})
+    cost = {(n, e.to): e.cost for n, es in g2.edges.items() for e in es}
+    check('페널티: 막힌 노드 진입은 대수 x 5000',
+          abs(cost[(A, B)] - (25.0 + 2 * BLOCK_PENALTY)) < 1e-9, f'{cost[(A, B)]}')
+    check('페널티: 막힌 노드 직진 이탈도 가산',
+          abs(cost[(B, B2)] - (10.0 + 2 * BLOCK_PENALTY)) < 1e-9, f'{cost[(B, B2)]}')
+    check('페널티: 차선변경 이탈은 무료', abs(cost[(B, A)] - 25.0) < 1e-9)
+    check('페널티: 무관한 엣지 그대로', abs(cost[(A, A2)] - 10.0) < 1e-9)
+
+    # 14h. _lane_node -- 같은 도로·같은 부호 차로만, 반경 안만
+    def _lp(x, y):
+        return G.LanePt(x, x, y, 0.0, 3.3, 'both', '', 'both', '')
+    pts = {('1', 0, -1): [_lp(i, 0.0) for i in range(21)],
+           ('1', 0, -2): [_lp(i, -3.3) for i in range(21)],
+           ('1', 0, 1): [_lp(i, 3.3) for i in range(21)],
+           ('2', 0, -1): [_lp(i, -6.6) for i in range(21)]}
+    li = G.LaneIndex(pts)
+    check('차로 노드: 같은 도로 옆 차로',
+          DetourPlanner._lane_node(li, 10.0, -3.4, ('1', 0, -1)) == ('1', 0, -2))
+    check('차로 노드: 대향 차로는 None',
+          DetourPlanner._lane_node(li, 10.0, 3.3, ('1', 0, -1)) is None)
+    check('차로 노드: 다른 도로는 None',
+          DetourPlanner._lane_node(li, 10.0, -6.6, ('1', 0, -1)) is None)
+    check('차로 노드: 반경 밖은 None',
+          DetourPlanner._lane_node(li, 10.0, -20.0, ('1', 0, -1)) is None)
+
+    # 14i. 시도한 적 없는 옆 차로 객체는 최후 안전망을 못 건다 (게이트 확인)
+    for oid, want in ((2, False), (1, True)):
+        _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
+        obs2 = OB.ObstacleCmd(action='stop', obj_id=oid)
+        _run(pol, lambda t, s: [_Fake(1, 8.0, 0.0), _Fake(2, 10.0, 3.3)],
+             n=800, obs=obs2)
+        check(f'안전망 게이트: obs가 id={oid}를 볼 때 {"발동" if want else "미발동"}',
+              ('last_resort_pass' in rec.kinds()) == want,
+              ','.join(sorted(set(rec.kinds()))))
 
     # 12. 실제 경로 -- 계획 단계 실측과 일치해야 한다
     data = _data_dir()

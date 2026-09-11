@@ -266,29 +266,76 @@ OBJ_RANGE_M = 80.0          # 9910 명세의 수신 반경. 이 밖은 넣지 �
 INJECT_ID_BASE = 900        # 녹화 id와 겹치지 않게
 
 
-class Injected:
-    """경로 위에 놓는 합성 정지 객체.
+def world_at(path, s: float, lat: float) -> tuple:
+    """경로 호길이 s, 부호 횡거리 lat(좌가 양수) -> (x, y, 접선 방위).
 
-    녹화 로그에는 **경로를 막는 정지 차량이 하나도 없다** (사전테스트 6세션
-    전부). 우회를 검증하려면 만들어 넣는 수밖에 없다. --objects 재생 블록의
-    빈 슬롯에 끼워 넣으므로 재생 자체는 그대로 간다.
+    부호 규약은 obstacles._project와 같다.
+    """
+    i = 0
+    while i < len(path.pts) - 2 and path.s[i + 1] < s:
+        i += 1
+    ax, ay = path.pts[i]
+    bx, by = path.pts[i + 1]
+    seg = max(1e-6, path.s[i + 1] - path.s[i])
+    u = max(0.0, (s - path.s[i]) / seg)
+    if i < len(path.pts) - 2:
+        u = min(1.0, u)         # 끝 선분에서는 외삽 -- 앞차가 종료선 너머로 떠난다
+    hx, hy = ax + u * (bx - ax), ay + u * (by - ay)
+    th = math.atan2(by - ay, bx - ax)
+    return hx - math.sin(th) * lat, hy + math.cos(th) * lat, th
+
+
+def _smooth(u: float) -> float:
+    u = max(0.0, min(1.0, u))
+    return u * u * (3.0 - 2.0 * u)
+
+
+class Injected:
+    """경로 위에 놓는 합성 객체. 정지가 기본이고 mode로 움직인다.
+
+    녹화 로그에는 **경로를 막는 정지 차량도, 끼어드는 차도 없다** (사전테스트
+    6세션 전부). 우회·TTC를 검증하려면 만들어 넣는 수밖에 없다. --objects 재생
+    블록의 빈 슬롯에 끼워 넣으므로 재생 자체는 그대로 간다.
+
+    mode
+      static  기본(v=0). 시작 시 한 번 (x,y,heading)으로 바꾸고 움직이지 않는다
+      path    경로를 따라 dir 방향으로 v로 달린다. ego s>=start부터, stop_s에서 정지.
+              앞차 주행 / 대향 직진(lat=+3.5,dir=-1 -- 우측통행이라 대향은 좌측)
+      cutin   path처럼 달리다 ego가 trig m 뒤로 오면 dur초 smoothstep으로
+              lat->lat1(0), v->v1. 헤딩은 실제 이동 방향(횡속도 포함)
+      line    ego s>=start에 도달하면 hdg(절대) 또는 rhdg(접선 상대, 직각=±1.5708)
+              방향 월드 직선 등속. 교차로 측면 진입
     """
 
     __slots__ = ('id', 'x', 'y', 'heading', 'speed', 'length', 'width',
-                 'height')
+                 'height', 'mode', 's', 'lat', 'dir', 'start', 'trig', 'dur',
+                 'v0', 'v1', 'lat0', 'lat1', 'stop_s', 'hdg', '_t', '_fired',
+                 '_started')
 
     def __init__(self, oid, x, y, heading, speed, length, width, height):
         self.id = oid
         self.x, self.y, self.heading = x, y, heading
         self.speed = speed
         self.length, self.width, self.height = length, width, height
+        self.mode = 'static'
+        self.s = self.lat = 0.0
+        self.dir = 1.0
+        self.start = None
+        self.trig, self.dur = 20.0, 2.5
+        self.v0, self.v1 = speed, speed
+        self.lat0, self.lat1 = 0.0, 0.0
+        self.stop_s = None
+        self.hdg = heading
+        self._t = 0.0
+        self._fired = False
+        self._started = False
 
     @classmethod
     def parse(cls, spec: str, path, oid: int) -> 'Injected':
-        """s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7] -> 월드 좌표로 고정.
+        """s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7][,mode=..,...] -> 객체.
 
-        s(경로 호길이)와 lat(부호 횡거리, 좌가 양수)을 시작 시 한 번만
-        (x,y,heading)으로 바꾼다. 이후 움직이지 않는다.
+        s(경로 호길이)와 lat(부호 횡거리, 좌가 양수)을 시작 시 (x,y,heading)으로
+        바꾼다. mode가 없고 v=0이면 예전처럼 움직이지 않는다.
         """
         kv = {}
         for part in spec.split(','):
@@ -299,34 +346,88 @@ class Injected:
                 raise SystemExit(f'--inject-object 형식 오류: {part!r} '
                                  '(s=250,lat=0,l=4.39,w=1.81,h=1.35,v=0)')
             k, val = part.split('=', 1)
-            kv[k.strip()] = float(val)
+            k = k.strip()
+            kv[k] = val.strip() if k == 'mode' else float(val)
+        dims = (kv.get('l', 4.39), kv.get('w', 1.81), kv.get('h', 1.35))
+        v = kv.get('v', 0.0)
+        mode = kv.get('mode', 'path' if v > 0.0 else 'static')
+        if mode not in ('static', 'path', 'cutin', 'line'):
+            raise SystemExit(f'--inject-object mode={mode!r} (static/path/cutin/line)')
         if 'x' in kv and 'y' in kv:
             # 절대 좌표. 경로 꼬리 밖(종료 라바콘)에 놓을 때 쓴다. 헤딩은 끝 접선
-            return cls(int(kv.get('id', oid)), kv['x'], kv['y'], path.end_heading(),
-                       kv.get('v', 0.0), kv.get('l', 4.39), kv.get('w', 1.81),
-                       kv.get('h', 1.35))
-        if 's' not in kv:
-            raise SystemExit(f'--inject-object 에는 s= (또는 x=,y=) 가 필요하다: {spec!r}')
+            o = cls(int(kv.get('id', oid)), kv['x'], kv['y'], path.end_heading(),
+                    v, *dims)
+            th = path.end_heading()
+        else:
+            if 's' not in kv:
+                raise SystemExit(f'--inject-object 에는 s= (또는 x=,y=) 가 필요하다: {spec!r}')
+            x, y, th = world_at(path, kv['s'], kv.get('lat', 0.0))
+            o = cls(int(kv.get('id', oid)), x, y, th, v, *dims)
+            o.s, o.lat = kv['s'], kv.get('lat', 0.0)
+        o.mode = mode
+        o.dir = -1.0 if kv.get('dir', 1.0) < 0 else 1.0
+        if o.dir < 0:
+            o.heading = th + math.pi
+        o.start = kv.get('start')
+        o.trig = kv.get('trig', 20.0)
+        o.dur = max(0.1, kv.get('dur', 2.5))
+        o.v0, o.v1 = v, kv.get('v1', v)
+        o.lat0, o.lat1 = o.lat, kv.get('lat1', 0.0)
+        o.stop_s = kv.get('stop_s')
+        if 'hdg' in kv:
+            o.hdg = kv['hdg']
+        elif 'rhdg' in kv:
+            o.hdg = th + kv['rhdg']
+        else:
+            o.hdg = th
+        if mode == 'line':
+            o.heading = o.hdg
+        if mode in ('line', 'path', 'cutin') and o.start is not None:
+            o.speed = 0.0           # 출발 전에는 정지 상태로 보인다
+        return o
 
-        s = kv['s']
-        lat = kv.get('lat', 0.0)
-        i = 0
-        while i < len(path.pts) - 2 and path.s[i + 1] < s:
-            i += 1
-        ax, ay = path.pts[i]
-        bx, by = path.pts[i + 1]
-        seg = max(1e-6, path.s[i + 1] - path.s[i])
-        u = min(1.0, max(0.0, (s - path.s[i]) / seg))
-        hx, hy = ax + u * (bx - ax), ay + u * (by - ay)
-        th = math.atan2(by - ay, bx - ax)
-        # 부호 규약은 obstacles._project 와 같다 (진행방향 좌측이 양수)
-        x = hx - math.sin(th) * lat
-        y = hy + math.cos(th) * lat
-        return cls(int(kv.get('id', oid)), x, y, th, kv.get('v', 0.0),
-                   kv.get('l', 4.39), kv.get('w', 1.81), kv.get('h', 1.35))
+    def advance(self, dt: float, ego_s: float, path) -> None:
+        """한 프레임 진행. overlay 직전에 부른다."""
+        if self.mode == 'static':
+            return
+        if not self._started:
+            if self.start is not None and ego_s < self.start:
+                return
+            self._started = True
+            self.speed = self.v0
+        if self.mode == 'line':
+            self.x += self.speed * math.cos(self.hdg) * dt
+            self.y += self.speed * math.sin(self.hdg) * dt
+            self.heading = self.hdg
+            return
+        v_along = self.speed if self.mode == 'path' else self.v0
+        lat_prev = self.lat
+        if self.mode == 'cutin':
+            if not self._fired and (self.s - ego_s) <= self.trig:
+                self._fired = True
+                self._t = 0.0
+            if self._fired:
+                self._t += dt
+                u = _smooth(self._t / self.dur)
+                self.lat = self.lat0 + (self.lat1 - self.lat0) * u
+                v_along = self.v0 + (self.v1 - self.v0) * u
+        self.s += self.dir * v_along * dt
+        if self.stop_s is not None and (
+                (self.dir > 0 and self.s >= self.stop_s)
+                or (self.dir < 0 and self.s <= self.stop_s)):
+            self.s = self.stop_s
+            v_along = 0.0
+        x, y, th = world_at(path, self.s, self.lat)
+        self.x, self.y = x, y
+        dlat = (self.lat - lat_prev) / dt if dt > 0 else 0.0
+        if self.dir < 0:
+            th += math.pi
+            dlat = -dlat
+        self.heading = th + (math.atan2(dlat, v_along) if v_along > 1e-6 else 0.0)
+        self.speed = math.hypot(v_along, dlat)
 
     def __repr__(self) -> str:
-        return (f'<Injected {self.id} ({self.x:.1f},{self.y:.1f}) '
+        return (f'<Injected {self.id} {self.mode} ({self.x:.1f},{self.y:.1f}) '
                 f'{self.length:.2f}x{self.width:.2f}x{self.height:.2f} '
                 f'v={self.speed:.1f}>')
 

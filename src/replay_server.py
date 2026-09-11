@@ -204,9 +204,13 @@ def build_sim(args):
     print(f'[sim] 객체 재생 모드={track.mode} 프레임={len(track.blocks)}')
     for o in injected:
         i = path.nearest(o.x, o.y)
-        print(f'[sim] 주입 id={o.id} s={path.s[i]:.1f}m '
+        print(f'[sim] 주입 id={o.id} {o.mode} s={path.s[i]:.1f}m '
               f'({o.x:.1f},{o.y:.1f}) '
-              f'{o.length:.2f}x{o.width:.2f}x{o.height:.2f} v={o.speed:.1f}')
+              f'{o.length:.2f}x{o.width:.2f}x{o.height:.2f} v={o.v0:.1f}'
+              + (f' start={o.start:.0f}' if o.start is not None else '')
+              + (f' trig={o.trig:.0f} dur={o.dur:.1f} v1={o.v1:.1f}'
+                 if o.mode == 'cutin' else '')
+              + (f' dir={o.dir:+.0f}' if o.dir < 0 else ''))
     return path, sl_list, src, track, injected
 
 
@@ -259,6 +263,8 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
                       f'― 이 프레임 뒤 ego(0,0) {args.end_frames}프레임 송신')
                 end_frames = args.end_frames
         tl_id, tl_state = src.sample(s_ego, sim_t)
+        for o in injected:
+            o.advance(FRAME_DT, s_ego, path)    # 이동 객체 (static이면 무시)
         blob = sim_world.overlay(track.at(s_ego, sim_t), injected, ego)
         try:
             conn.sendall(sim_world.pack_frame(ego, blob, tl_id, tl_state))
@@ -354,10 +360,14 @@ def main() -> None:
                      default=sim_world.DEFAULT_ACQUIRE_M,
                      help='신호를 보고하기 시작하는 거리 [m]')
     sim.add_argument('--inject-object', action='append', metavar='SPEC',
-                     help='경로 위에 합성 정지 객체를 놓는다. 반복 지정 가능. '
+                     help='경로 위에 합성 객체를 놓는다. 반복 지정 가능. '
                           's=250,lat=0,l=4.39,w=1.81,h=1.35,v=0[,id=7] '
                           '(s=경로 호길이, lat=부호 횡거리 좌가 양수) 또는 '
-                          'x=,y= 절대 좌표 (경로 꼬리 밖 종료 라바콘)')
+                          'x=,y= 절대 좌표 (경로 꼬리 밖 종료 라바콘). '
+                          'v>0이면 움직인다: mode=path (경로 따라, dir=-1 역방향, '
+                          'start=<ego s>부터, stop_s=), mode=cutin (ego가 trig= m '
+                          '뒤에 오면 dur= 초에 lat->lat1=, v->v1=), mode=line '
+                          '(start= 도달 시 hdg= 절대 / rhdg= 접선 상대 방향 직선)')
     sim.add_argument('--objects', choices=('s', 't', 'none'), default='s',
                      help='objects[] 재생 색인: s=진행거리 t=시간 none=없음')
     sim.add_argument('--objects-from', default='',

@@ -41,7 +41,8 @@ DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'ob_act', 'ob_kind', 'ob_id', 'ob_dist', 'ob_lat',
               'turn', 'turn_src', 'cw_act', 'cw_dist',
               'dt_act', 'dt_dist',
-              'rz_ratio', 'rz_far', 'rz_in', 'fin_lon']
+              'rz_ratio', 'rz_far', 'rz_in', 'fin_lon',
+              'tt_act', 'tt_tcpa', 'tt_dcpa']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -153,7 +154,9 @@ class SessionLog:
                   cw_act: str = '', cw_dist: float = NAN,
                   dt_act: str = '', dt_dist: float = NAN,
                   rz_ratio: float = NAN, rz_far: float = NAN,
-                  rz_in: int = 0, fin_lon: float = NAN) -> None:
+                  rz_in: int = 0, fin_lon: float = NAN,
+                  tt_act: str = '', tt_tcpa: float = NAN,
+                  tt_dcpa: float = NAN) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -174,7 +177,8 @@ class SessionLog:
                 tl_act, tl_dist,
                 ob_act, ob_kind, ob_id, ob_dist, ob_lat,
                 turn, turn_src, cw_act, cw_dist,
-                dt_act, dt_dist, rz_ratio, rz_far, rz_in, fin_lon)])
+                dt_act, dt_dist, rz_ratio, rz_far, rz_in, fin_lon,
+                tt_act, tt_tcpa, tt_dcpa)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (
@@ -235,7 +239,10 @@ class SessionLog:
         영구 정지 객체 우회(detour.py)가 내는
         detour_start / detour_done / detour_failed / detour_impossible /
         detour_tight / detour_solid_lc / detour_ld_boost / detour_ld_restore /
-        last_resort_pass / last_resort_clear,
+        detour_context / last_resort_pass / last_resort_clear,
+
+        TTC 충돌 예측(ttc.py)이 내는
+        ttc_warn / ttc_brake / ttc_stop / ttc_clear / ttc_timeout,
 
         붉은 보호구역(redzone.py)이 내는
         redzone_enter / redzone_exit / redzone_hold / redzone_hold_end /

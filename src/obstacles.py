@@ -261,6 +261,18 @@ class ObstaclePolicy:
         self._hold_since = None     # 실제로 멈춘 시각
         self._creep_id = None       # 교착 해제로 크립 중인 객체 id
 
+    def adopt(self, old) -> None:
+        """우회 경로 교체. **트랙은 월드 좌표라 새 경로에서도 그대로 유효하다**
+        -- s/lat/th는 update()가 매 프레임 다시 투영한다. 버리면 trusted
+        (TRUST_FRAMES)를 다시 채우는 동안 보행자 예측·앞차 속도가 꺼지고
+        detour의 최후 안전망 게이트(obs.obj_id)가 늦게 잡힌다 (9/11).
+
+        정지 시각·크립 id·보행자 히스테리시스·이벤트 중복 억제는 옛 경로 기준
+        판정의 산물이라 가져오지 않는다 -- 새 경로에서 다시 판정한다.
+        """
+        if old is not None:
+            self._tracks = dict(old._tracks)
+
     def _announce(self, key, kind: str, detail: str) -> None:
         if key in self._announced:
             return
@@ -835,6 +847,17 @@ def _selftest() -> int:
     log, end = _drive(pol, path, lambda t, x: [_Fake(10, 290.0, 0.0, dims=CAR)], n=600)
     check('종료 구간 차량: 그대로 선다', any(r[3] in ('stop', 'hold') for r in log)
           and end < 290.0, f'{end:.1f}m')
+
+    # 9. 우회 교체 -- 트랙(월드 좌표)은 새 정책이 이어받는다 (9/11)
+    a = ObstaclePolicy(_Straight())
+    _drive(a, a.path, lambda t, x: [_Fake(2, 120.0, 0.0, dims=CAR)], n=5)
+    b = ObstaclePolicy(_Straight())
+    b.adopt(a)
+    check('adopt: 트랙 승계 (trusted)', 2 in b._tracks and b._tracks[2].trusted
+          and b._tracks[2].n_seen == a._tracks[2].n_seen,
+          f'{b._tracks.get(2)}')
+    b.adopt(None)
+    check('adopt(None): 무해', 2 in b._tracks and b._hold_since is None)
 
     print()
     if fails:
