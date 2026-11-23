@@ -244,15 +244,16 @@ def load_path(csv_path: str, segments: list[str],
     return Path(pts, n_real=n_real), bounds
 
 
-def _stop_target(s_ego: float, sig, obs) -> float:
-    """sig/obs가 겨냥한 후륜축 정지 지점 중 가까운 쪽. 둘 다 없으면 nan.
+def _stop_target(s_ego: float, sig, obs, tt) -> float:
+    """sig/obs/ttc가 겨냥한 후륜축 정지 지점 중 가까운 쪽. 아무도 없으면 nan.
 
     stop_avail은 "지금부터 몇 m 더 가서 설 작정인가"라서 s_ego를 더하면 경로
     누적거리가 된다. 횡단보도 정차 금지(항목 12)가 "그 자리가 횡단보도 위인가"를
-    묻는 데만 쓴다.
+    묻는 데만 쓴다. ttc를 넣은 것은 9/11 실차 -- 차로 내 라바콘 앞 TTC 정지가
+    횡단보도 위였는데 crosswalks는 그 정지 의사를 몰랐다.
     """
     best = float('nan')
-    for avail in (sig.stop_avail, obs.stop_avail):
+    for avail in (sig.stop_avail, obs.stop_avail, tt.stop_avail):
         if avail != avail:                      # nan = 정지 의사 없음
             continue
         s = s_ego + max(0.0, avail)
@@ -312,7 +313,6 @@ def run(args) -> None:
         'ttc': not args.no_ttc,
         'ttc_dcrit_m': args.ttc_dcrit,
         'turn_signal': not args.no_turn_signal,
-        'turn_junction': not args.no_junction_signal,
         'turn_lead_s': args.turn_lead,
         'crosswalk': (not args.no_crosswalk) and bool(ev_path),
         'cw_escape_after_s': args.cw_escape_after,
@@ -430,14 +430,12 @@ def run(args) -> None:
         else:
             say('[pp] 충돌 회피 비활성 (--no-obstacle)')
 
-        # 방향지시등 (평가항목 13). 차선변경은 waypoint CSV의 lc_dir에서,
-        # 교차로 회전은 경로 헤딩에서 나온다.
+        # 방향지시등 (평가항목 13). 차선변경(waypoint CSV의 lc_dir)에만 켠다.
+        # 교차로 회전 점등은 채점 대상이 아니고 실차에서 차선변경 점등을
+        # 방해해 9/11에 뺐다.
         if not args.no_turn_signal:
-            tz_list, tz_warn = turnsignal.build_zones(
-                path, wp_csv, junction=not args.no_junction_signal)
-            n_lc = sum(1 for z in tz_list if z.kind == 'lc')
-            say(f'[pp] 방향지시등 구간 {len(tz_list)}개 '
-                f'(차선변경 {n_lc} / 회전 {len(tz_list) - n_lc}), '
+            tz_list, tz_warn = turnsignal.build_zones(path, wp_csv)
+            say(f'[pp] 방향지시등 구간 {len(tz_list)}개 (차선변경만), '
                 f'선행 {args.turn_lead:.1f}초')
             for line in turnsignal.summary(tz_list):
                 say('[pp]' + line)
@@ -538,6 +536,13 @@ def run(args) -> None:
                 print('[pp] 우회 활성 (완주 보장)')
                 for line in detour.summary(det_policy):
                     print('[pp]' + line)
+                # 보행자 횡단 완료의 "도로 밖" 판정은 planner의 차로 인덱스를
+                # 쓴다. planner가 정책 뒤에 만들어져 여기서 물린다. 우회 교체
+                # 시에는 obs.adopt()가 넘긴다
+                if obs_policy is not None:
+                    obs_policy.on_road = planner.on_road
+                    print('[pp] 보행자 횡단 완료 판정에 도로 밖 조건 사용 '
+                          f'(driving 차로 {obstacles.PED_OFFROAD_M:.0f}m 밖)')
                 und = sum(z.length for z in zones)
                 log.note('undetourable_m', round(und, 1))
                 log.note('undetourable_pct',
@@ -836,10 +841,13 @@ def run(args) -> None:
                 if xw_policy is not None:
                     xw = xw_policy.update(
                         path.s[idx], v, t,
-                        stop_s=_stop_target(path.s[idx], sig, obs),
+                        stop_s=_stop_target(path.s[idx], sig, obs, tt),
                         tl_stop_ahead=(sig.stopping and sig.dist > 0.0),
                         front_clear=(None if obs_policy is None
-                                     else obs.front_clear))
+                                     else obs.front_clear),
+                        # 보행자 때문에 서 있는 동안은 탈출하지 않는다 (항목 10 우선)
+                        ped_hold=(obs.stopping
+                                  and obs.kind == obstacles.PEDESTRIAN))
                     v_cmd = min(v_cmd, xw.v_limit)
                     # **min() 구조를 깨는 유일한 지점이다.** 항목 12(-3)를
                     # 피하려고 v_cmd를 끌어올린다. 항목 7(-6)·14(-6)이 걸린
@@ -1035,8 +1043,6 @@ def main() -> None:
                     help='TTC 최근접 거리 임계 [m]. 이 안이면 충돌 경로로 본다')
     ap.add_argument('--no-turn-signal', action='store_true',
                     help='방향지시등을 끈다 (회귀 비교용)')
-    ap.add_argument('--no-junction-signal', action='store_true',
-                    help='교차로 회전 점등만 끈다. 차선변경 점등은 남는다')
     ap.add_argument('--turn-lead', type=float, default=turnsignal.LEAD_S,
                     help='방향지시등 선행 점등 시간 [s]. 요건은 3초')
     ap.add_argument('--no-crosswalk', action='store_true',

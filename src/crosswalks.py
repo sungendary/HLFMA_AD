@@ -65,6 +65,10 @@ MERGE_M = 1.5               # m, 이 안의 같은 종류는 한 횡단보도로
 PRE_MARGIN = 1.0            # m, 후륜축을 구간 시작 이만큼 앞에 세운다
 DECEL_XW = 2.0              # m/s^2, 정지 프로파일. 신호(2.0)와 같게 —
                             # 이 정지는 급할 이유가 없다
+GUARD_HOLD_MS = 3.0         # m/s, 예방 목표를 넘은 뒤에도 이보다 느리면 계속 잡는다
+GUARD_MAX_S = 20.0          # s, 예방 정지가 이만큼 이어지면 포기한다. detour가
+                            # 켜져 있으면 우회·최후 안전망이 먼저 풀므로
+                            # --no-detour 교착 방지용이다. 신호 대기 중엔 안 센다
 
 # 탈출
 DWELL_MS = 1.0 / 3.6        # m/s, 항목 12의 "1km/h 이하"
@@ -196,6 +200,9 @@ class CrosswalkPolicy:
         self._escape_since = None   # 탈출을 시작한 시각
         self._escape_zone = None    # 탈출 중인 구간 (래치)
         self._on_zone = None        # 지금 올라가 있는 구간
+        self._guard_since = None    # 예방 정지 상태로 멈춘 시각
+        self._guard_off = None      # 예방을 포기한 구간 (지나갈 때까지)
+        self._guard_zone = None     # 예방이 걸린 구간 (목표를 살짝 넘어도 계속 잡는다)
         self._announced = set()
 
     def _announce(self, key, kind: str, detail: str) -> None:
@@ -220,12 +227,16 @@ class CrosswalkPolicy:
     # -- 본체 -----------------------------------------------------------
     def update(self, s_ego: float, v: float, t: float, *,
                stop_s: float = float('nan'), tl_stop_ahead: bool = False,
-               front_clear=None) -> CrosswalkCmd:
-        """stop_s는 sig/obs가 겨냥한 **후륜축 정지 지점**(경로 누적거리)이다.
+               front_clear=None, ped_hold: bool = False) -> CrosswalkCmd:
+        """stop_s는 sig/obs/ttc가 겨냥한 **후륜축 정지 지점**(경로 누적거리)이다.
         nan이면 아무도 정지를 지령하지 않았다는 뜻이다.
 
         front_clear는 obstacles가 낸 앞범퍼 기준 전방 여유다. **None이면
         obstacles가 꺼져 있다는 뜻이고 탈출을 발동하지 않는다.**
+
+        ped_hold는 obstacles가 지금 보행자 때문에 서 있다는 뜻이다. 그동안은
+        탈출하지 않는다 -- 보행자가 VEH_LANE_M 밖(횡거리 3~6m)이면 front_clear가
+        열려 있어 탈출이 보행자 정지를 덮어썼다 (항목 10 -6 > 항목 12 -3).
         """
         dist = self._next_dist(s_ego)
         on = self._zone_on(s_ego)
@@ -271,7 +282,9 @@ class CrosswalkPolicy:
             on = target
             need = on.s1 + EXIT_M - s_ego
             why = ''
-            if front_clear is None:
+            if ped_hold:
+                why = '보행자 정지 중 (항목 10 우선)'
+            elif front_clear is None:
                 why = 'obstacles가 꺼져 있어 전방을 모른다'
             elif tl_stop_ahead:
                 why = '적색·황색 정지선이 앞에 있다 (항목 7 우선)'
@@ -308,29 +321,71 @@ class CrosswalkPolicy:
 
         # -- 예방 --------------------------------------------------------
         # 아무도 정지를 지령하지 않으면 할 일이 없다. nan 비교로 판별한다.
+        # 포기한 구간은 지나갈 때까지 다시 보지 않는다
+        if self._guard_off is not None and s_ego > self._guard_off.s1:
+            self._guard_off = None
+        guarding = False
         if stop_s == stop_s:
+            # **물리적 착지점.** 목표가 구간 앞이어도 지금 속도로는 거기 못 서고
+            # 구간 위에 떨어질 수 있다 (v²/2a). 그 경우도 예방 대상으로 본다 --
+            # 실제로는 목표보다 앞에 설 수 없으니 최소 착지 거리를 함께 잰다
+            landing = max(stop_s, s_ego + v * v / (2.0 * DECEL_HARD))
             for z in self.zones:
-                if z.s1 < s_ego or not (z.s0 <= stop_s <= z.s1):
+                if z.s1 < s_ego or z is self._guard_off:
+                    continue
+                if not (z.s0 <= landing <= z.s1):
                     continue
                 avail = (z.s0 - PRE_MARGIN) - s_ego
+                if s_ego >= z.s0:
+                    break               # 이미 올라갔다. 탈출 로직의 몫이다
                 if avail <= 0.0:
-                    break               # 이미 붙었다. 예방은 늦었다
-                if v * v > 2.0 * DECEL_HARD * avail:
+                    # 목표(구간 앞 1m)를 살짝 넘었다. **예방이 걸려 있던 구간이면
+                    # 계속 잡는다** -- P 제어 지연으로 0.1m 넘은 순간 놓아 버리면
+                    # 객체 목표(구간 위)를 향해 다시 가속해 횡단보도에 올라간다.
+                    # sim xw_ped에서 실제로 그랬다 (514.2 목표를 1.5m/s로 넘고
+                    # 4m 더 가 정지). 예방 없이 빠르게 닿았으면(포기했던 경우)
+                    # 여기서 급제동해도 어차피 올라가므로 놓아둔다
+                    if self._guard_zone is not z or v >= GUARD_HOLD_MS:
+                        break
+                    avail = 0.0
+                elif v * v > 2.0 * DECEL_HARD * avail:
                     self._announce(
                         (id(z), 'infeasible'), 'xw_guard_infeasible',
                         f'횡단보도 s={z.s:.1f}m 위에 설 판인데 그 앞 '
                         f'{avail:.1f}m에 못 선다 (v={v * 3.6:.0f}km/h, '
-                        f'{DECEL_HARD:.1f}m/s^2 기준). 급제동하지 않는다 ― '
+                        f'{DECEL_HARD:.1f}m/s^2 기준, 목표 {stop_s - z.s0:+.1f}m / '
+                        f'물리 최소 {landing - z.s0:+.1f}m). 급제동하지 않는다 ― '
                         f'올라가면 탈출로 처리한다')
                     break
+                # 예방 정지가 길어지면 포기한다 (신호 대기 중이 아닐 때만)
+                if v < DWELL_MS and not tl_stop_ahead:
+                    if self._guard_since is None:
+                        self._guard_since = t
+                    elif t - self._guard_since >= GUARD_MAX_S:
+                        self._on_event(
+                            'xw_guard_giveup',
+                            f'횡단보도 s={z.s:.1f}m 앞에서 '
+                            f'{t - self._guard_since:.0f}초 정지 ― 아무도 비키지 '
+                            f'않아 예방을 포기한다 (구간을 지날 때까지)')
+                        self._guard_off = z
+                        self._guard_since = None
+                        break
+                else:
+                    self._guard_since = None
+                guarding = True
+                self._guard_zone = z
                 v_limit, accel_limit = _profile(avail, v, 0.0, DECEL_XW)
                 self._announce(
                     (id(z), 'guard'), 'xw_guard',
                     f'정지 목표가 횡단보도 s={z.s:.1f}m 위 '
-                    f'({stop_s - z.s0:+.1f}m) ― 구간 앞 {avail:.1f}m로 당긴다')
+                    f'(목표 {stop_s - z.s0:+.1f}m / 물리 최소 {landing - z.s0:+.1f}m) '
+                    f'― 구간 앞 {avail:.1f}m로 당긴다')
                 return CrosswalkCmd(v_limit, 'guard', dist,
                                     f'횡단보도 앞 정지 {avail:.1f}m',
                                     accel_limit)
+        if not guarding:
+            self._guard_since = None
+            self._guard_zone = None
 
         if on is not None:
             return CrosswalkCmd(action='on', dist=dist, reason='횡단보도 위')
@@ -387,7 +442,7 @@ class _Rec:
 
 def _drive(policy, *, s0=0.0, v0=12.5, v_target=12.5, ext_stop_s=None,
            front_clear=None, tl_stop_ahead=False, ext_hold=False,
-           dt=0.05, n=600):
+           ped_hold=False, dt=0.05, n=600):
     """pure_pursuit의 합류 산술을 그대로 흉내낸다.
 
     ext_stop_s는 stoplines/obstacles가 겨냥한 후륜축 정지 지점이다.
@@ -400,7 +455,7 @@ def _drive(policy, *, s0=0.0, v0=12.5, v_target=12.5, ext_stop_s=None,
         stop_s = float('nan') if ext_stop_s is None else ext_stop_s
         cmd = policy.update(s, v, t, stop_s=stop_s,
                             tl_stop_ahead=tl_stop_ahead,
-                            front_clear=front_clear)
+                            front_clear=front_clear, ped_hold=ped_hold)
         acts.append(cmd.action)
 
         v_cmd, a_lim = v_target, float('inf')
@@ -457,13 +512,56 @@ def _selftest() -> int:
     check('정지 지령이 없으면 무제약', 'guard' not in acts and s > 300.0,
           f's={s:.1f} v={v * 3.6:.0f}km/h')
 
-    # 3. 예방 불가 — 급제동해야 하면 포기한다
+    # 3. 예방 불가 — 급제동해야 하면 포기한다. 목표는 구간 앞(146)인데
+    #    v=8m/s의 물리 최소 착지(143+7.1=150.1)가 구간 위라 예방 대상이고,
+    #    구간 앞 3m에는 4.5m/s^2로도 못 선다
     rec = _Rec()
     pol = CrosswalkPolicy(None, [z], on_event=rec)
-    _s, _v, acts, _h = _drive(pol, s0=142.0, ext_stop_s=150.0)
+    _s, _v, acts, _h = _drive(pol, s0=143.0, v0=8.0, ext_stop_s=146.0)
     check('예방 불가: 급제동하지 않는다',
           'xw_guard_infeasible' in rec.kinds() and 'guard' not in acts,
           ','.join(sorted(set(rec.kinds()))))
+
+    # 3a. 예방 목표(146)를 P 제어 지연으로 살짝 넘어도 구간 앞이면 계속 잡는다.
+    #     sim xw_ped에서 0.1m 넘은 순간 놓아 객체 목표(구간 위)로 다시 가속했다
+    rec = _Rec()
+    pol = CrosswalkPolicy(None, [z], on_event=rec)
+    c0 = pol.update(145.0, 1.5, 0.0, stop_s=150.0)
+    c1 = pol.update(146.1, 1.5, 0.05, stop_s=150.0)
+    c2 = pol.update(146.6, 0.2, 0.10, stop_s=150.0)
+    check('예방 목표를 살짝 넘어도 구간 앞이면 계속 잡는다 (v_limit 0)',
+          c0.action == 'guard' and c1.action == 'guard' and c1.v_limit == 0.0
+          and c2.action == 'guard' and c2.v_limit == 0.0,
+          f'{c0.action} {c1.action}/{c1.v_limit:.1f} {c2.action}/{c2.v_limit:.1f}')
+    pol2 = CrosswalkPolicy(None, [z])
+    c3 = pol2.update(146.1, 8.0, 0.0, stop_s=150.0)
+    check('예방 없이 빠르게 닿았으면(포기) 목표 너머에서 잡지 않는다',
+          c3.action != 'guard', c3.action)
+
+    # 3b. 목표는 구간 위(150)지만 지금 속도로는 물리적으로 구간을 지나쳐
+    #     (140+17.4=157.4) 선다 — 횡단보도 위에 서지 않으므로 예방도 포기도 없다
+    rec = _Rec()
+    pol = CrosswalkPolicy(None, [z], on_event=rec)
+    _s, _v, acts, _h = _drive(pol, s0=140.0, v0=12.5, ext_stop_s=150.0)
+    check('물리 착지점이 구간 너머면 예방하지 않는다',
+          not ({'xw_guard', 'xw_guard_infeasible'} & set(rec.kinds()))
+          and 'guard' not in acts, ','.join(sorted(set(rec.kinds()))))
+
+    # 3c. 예방 정지가 20초 넘게 이어지면 포기한다 (--no-detour 교착 방지).
+    #     신호 대기 중이면 포기하지 않는다
+    rec = _Rec()
+    pol = CrosswalkPolicy(None, [z], on_event=rec)
+    s, _v, acts, _h = _drive(pol, s0=60.0, ext_stop_s=150.0, n=1000)
+    check('예방 20초 뒤 포기하고 진행한다',
+          'xw_guard_giveup' in rec.kinds() and s > 148.0,
+          f's={s:.2f} {",".join(sorted(set(rec.kinds())))}')
+    rec = _Rec()
+    pol = CrosswalkPolicy(None, [z], on_event=rec)
+    s, _v, acts, _h = _drive(pol, s0=60.0, ext_stop_s=150.0, n=1000,
+                             tl_stop_ahead=True)
+    check('신호 대기 중에는 예방을 포기하지 않는다',
+          'xw_guard_giveup' not in rec.kinds() and s < z.s0,
+          f's={s:.2f} {",".join(sorted(set(rec.kinds())))}')
 
     # 4. 탈출 — 전방이 비어 있으면 저속으로 빠져나간다
     rec = _Rec()
@@ -482,7 +580,9 @@ def _selftest() -> int:
     for name, kw in (('전방 여유 부족 (항목 14)', dict(front_clear=3.0)),
                      ('적색 정지선이 앞 (항목 7)',
                       dict(front_clear=30.0, tl_stop_ahead=True)),
-                     ('obstacles 비활성', dict(front_clear=None))):
+                     ('obstacles 비활성', dict(front_clear=None)),
+                     ('보행자 정지 중 (항목 10)',
+                      dict(front_clear=30.0, ped_hold=True))):
         rec = _Rec()
         pol = CrosswalkPolicy(None, [z], on_event=rec)
         s, _v, acts, _h = _drive(pol, s0=150.0, v0=0.0, ext_hold=True, **kw)
@@ -490,6 +590,10 @@ def _selftest() -> int:
               'escape' not in acts and z.s0 <= s <= z.s1
               and 'xw_escape_blocked' in rec.kinds(),
               f's={s:.2f} {",".join(sorted(set(rec.kinds())))}')
+        if kw.get('ped_hold'):
+            blocked = [d for k, d in rec.ev if k == 'xw_escape_blocked']
+            check('탈출 금지 사유에 보행자가 적힌다',
+                  blocked and '보행자' in blocked[0], blocked[0] if blocked else '')
 
     # 8. 통과 중에는 정차 감시만 하고 아무 제약도 없다
     pol = CrosswalkPolicy(None, [z])

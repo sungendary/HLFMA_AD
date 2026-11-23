@@ -225,16 +225,17 @@ class SessionLog:
         tl_timeout / tl_green_stuck / tl_unknown_state,
 
         충돌 회피(obstacles.py)가 내는
-        ped_stop_actual / ped_stop_predicted / ped_clear / ped_timeout /
+        ped_stop_actual / ped_stop_predicted / ped_hold / ped_done /
+        ped_resume / ped_clear / ped_clear_timeout / ped_timeout /
         veh_follow / veh_stop / veh_timeout / obstacle_slow /
         obstacle_clear / obj_id_reuse,
 
         방향지시등(turnsignal.py)이 내는
-        turn_on / turn_off / turn_conflict,
+        turn_on / turn_off / turn_pause / turn_resume,
 
         횡단보도 정차 금지(crosswalks.py)가 내는
-        xw_guard / xw_guard_infeasible / xw_dwell / crosswalk_escape /
-        xw_escape_blocked / xw_clear,
+        xw_guard / xw_guard_infeasible / xw_guard_giveup / xw_dwell /
+        crosswalk_escape / xw_escape_blocked / xw_clear,
 
         영구 정지 객체 우회(detour.py)가 내는
         detour_start / detour_done / detour_failed / detour_impossible /

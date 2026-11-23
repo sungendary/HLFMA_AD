@@ -63,9 +63,22 @@ VEH_BLOCK_S = 30.0          # s, 정지한 앞차는 신호 대기 중일 수 �
 # 보행자 (항목 10)
 PED_HARD_M = 3.0            # m, 즉시 정지 대역
 PED_WATCH_M = 6.0           # m, 예측 감시 대역
-PED_RELEASE_M = 4.5         # m, 히스테리시스 해제 (진입 3.0 < 해제 4.5)
-PED_CLEAR_FRAMES = 4        # 연속 이만큼 벗어나야 해제 (0.2초)
 PED_GAP = 4.0               # m, 보행자 앞 범퍼 정지 간격
+REAR_OVERHANG_M = 1.0       # m, 후륜축 -> 뒷범퍼 (check_collision과 같은 가정).
+                            # 보행자 예측에서 "횡단선을 완전히 지나는 시각"에 쓴다
+# 횡단 완료 판정 (9/11). "대역을 벗어남"이 아니라 "건너기를 마침"이어야 한다.
+# 실차에서 횡거리 +4.4~+5.2m에서 풀려 아직 도로 위인 보행자를 두고 출발했다
+# (pp_20260911_133947 id 12/11/16). 항목 10은 중대 -6이고 저속·정차는 무감점이다
+PED_CLEAR_M = 6.0           # m, 경로에서 이만큼 벗어나야 완료 후보 (정지 중 대역이기도 하다)
+PED_OFFROAD_M = 2.0         # m, 이 반경 안에 driving 차로 중심점이 없으면 도로 밖.
+                            # on_road 콜백(detour.LaneIndex)이 있을 때만 쓴다
+PED_BEHIND_M = 2.0          # m, 후륜축 뒤로 이만큼 지나면 완료
+PED_STILL_MS = 0.3          # m/s, 이 미만이면 서 있는 것 (detour.STOPPED_MS와 같게)
+PED_STILL_S = 3.0           # s, 이만큼 서 있으면 횡단 의사가 없다
+PED_LOST_S = 1.0            # s, 이만큼 안 보이면 시야 밖
+PED_CLEAR_HOLD_S = 1.5      # s, 전원 완료 뒤 추가 대기. 멈췄다 다시 걷는 사람을 흡수
+PED_CLEAR_TIMEOUT_S = 20.0  # s, 완료 조건이 영영 안 풀릴 때의 상한 (보도가 driving
+                            # 차로 2m 안으로 잡히면 갇힌다). 경고를 남기고 푼다
 PED_VLAT_MIN = 0.2          # m/s, 이보다 느린 횡방향 접근은 예측하지 않는다
 PED_CORRIDOR_M = 1.5        # m, 우리 차체가 실제로 쓸어가는 반폭 (반폭 0.95 +
                             # 여유 0.55). 이 밖의 보행자는 교착 해제 시
@@ -174,7 +187,8 @@ class Track:
     """id별 추적 상태. speed/heading을 믿어도 되는지가 핵심이다."""
 
     __slots__ = ('id', 'cls', 'x', 'y', 's', 'lat', 'th', 'speed', 'heading',
-                 'n_seen', 'trusted', 'missing', 'min_lat', 'first_t')
+                 'n_seen', 'trusted', 'missing', 'min_lat', 'first_t',
+                 'still_since')
 
     def __init__(self, oid, cls, x, y, t):
         self.id = oid
@@ -187,10 +201,29 @@ class Track:
         self.missing = 0
         self.min_lat = float('inf')  # 접근 중 최소 |횡거리| (부호 보존)
         self.first_t = t
+        self.still_since = None     # speed < PED_STILL_MS 가 시작된 시각
 
     def __repr__(self) -> str:
         return (f'<Track {self.id} {self.cls} lat={self.lat:+.1f} '
                 f'{"trusted" if self.trusted else "new"}>')
+
+
+class _Held:
+    """정지를 유발한 보행자 하나의 횡단 완료 대기 상태."""
+
+    __slots__ = ('id', 'since', 'last_seen', 'done', 'why', 'code', 'stopped')
+
+    def __init__(self, oid, t):
+        self.id = oid
+        self.since = t              # 처음 정지를 유발한 시각 (상한의 기준)
+        self.last_seen = t          # 마지막으로 objects[]에 있던 시각
+        self.done = False           # 횡단 완료 판정
+        self.why = ''               # 완료 근거 (사람이 읽는 문장)
+        self.code = ''              # lost / behind / still / lat / timeout
+        # 이 보행자 때문에 실제로 멈춘 적이 있다. 그 뒤로는 해제까지 v_limit 0 --
+        # TTC 등이 더 일찍 세웠으면 정지 프로파일이 PED_GAP까지 기어가게 두는데,
+        # 건너는 사람 옆에서 2m를 기어가는 것은 "정차"가 아니다 (sim xw_gate)
+        self.stopped = False
 
 
 class ObstacleCmd:
@@ -239,7 +272,8 @@ class ObstaclePolicy:
 
     def __init__(self, path, *, front_overhang: float = FRONT_OVERHANG,
                  lookahead: float = LOOKAHEAD_M, max_block: float = MAX_BLOCK_S,
-                 finish_zone: float = FINISH_ZONE_M, on_event=None):
+                 finish_zone: float = FINISH_ZONE_M, on_event=None,
+                 on_road=None):
         self.path = path
         self.front = front_overhang
         self.lookahead = lookahead
@@ -249,6 +283,10 @@ class ObstaclePolicy:
         self.finish_zone = finish_zone
         self._gate_s = gate_s(path, finish_zone)
         self._on_event = on_event or (lambda kind, detail: None)
+        # (x, y) -> bool. driving 차로 위인가. None이면 도로 밖 조건을 못 쓴다
+        # (횡거리 PED_CLEAR_M만으로 완료). pure_pursuit이 detour.DetourPlanner
+        # .on_road를 물린다 -- planner가 정책 뒤에 만들어져 생성자 인자가 아니다
+        self.on_road = on_road
         self.reset()
 
     # -- 상태 -----------------------------------------------------------
@@ -256,8 +294,8 @@ class ObstaclePolicy:
         """리스폰 시 호출한다. 위치가 강제로 옮겨졌으므로 추적을 전부 버린다."""
         self._tracks: dict = {}
         self._announced = set()     # 이벤트 중복 억제 키
-        self._ped_ids = set()       # 정지를 유발한 보행자 id (히스테리시스 대상)
-        self._ped_clear = 0         # 연속 해제 프레임 수
+        self._hold: dict = {}       # 정지를 유발한 보행자 id -> _Held (횡단 완료 대기)
+        self._all_done_t = None     # 전원 완료가 시작된 시각 (PED_CLEAR_HOLD_S 기준)
         self._hold_since = None     # 실제로 멈춘 시각
         self._creep_id = None       # 교착 해제로 크립 중인 객체 id
 
@@ -267,11 +305,17 @@ class ObstaclePolicy:
         (TRUST_FRAMES)를 다시 채우는 동안 보행자 예측·앞차 속도가 꺼지고
         detour의 최후 안전망 게이트(obs.obj_id)가 늦게 잡힌다 (9/11).
 
-        정지 시각·크립 id·보행자 히스테리시스·이벤트 중복 억제는 옛 경로 기준
-        판정의 산물이라 가져오지 않는다 -- 새 경로에서 다시 판정한다.
+        **보행자 횡단 완료 대기(_hold)와 on_road도 넘긴다** -- 경로만 바뀐 것이지
+        건너던 사람이 사라진 게 아니다. 횡거리 기준 판정은 새 경로에서 다시
+        한다. 정지 시각·크립 id·이벤트 중복 억제는 옛 경로 기준 판정의
+        산물이라 가져오지 않는다.
         """
         if old is not None:
             self._tracks = dict(old._tracks)
+            self._hold = dict(old._hold)
+            self._all_done_t = old._all_done_t
+            if self.on_road is None:
+                self.on_road = old.on_road
 
     def _announce(self, key, kind: str, detail: str) -> None:
         if key in self._announced:
@@ -294,7 +338,7 @@ class ObstaclePolicy:
                                    f'id={o.id}가 한 프레임에 {jump:.1f}m 이동 '
                                    f'(한계 {ID_JUMP_M:.2f}m) ― 다른 객체다. '
                                    f'추적을 리셋하고 속도 예측을 끈다')
-                    self._ped_ids.discard(o.id)
+                    self._hold.pop(o.id, None)
                     tr = None
             if tr is None:
                 tr = Track(o.id, classify(o), o.x, o.y, t)
@@ -306,11 +350,22 @@ class ObstaclePolicy:
             tr.cls = classify(o)
             tr.speed, tr.heading = o.speed, o.heading
             tr.missing = 0
+            # 정지 시작 시각. 횡단 완료 판정의 "3초 정지" 근거다
+            if abs(o.speed) < PED_STILL_MS:
+                if tr.still_since is None:
+                    tr.still_since = t
+            else:
+                tr.still_since = None
+            h = self._hold.get(o.id)
+            if h is not None:
+                h.last_seen = t
 
         for oid in [k for k, tr in self._tracks.items() if k not in seen]:
             tr = self._tracks[oid]
             tr.missing += 1
-            if tr.missing > TRACK_GRACE:
+            # 횡단 완료를 기다리는 보행자의 트랙은 지우지 않는다 -- 마지막
+            # 위치가 판정 근거이고 "시야 밖"은 last_seen으로 따로 잰다
+            if tr.missing > TRACK_GRACE and oid not in self._hold:
                 del self._tracks[oid]
 
     # -- 본체 -----------------------------------------------------------
@@ -379,17 +434,23 @@ class ObstaclePolicy:
             if cls == VEHICLE:
                 cmd = self._vehicle(o, tr, d, lat, th, v)
             elif cls == PEDESTRIAN:
-                cmd = self._pedestrian(o, tr, d, lat, th, v)
+                cmd = self._pedestrian(o, tr, d, lat, th, v, t)
                 if cmd is not None:
                     ped_stopped = True
-                    self._ped_ids.add(o.id)
+                    self._note_ped_cmd(o.id, tr, d, lat, t, v)
             else:
                 cmd = self._obstacle(o, tr, d, lat)
             if cmd is not None:
                 cands.append(cmd)
                 cand_ids.add(o.id)
 
-        self._release_pedestrians(ped_stopped)
+        self._release_pedestrians(ped_stopped, s_ego, t)
+        # 횡단 완료를 기다리는 동안은 보행자가 대역 밖(또는 뒤)이라 명령이 안
+        # 나와도 서 있어야 한다. 후보가 비면 v_limit=inf라 그냥 출발해 버린다
+        hold = self._hold_cmd(ped_stopped, s_ego, v, t)
+        if hold is not None:
+            cands.append(hold)
+            cand_ids.add(hold.obj_id)
 
         if not cands:
             self._hold_since = None
@@ -455,18 +516,22 @@ class ObstaclePolicy:
         return ObstacleCmd(v_limit, action, VEHICLE, o.id, d, lat, reason,
                            accel_limit, stop_avail=avail)
 
-    def _pedestrian(self, o, tr, d, lat, th, v) -> ObstacleCmd | None:
+    def _pedestrian(self, o, tr, d, lat, th, v, t) -> ObstacleCmd | None:
         """항목 10 (중대 -6). 정적 3m 대역만으로는 제동이 늦다.
 
         45km/h(12.5 m/s)에서 DECEL_OBJ 정지에 31m가 필요한데 3.6 m/s 보행자는
         3m 대역을 0.83초(우리는 10m 진행)에 지난다. 그래서 3~6m 대역에서는
         도달 시각을 예측해 미리 선다.
+
+        **이미 이 보행자 때문에 서 있고 아직 횡단 완료가 아니면 대역이
+        PED_CLEAR_M(6m)이다.** 완료 판정이 난 보행자는 원래 대역(3m)과 예측
+        분기로만 다시 잡는다 -- 되돌아오면 재발동한다.
         """
         if d <= 0.0:
             return None
         alat = abs(lat)
-        # 히스테리시스: 이미 이 보행자 때문에 서 있으면 더 넓은 대역을 쓴다
-        band = PED_RELEASE_M if o.id in self._ped_ids else PED_HARD_M
+        h = self._hold.get(o.id)
+        band = PED_CLEAR_M if (h is not None and not h.done) else PED_HARD_M
 
         if alat <= band:
             ev, why = 'ped_stop_actual', f'횡거리 {alat:.1f}m ― 대역 안'
@@ -476,7 +541,11 @@ class ObstaclePolicy:
             if vlat < PED_VLAT_MIN:
                 return None
             t_ped = (alat - PED_HARD_M) / vlat
-            t_ego = max(0.0, d - self.front - PED_GAP) / max(v, 0.1)
+            # 우리가 그 사람의 횡단선을 **차체 끝까지 완전히 지나는** 시각.
+            # 예전엔 "정지점(범퍼 4m 앞)에 닿는 시각"이라 서 있는 차(v≈0)가
+            # 정지점에 있으면 t_ego=0이 되어 되돌아오는 보행자를 대역(3m)에
+            # 들어올 때까지 무시했다 -- 완료 대기 뒤 출발 직후 다시 서는 톱니
+            t_ego = max(0.0, d + REAR_OVERHANG_M) / max(v, 0.1)
             if t_ped >= t_ego:
                 return None
             ev = 'ped_stop_predicted'
@@ -506,6 +575,8 @@ class ObstaclePolicy:
                                accel_limit, stop_avail=avail)
 
         avail = d - self.front - PED_GAP
+        if h is not None and h.stopped:
+            avail = 0.0             # 한 번 섰으면 해제까지 기어가지 않는다
         v_limit, accel_limit = _profile(avail, v)
         action = 'hold' if (v < STOP_SPEED and v_limit < STOP_SPEED) else 'stop'
         return ObstacleCmd(v_limit, action, PEDESTRIAN, o.id, d, lat, why,
@@ -523,32 +594,147 @@ class ObstaclePolicy:
                        f'id={o.id} 전방 {d:.1f}m 횡거리 {lat:+.2f}m '
                        f'(h={o.height:.2f} w={o.width:.2f}) ― '
                        f'감속만 한다 (정지하지 않음)')
+        # obstacles는 서지 않지만 **TTC가 이 라바콘 MIN_GAP 앞에 세운다.** 그
+        # 자리를 예측 정지점으로 실어 crosswalks가 횡단보도 위 착지를 미리
+        # 막게 한다 (실차 9/11 t=277: 라바콘 앞 TTC 정지가 횡단보도 4m 안이었다).
+        # TTC warn은 t_cpa 4s라 서행 중에는 구간 진입 뒤에야 나온다
         return ObstacleCmd(OBST_CREEP, 'slow', OBSTACLE, o.id, d, lat,
-                           f'차로 내 장애물 {abs(lat):.2f}m ― 감속만')
+                           f'차로 내 장애물 {abs(lat):.2f}m ― 감속만 '
+                           f'(TTC 정지점 {d - self.front - MIN_GAP:.1f}m)',
+                           stop_avail=d - self.front - MIN_GAP)
 
-    # -- 해제 -----------------------------------------------------------
-    def _release_pedestrians(self, ped_stopped: bool) -> None:
-        """횡단이 끝났나. 연속 PED_CLEAR_FRAMES 동안 아무도 안 잡히면 푼다."""
-        if not self._ped_ids:
-            self._ped_clear = 0
+    # -- 횡단 완료 대기 -------------------------------------------------
+    def _note_ped_cmd(self, oid: int, tr, d: float, lat: float, t: float,
+                      v: float) -> None:
+        """이번 프레임 이 보행자가 정지 명령을 냈다. 대기 목록에 넣거나,
+        완료로 봤던 사람이 움직이며 다시 잡혔으면 완료를 취소한다."""
+        h = self._hold.get(oid)
+        if h is None:
+            h = self._hold[oid] = _Held(oid, t)
+        h.last_seen = t
+        if v < STOP_SPEED:
+            h.stopped = True
+        # 상한으로 완료한 사람은 되돌리지 않는다 -- 되돌리면 다음 프레임에 또
+        # 상한에 걸려 매 프레임 완료/취소가 반복된다
+        if (h.done and h.code != 'timeout'
+                and (tr is None or tr.still_since is None)):
+            h.done, h.code, h.why = False, '', ''
+            self._on_event('ped_resume',
+                           f'id={oid} 전방 {d:.1f}m 횡거리 {lat:+.1f}m ― 완료로 '
+                           f'봤던 보행자가 다시 접근한다. 횡단 완료 판정을 되돌린다')
+
+    def _ped_done_reason(self, h: _Held, s_ego: float, t: float):
+        """(code, why) 또는 None. 위에서부터 첫 일치."""
+        tr = self._tracks.get(h.id)
+        if tr is None or t - h.last_seen >= PED_LOST_S:
+            return 'lost', f'시야 밖 {t - h.last_seen:.1f}s'
+        d = tr.s - s_ego
+        alat = abs(tr.lat)
+        if d < -PED_BEHIND_M:
+            return 'behind', f'후륜축 뒤 {-d:.1f}m 지나감'
+        if alat > PED_HARD_M:
+            # 대역 안(3m)에서는 "완료"가 의미가 없다 -- 어차피 정지 명령이 선다
+            if tr.still_since is not None and t - tr.still_since >= PED_STILL_S:
+                return 'still', (f'{t - tr.still_since:.1f}s 정지 (횡거리 '
+                                 f'{tr.lat:+.1f}m) ― 횡단 의사 없음')
+            if alat >= PED_CLEAR_M:
+                if self.on_road is None:
+                    return 'lat', f'경로에서 {alat:.1f}m (도로 여부 불명)'
+                if not self.on_road(tr.x, tr.y):
+                    return 'lat', f'경로에서 {alat:.1f}m, 도로 밖'
+        if t - h.since >= PED_CLEAR_TIMEOUT_S:
+            road = ('도로 위' if (self.on_road is not None
+                                  and self.on_road(tr.x, tr.y)) else '도로 여부 불명')
+            return 'timeout', (f'대기 상한 {PED_CLEAR_TIMEOUT_S:.0f}s (횡거리 '
+                               f'{tr.lat:+.1f}m, {road}) ― 경고하고 푼다')
+        return None
+
+    def _release_pedestrians(self, ped_stopped: bool, s_ego: float,
+                             t: float) -> None:
+        """횡단이 끝났나. 보행자마다 완료 조건(시야 밖 / 뒤로 지나감 / 3초 정지 /
+        6m 밖 + 도로 밖 / 상한)을 보고, **전원 완료 뒤 PED_CLEAR_HOLD_S를 더
+        기다린 뒤** 푼다. 어느 조건으로 풀렸는지 이벤트에 남긴다."""
+        if not self._hold:
+            self._all_done_t = None
             return
-        if ped_stopped:
-            self._ped_clear = 0
+        for h in self._hold.values():
+            if h.done:
+                continue
+            r = self._ped_done_reason(h, s_ego, t)
+            if r is None:
+                continue
+            h.done, (h.code, h.why) = True, r
+            tr = self._tracks.get(h.id)
+            where = (f'전방 {tr.s - s_ego:.1f}m 횡거리 {tr.lat:+.1f}m'
+                     if tr is not None else '위치 불명')
+            self._on_event('ped_done', f'id={h.id} {where} ― 횡단 완료: {h.why}')
+        if ped_stopped or any(not h.done for h in self._hold.values()):
+            self._all_done_t = None
             return
-        self._ped_clear += 1
-        if self._ped_clear < PED_CLEAR_FRAMES:
-            return
-        lats = []
-        for oid in sorted(self._ped_ids):
-            tr = self._tracks.get(oid)
-            lats.append(f'{oid}:{tr.lat:+.1f}m' if tr is not None
-                        else f'{oid}:시야밖')
+        # 전원 완료. 뒤로 지나간 사람뿐이면 기다릴 이유가 없다
+        if not all(h.code == 'behind' for h in self._hold.values()):
+            if self._all_done_t is None:
+                self._all_done_t = t
+            if t - self._all_done_t < PED_CLEAR_HOLD_S:
+                return
+        parts = [f'{h.id}({h.why})' for h in sorted(self._hold.values(),
+                                                      key=lambda x: x.id)]
+        timed = [h for h in self._hold.values() if h.code == 'timeout']
+        if timed:
+            self._on_event('ped_clear_timeout',
+                           f'보행자 {", ".join(str(h.id) for h in timed)} 횡단 완료 '
+                           f'조건이 {PED_CLEAR_TIMEOUT_S:.0f}s 안에 안 풀렸다 ― '
+                           f'교착 방지로 해제한다 (도로 밖 판정을 의심할 것)')
+        waited = 0.0 if self._all_done_t is None else t - self._all_done_t
         self._on_event('ped_clear',
-                       f'보행자 {", ".join(lats)} ― 횡단 완료, 재출발')
-        self._ped_ids.clear()
-        self._ped_clear = 0
+                       f'보행자 {", ".join(parts)} ― 전원 횡단 완료, '
+                       f'{waited:.1f}초 더 기다린 뒤 재출발')
+        self._hold.clear()
+        self._all_done_t = None
         self._hold_since = None
         self._creep_id = None
+
+    def _hold_cmd(self, ped_stopped: bool, s_ego: float, v: float,
+                  t: float) -> ObstacleCmd | None:
+        """대기 중인데 이번 프레임 보행자 명령이 없으면 정지 명령을 합성한다.
+
+        대상은 미완료 보행자 중 가장 가까운 것, 없으면(전원 완료 후 추가 대기)
+        아무나. 크립 중인 id는 뺀다 -- 교착 해제된 크립을 되살리면 안 된다.
+        **보행자 명령(크립 포함)이 하나라도 있으면 합성하지 않는다** -- 크립
+        명령 옆에 정지 명령을 놓으면 min()이 정지를 골라 교착 해제가 죽는다.
+        실제 정지 PEDESTRIAN 명령이므로 blocking(stoplines 동결), _deadlock
+        (ped_timeout 크립), detour 최후 안전망의 obj_id 게이트가 그대로 산다.
+        """
+        if not self._hold or ped_stopped:
+            return None
+        pool = [h for h in self._hold.values() if h.id != self._creep_id]
+        if not pool:
+            return None
+        pending = [h for h in pool if not h.done]
+
+        def dist_of(h):
+            tr = self._tracks.get(h.id)
+            return tr.s - s_ego if tr is not None else float('inf')
+
+        h = min(pending or pool, key=dist_of)
+        tr = self._tracks.get(h.id)
+        d = tr.s - s_ego if tr is not None else float('nan')
+        lat = tr.lat if tr is not None else float('nan')
+        avail = max(0.0, d - self.front - PED_GAP) if d == d else 0.0
+        if h.stopped:
+            avail = 0.0             # 한 번 섰으면 해제까지 기어가지 않는다
+        v_limit, accel_limit = _profile(avail, v)
+        action = 'hold' if (v < STOP_SPEED and v_limit < STOP_SPEED) else 'stop'
+        if pending:
+            why = (f'보행자 id={h.id} 횡단 대기 (대역 밖 {lat:+.1f}m, '
+                   f'아직 완료 아님)')
+            self._announce((h.id, 'hold'), 'ped_hold',
+                           f'id={h.id} 전방 {d:.1f}m 횡거리 {lat:+.1f}m ― 대역 '
+                           f'밖이지만 횡단 완료가 아니라 계속 선다')
+        else:
+            why = f'보행자 전원 완료 ― {PED_CLEAR_HOLD_S:.1f}초 추가 대기'
+        return ObstacleCmd(v_limit, action, PEDESTRIAN, h.id, d, lat, why,
+                           accel_limit, stop_avail=avail)
 
     def _deadlock(self, cmd: ObstacleCmd, cand_ids: set,
                   v: float, t: float) -> ObstacleCmd:
@@ -601,8 +787,12 @@ def summary(policy: ObstaclePolicy) -> list:
         f'  차량  차로폭 ±{VEH_LANE_M:.1f}m  최소간격 {MIN_GAP:.1f}m  '
         f'차간 {HEADWAY_S:.1f}s  교착 {VEH_BLOCK_S:.0f}s',
         f'  보행자 정지 ±{PED_HARD_M:.1f}m  예측 ±{PED_WATCH_M:.1f}m  '
-        f'해제 ±{PED_RELEASE_M:.1f}m  교착 {policy.max_block:.0f}s '
-        f'(차폭 ±{PED_CORRIDOR_M:.1f}m 밖이면 서행 통과)',
+        f'교착 {policy.max_block:.0f}s (차폭 ±{PED_CORRIDOR_M:.1f}m 밖이면 서행 통과)',
+        f'  횡단 완료: 경로 {PED_CLEAR_M:.0f}m 밖'
+        + ('+도로 밖' if policy.on_road is not None else '(도로 판정 없음)')
+        + f' / 뒤 {PED_BEHIND_M:.0f}m / 정지 {PED_STILL_S:.0f}s / 시야 밖 '
+          f'{PED_LOST_S:.0f}s, 이후 {PED_CLEAR_HOLD_S:.1f}s 대기, 상한 '
+          f'{PED_CLEAR_TIMEOUT_S:.0f}s',
         f'  장애물 ±{OBST_LANE_M:.1f}m 이내면 {OBST_CREEP * 3.6:.0f}km/h '
         f'감속만 (정지 안 함). 경로 끝 {policy.finish_zone:.0f}m 안은 '
         f'종료 라바콘으로 보고 무시',
@@ -795,18 +985,149 @@ def _selftest() -> int:
     check('추월 차량: 상한이 앞차 속도 이상',
           all(r[6] >= 13.8 for r in log if r[4] == VEHICLE))
 
-    # 5. 횡단하는 보행자 — 대역에 들어오기 전에 예측으로 선다 (항목 10)
-    ev = []
-    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: ev.append(k))
+    # 5. 횡단하는 보행자 — 대역에 들어오기 전에 예측으로 서고 (항목 10),
+    #    **경로에서 PED_CLEAR_M 밖으로 나갈 때까지 서 있다가 1.5초 더 기다린 뒤**
+    #    출발한다. 실차에서 +4.4~5.2m에서 풀려 도로 위 보행자를 두고 출발했다
     def crossing(t, x):
         return [_Fake(3, 70.0, -6.0 + 2.5 * t, speed=2.5,
                       heading=math.pi / 2, dims=PED)]
-    log, _ = _drive(pol, path, crossing, n=120)
+
+    def free_after(log):
+        """(첫 정지 t, 그 뒤 처음으로 제약이 풀린 t)."""
+        t0 = next((r[0] for r in log if r[3] in ('stop', 'hold')), None)
+        if t0 is None:
+            return None, None
+        t1 = next((r[0] for r in log if r[0] > t0 and r[3] == 'none'), None)
+        return t0, t1
+
+    evd = []
+    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: evd.append((k, d)))
+    log, _ = _drive(pol, path, crossing, n=240)
+    ev = [k for k, _d in evd]
     check('횡단 보행자: 예측 정지 발화', 'ped_stop_predicted' in ev, ','.join(ev))
-    first_pred = next((r[0] for r in log if r[3] in ('stop', 'hold')), None)
-    check('횡단 보행자: 대역 진입 전에 반응',
-          first_pred is not None and first_pred < 1.2,
-          f'첫 정지 t={first_pred}')
+    t0, t1 = free_after(log)
+    check('횡단 보행자: 대역 진입 전에 반응', t0 is not None and t0 < 1.2,
+          f'첫 정지 t={t0}')
+    # 보행자가 lat +6.0에 닿는 t=4.8 + 1.5초 대기
+    check('횡단 보행자: 6m 밖으로 나가고 1.5초 뒤에야 풀린다',
+          t1 is not None and 6.2 <= t1 <= 7.0, f'해제 t={t1}')
+    done = [d for k, d in evd if k == 'ped_done']
+    clear = [d for k, d in evd if k == 'ped_clear']
+    check('횡단 보행자: 해제 근거가 이벤트에 남는다',
+          len(done) == 1 and '경로에서' in done[0] and len(clear) == 1
+          and '더 기다린' in clear[0], f'{done} {clear}')
+
+    # 5b. 넓은 도로 — 도로 밖(on_road)까지 기다린다. 인덱스가 없으면 6m만
+    for road, lo, hi, why in ((lambda x, y: abs(y) < 8.0, 7.0, 7.8,
+                               '3차로: lat 8m(도로 밖)까지'),
+                              (None, 6.2, 7.0, '인덱스 없음: 6m')):
+        pol = ObstaclePolicy(_Straight(), on_road=road)
+        log, _ = _drive(pol, path, crossing, n=240)
+        t0, t1 = free_after(log)
+        check(f'횡단 완료 ({why})', t1 is not None and lo <= t1 <= hi,
+              f'해제 t={t1}')
+
+    # 5c. 보도로 물러나 서 있는 보행자 — 3초 정지면 횡단 의사 없음, 20초를 안 기다린다
+    def to_sidewalk(t, x):
+        u = min(t, 3.0)
+        return [_Fake(4, 60.0, -2.0 - u, speed=(1.0 if t < 3.0 else 0.0),
+                      heading=-math.pi / 2, dims=PED)]
+    evd = []
+    pol = ObstaclePolicy(_Straight(), on_road=lambda x, y: True,
+                         on_event=lambda k, d: evd.append((k, d)))
+    log, end = _drive(pol, path, to_sidewalk, n=240)
+    t0, t1 = free_after(log)
+    done = [d for k, d in evd if k == 'ped_done']
+    check('보도 정지 보행자: 3초 정지 + 1.5초 뒤 출발 (t≈7.5)',
+          t1 is not None and 7.4 <= t1 <= 8.2 and done and '정지' in done[0],
+          f'해제 t={t1} {done}')
+    check('보도 정지 보행자: 교착 타임아웃 없이 풀린다',
+          'ped_timeout' not in [k for k, _d in evd] and end > 70.0,
+          f'{end:.1f}m')
+
+    # 5d. 우리 쪽으로 걸어와 옆을 지나간 보행자 — 뒤로 지나가면 바로 출발
+    def walker(t, x):
+        return [_Fake(6, 60.0 - 1.5 * t, 2.5, speed=1.5, heading=math.pi,
+                      dims=PED)]
+    evd = []
+    pol = ObstaclePolicy(_Straight(), on_road=lambda x, y: True,
+                         on_event=lambda k, d: evd.append((k, d)))
+    log, end = _drive(pol, path, walker, n=600)
+    done = [d for k, d in evd if k == 'ped_done']
+    clear = [d for k, d in evd if k == 'ped_clear']
+    check('지나간 보행자: 뒤로 지나가면 대기 없이 출발',
+          done and '뒤' in done[0] and clear and '0.0초 더' in clear[0]
+          and end > 100.0, f'{done} {clear} {end:.1f}m')
+
+    # 5e~5f. 도로 위에서 6m 밖으로 걸어가는 보행자 — 명령이 안 나와도 정지를
+    #        합성해 서 있고, 상한(PED_CLEAR_TIMEOUT_S)에 걸리면 경고하고 푼다
+    global PED_CLEAR_TIMEOUT_S
+    saved = PED_CLEAR_TIMEOUT_S
+    PED_CLEAR_TIMEOUT_S = 12.0
+    try:
+        def wide(t, x):
+            return [_Fake(7, 60.0, -2.0 + 1.0 * t, speed=1.0,
+                          heading=math.pi / 2, dims=PED)]
+        evd = []
+        pol = ObstaclePolicy(_Straight(), on_road=lambda x, y: True,
+                             on_event=lambda k, d: evd.append((k, d)))
+        log, end = _drive(pol, path, wide, n=400)
+        ev = [k for k, _d in evd]
+        held = [r for r in log if 8.5 <= r[0] <= 11.5]
+        check('넓은 도로 보행자: 6m 밖에서도 정지 명령을 합성한다 (hold)',
+              held and all(r[3] in ('stop', 'hold') and r[4] == PEDESTRIAN
+                           and r[5] == 7 for r in held) and 'ped_hold' in ev,
+              f'{sorted({r[3] for r in held})} {",".join(ev)}')
+        t0, t1 = free_after(log)
+        check('넓은 도로 보행자: 상한에 걸리면 경고하고 푼다',
+              'ped_clear_timeout' in ev and t1 is not None
+              and 13.4 <= t1 <= 14.2 and end > 70.0,
+              f'해제 t={t1} {end:.1f}m')
+        check('넓은 도로 보행자: 완료/취소가 프레임마다 반복되지 않는다',
+              ev.count('ped_done') == 1 and ev.count('ped_resume') == 0,
+              f'ped_done {ev.count("ped_done")} ped_resume {ev.count("ped_resume")}')
+    finally:
+        PED_CLEAR_TIMEOUT_S = saved
+
+    # 5g. 완료로 봤던 보행자가 되돌아오면 완료를 취소하고 계속 선다
+    def back(t, x):
+        if t < 3.0:
+            return [_Fake(8, 60.0, -2.0 + (6.5 / 3.0) * t, speed=6.5 / 3.0,
+                          heading=math.pi / 2, dims=PED)]
+        if t < 7.0:
+            return [_Fake(8, 60.0, 4.5, speed=0.0, heading=math.pi / 2, dims=PED)]
+        return [_Fake(8, 60.0, 4.5 - 1.0 * (t - 7.0), speed=1.0,
+                      heading=-math.pi / 2, dims=PED)]
+    evd = []
+    pol = ObstaclePolicy(_Straight(), on_road=lambda x, y: True,
+                         on_event=lambda k, d: evd.append((k, d)))
+    log, _ = _drive(pol, path, back, n=200)
+    ev = [k for k, _d in evd]
+    moving_free = [r for r in log if 7.5 <= r[0] <= 9.0 and r[3] == 'none']
+    check('되돌아오는 보행자: ped_resume 로 완료를 취소하고 서 있는다',
+          'ped_done' in ev and 'ped_resume' in ev and not moving_free,
+          f'{",".join(ev)} 풀린 프레임 {len(moving_free)}')
+
+    # 5h. 다른 이유(앞차)로 보행자보다 훨씬 앞에서 섰다가 앞차가 사라져도, 건너는
+    #     사람 쪽으로 PED_GAP까지 기어가지 않는다 (sim xw_gate: TTC가 먼저 세운 뒤
+    #     정지 프로파일이 2m를 2m/s로 기어갔다)
+    def early_stop(t, x):
+        objs = [_Fake(9, 70.0, -2.0 + 0.5 * t, speed=0.5, heading=math.pi / 2,
+                      dims=PED)]
+        if t < 12.0:
+            objs.append(_Fake(10, 60.0, 0.0, dims=CAR))
+        return objs
+    evd = []
+    pol = ObstaclePolicy(_Straight(), on_event=lambda k, d: evd.append((k, d)))
+    log, end = _drive(pol, path, early_stop, n=440)
+    t_stop = next((r[0] for r in log if r[2] < STOP_SPEED), None)
+    t0, t1 = free_after(log)
+    crept = [r for r in log if t_stop is not None and t_stop < r[0] < (t1 or 99.0)
+             and r[2] > STOP_SPEED]
+    check('일찍 선 뒤 보행자 쪽으로 기어가지 않는다',
+          t_stop is not None and t_stop < 12.0 and not crept and t1 is not None
+          and t1 > 16.0 and end > 60.0,
+          f'정지 t={t_stop} 해제 t={t1} 기어간 프레임 {len(crept)} {end:.1f}m')
 
     # 6. 교착 해제 — 차폭 밖 정지 보행자는 결국 서행 통과한다
     ev = []
@@ -816,6 +1137,8 @@ def _selftest() -> int:
     log, end = _drive(pol, path, lambda t, x: [stuck], n=1400)
     check('교착: ped_timeout 발화', 'ped_timeout' in ev, ','.join(ev))
     check('교착: 결국 지나간다', end > 60.0, f'{end:.1f}m 진행')
+    check('교착: 완료 판정이 프레임마다 반복되지 않는다',
+          ev.count('ped_done') <= 1, f'ped_done {ev.count("ped_done")}')
 
     # 7. 교착이어도 차폭 안 보행자는 들이받지 않는다
     pol = ObstaclePolicy(_Straight(), max_block=3.0)
@@ -849,13 +1172,16 @@ def _selftest() -> int:
           and end < 290.0, f'{end:.1f}m')
 
     # 9. 우회 교체 -- 트랙(월드 좌표)은 새 정책이 이어받는다 (9/11)
-    a = ObstaclePolicy(_Straight())
+    a = ObstaclePolicy(_Straight(), on_road=lambda x, y: True)
     _drive(a, a.path, lambda t, x: [_Fake(2, 120.0, 0.0, dims=CAR)], n=5)
+    a._hold[3] = _Held(3, 0.0)
     b = ObstaclePolicy(_Straight())
     b.adopt(a)
     check('adopt: 트랙 승계 (trusted)', 2 in b._tracks and b._tracks[2].trusted
           and b._tracks[2].n_seen == a._tracks[2].n_seen,
           f'{b._tracks.get(2)}')
+    check('adopt: 보행자 횡단 대기·on_road 승계',
+          3 in b._hold and b.on_road is not None)
     b.adopt(None)
     check('adopt(None): 무해', 2 in b._tracks and b._hold_since is None)
 

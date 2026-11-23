@@ -577,6 +577,15 @@ class DetourPlanner:
                                     name='detour')
         self._th.start()
 
+    def on_road(self, x: float, y: float) -> bool:
+        """이 점이 driving 차로 위인가 (obstacles의 보행자 횡단 완료 판정용).
+
+        LaneIndex는 driving 차로 중심점만 담고 있으므로 PED_OFFROAD_M 안에
+        중심점이 하나도 없으면 보도·중앙분리대다. 5m 격자라 싸고 읽기만 한다
+        (워커 스레드와 공유해도 안전하다).
+        """
+        return bool(self.index.near(x, y, OB.PED_OFFROAD_M))
+
     # -- 외부 인터페이스 ------------------------------------------------
     @property
     def busy(self) -> bool:

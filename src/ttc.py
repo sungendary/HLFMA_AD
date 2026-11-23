@@ -97,11 +97,12 @@ class TtcCmd:
     """한 프레임의 판정. obstacles.ObstacleCmd와 같은 모양이다."""
 
     __slots__ = ('v_limit', 'accel_limit', 'action', 'kind', 'obj_id',
-                 't_cpa', 'd_cpa', 'reason')
+                 't_cpa', 'd_cpa', 'reason', 'stop_avail')
 
     def __init__(self, v_limit=float('inf'), action='none', kind='',
                  obj_id=-1, t_cpa=float('nan'), d_cpa=float('nan'),
-                 reason='', accel_limit=float('inf')):
+                 reason='', accel_limit=float('inf'),
+                 stop_avail=float('nan')):
         self.v_limit = v_limit          # m/s. inf면 제약 없음
         self.accel_limit = accel_limit  # m/s^2 상한. inf면 제약 없음
         self.action = action            # none / warn / brake / stop / timeout
@@ -110,6 +111,11 @@ class TtcCmd:
         self.t_cpa = t_cpa              # s, 최근접까지 남은 시간
         self.d_cpa = d_cpa              # m, 최근접 거리
         self.reason = reason
+        # 후륜축이 지금부터 몇 m 더 가서 설 작정인가 (obstacles.ObstacleCmd와
+        # 같은 규약). brake/stop 단계, 그리고 **정지한 차로 내 객체의 warn**에
+        # 싣는다 -- 그 경우 정지는 기하로 정해져 있어 crosswalks가 미리 봐도
+        # 오탐이 아니다. 이동 객체의 warn·timeout은 nan
+        self.stop_avail = stop_avail
 
     def __repr__(self) -> str:
         return (f'<TtcCmd {self.action} id={self.obj_id} v<={self.v_limit:.1f} '
@@ -372,10 +378,11 @@ class TtcPolicy:
                 continue
             if a.miss > 0:
                 if a.last is not None:
-                    v_lim, a_lim, t_cpa, d_cpa, cls = a.last
+                    v_lim, a_lim, t_cpa, d_cpa, cls, sa = a.last
                     key = (v_lim, t_cpa)
                     if worst is None or key < worst[0]:
-                        worst = (key, oid, cls, t_cpa, d_cpa, a.level, v_lim, a_lim)
+                        worst = (key, oid, cls, t_cpa, d_cpa, a.level, v_lim,
+                                 a_lim, sa)
                 continue
             o, cls, t_cpa, d_cpa, s_o, lat_o, v_lead, _crit = cands[oid]
             dh = _wrap(o.heading - ego_heading)
@@ -406,6 +413,14 @@ class TtcPolicy:
                 if a.stop_since is None:
                     a.stop_since = t
                 self._check_timeout(a, cls, t, t_cpa, d_cpa)
+            # 정지 의사 (crosswalks 예방용). 정지한 차로 내 객체는 warn에서
+            # 이미 정지점이 확정이다 -- 서행 중에는 warn(4s)이 너무 늦다
+            sa = float('nan')
+            if not a.timed_out and (
+                    level in ('brake', 'stop')
+                    or (abs(o.speed) < STATIONARY_MS
+                        and abs(lat_o) <= OB.VEH_LANE_M)):
+                sa = max(0.0, avail)
             if a.timed_out:
                 v_lim, a_lim = _limit(avail, v, V_FLOOR, V_FLOOR)
                 shown = 'timeout'
@@ -422,14 +437,15 @@ class TtcPolicy:
                     a.announced = True
                     a.told = level
             a.level = level
-            a.last = (v_lim, a_lim, t_cpa, d_cpa, cls)
+            a.last = (v_lim, a_lim, t_cpa, d_cpa, cls, sa)
             key = (v_lim, t_cpa)
             if worst is None or key < worst[0]:
-                worst = (key, oid, cls, t_cpa, d_cpa, shown, v_lim, a_lim)
+                worst = (key, oid, cls, t_cpa, d_cpa, shown, v_lim, a_lim, sa)
 
         if worst is not None:
-            _k, oid, cls, t_cpa, d_cpa, shown, v_lim, a_lim = worst
+            _k, oid, cls, t_cpa, d_cpa, shown, v_lim, a_lim, sa = worst
             cmd.v_limit, cmd.accel_limit = v_lim, a_lim
+            cmd.stop_avail = sa
             cmd.action, cmd.kind, cmd.obj_id = shown, cls, oid
             cmd.t_cpa, cmd.d_cpa = t_cpa, d_cpa
             cmd.reason = f'{cls} id={oid} t_cpa={t_cpa:.1f}s d_cpa={d_cpa:.1f}m'
@@ -470,6 +486,8 @@ class TtcPolicy:
                 cmd.kind, cmd.obj_id = OB.classify(o), oid
                 cmd.t_cpa, cmd.d_cpa = 0.0, abs(lat_o)
                 cmd.reason = f'정지 유지 (앞 {gap:.1f}m)'
+                cmd.stop_avail = (float('nan') if a.timed_out
+                                  else max(0.0, gap - MIN_GAP))
         for oid in list(self._acts):
             if oid not in keep:
                 self._release(oid)
@@ -879,6 +897,39 @@ def _selftest() -> int:
     log, _ = OB._drive(pol, path, lambda t, x: [Fake(20, 40.0, 2.2, dims=CAR)], n=200)
     check('정지 차량 lat 2.2: 무반응 (obstacles 기준)', acts(log) == {'none'},
           f'{sorted(acts(log))}')
+
+    # 16b. 정지 의사(stop_avail) ― crosswalks 예방용. 정지한 차로 내 객체는
+    #      warn부터, 이동 객체는 brake/stop부터, 그 밖은 nan
+    def run_sa(objs_at, n=200):
+        pol = TtcPolicy(path)
+        x, v, idx, out = 0.0, 12.5, 0, []
+        for k in range(n):
+            t = k * 0.05
+            while idx < len(path.pts) - 1 and path.s[idx + 1] <= x:
+                idx += 1
+            cmd = pol.update(idx, x, v, x, 0.0, 0.0, objs_at(t, x), t)
+            out.append((t, x, cmd.action, cmd.stop_avail))
+            v_cmd = min(12.5, cmd.v_limit)
+            a = max(-6.0, min(3.0, min(1.2 * (v_cmd - v), cmd.accel_limit)))
+            if v_cmd <= 0.0:
+                a = min(a, -1.5)
+            x += v * 0.05
+            v = max(0.0, v + a * 0.05)
+        return out
+
+    car = Fake(1, 80.0, 0.0, dims=CAR)
+    sa = run_sa(lambda t, x: [car])
+    w = next((r for r in sa if r[2] == 'warn'), None)
+    want = (car.x - car.length * 0.5) - (w[1] + FRONT_OVERHANG) - MIN_GAP if w else 0.0
+    check('stop_avail: 정지 앞차는 warn부터 정지점을 낸다',
+          w is not None and w[3] == w[3] and abs(w[3] - want) < 0.5,
+          f'{w} 기대 {want:.1f}')
+    check('stop_avail: brake/stop 프레임은 전부 유한',
+          all(r[3] == r[3] for r in sa if r[2] in ('brake', 'stop')))
+    sa2 = run_sa(lambda t, x: [Fake(3, 40.0 + 6.0 * t, 0.0, speed=6.0, dims=CAR)])
+    warns = [r for r in sa2 if r[2] == 'warn']
+    check('stop_avail: 이동 객체(느린 앞차)의 warn은 nan',
+          warns and all(r[3] != r[3] for r in warns), f'{len(warns)}프레임')
 
     # 17. 비용 ― 30객체 최악에서 프레임당 2ms 미만
     pol = TtcPolicy(path)
