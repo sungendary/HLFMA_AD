@@ -1,6 +1,0 @@
-segment_id,turn,lane,speed_limit
-p1_to_p2,straight,2,50
-p2_to_p3,right,2,50
-p3_to_p4,straight,2,50
-p4_to_p5,straight,2,50
-p5_to_p6,straight,2,50
