@@ -103,6 +103,10 @@ flowchart LR
 - Python 3.11 표준 라이브러리만 사용합니다. 보호구역 판정에는 ffmpeg가 필요합니다.
 - 예: `python src/pure_pursuit.py --host <VTD IP> --waypoints data/race.csv --events data/race_events.csv`
 
+## 개발 기록
+
+[`CLAUDE.md`](CLAUDE.md)는 개발 기간 동안 Claude Code에 준 작업 지침이자 개발 일지입니다. 설계 결정과 근거, 시뮬레이터와 실차 시험에서 잡은 결함과 수정 과정, 대회 후 교차로 충돌 분석까지 날짜별로 남겼습니다. 맨 위의 "문제 해결·검증 사례 바로가기"부터 보시면 됩니다.
+
 ## 한계와 다음 단계
 
 - 교차로 양보의 통과 시간을 실제 곡률 속도 프로파일로 계산
