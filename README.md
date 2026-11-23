@@ -86,6 +86,23 @@ flowchart LR
 4. **회귀 시험**: 기능 추가마다 빈 도로와 기존 시나리오 전체 재실행
 5. **실차(VTD) 시험**: 사전테스트, 직접 만든 시나리오
 
+## 폴더 구성
+
+| 경로 | 내용 |
+|---|---|
+| `src/pure_pursuit.py` | 메인 제어 루프. 경로 추종과 규칙 모듈들의 속도 제한을 합쳐 20Hz로 명령 송신 |
+| `src/hlvtd_client.py` `session_log.py` `tcp_inbound_sniffer.py` | VTD 통신 파싱·속도 추정, 전 프레임 기록, 규격 해석에 쓴 바이트 덤프 도구 |
+| `src/stoplines.py` `obstacles.py` `ttc.py` `junction_yield.py` `detour.py` `finish.py` `crosswalks.py` `turnsignal.py` `redzone.py` | 규칙 대응: 신호 정지, 충돌 회피, 충돌 예측, 교차로 양보, 정지 차량 우회, 종료선, 횡단보도, 방향지시등, 보호구역 |
+| `src/xodr_*.py` | OpenDRIVE 파서, 차로·노면표시 추출, 차로 그래프와 경로 생성 |
+| `src/replay_server.py` `sim_world.py` `check_*.py` `analyze_session.py` | 검증: 가짜 VTD 서버(폐루프 시뮬레이터), 자동 채점기, 세션 분석 |
+| `data/race.csv` `data/race_events.csv` | 본대회 경로로 생성한 주행 경로와 경로 위 이벤트(정지선, 신호, 횡단보도 등) |
+
+## 실행 환경
+
+- 실행하려면 VTD 시뮬레이터와 주최측 OpenDRIVE 지도가 필요합니다. 지도와 대회 원본 경로는 주최측 배포 자료라 포함하지 않았습니다.
+- Python 3.11 표준 라이브러리만 사용합니다. 보호구역 판정에는 ffmpeg가 필요합니다.
+- 예: `python src/pure_pursuit.py --host <VTD IP> --waypoints data/race.csv --events data/race_events.csv`
+
 ## 한계와 다음 단계
 
 - 교차로 양보의 통과 시간을 실제 곡률 속도 프로파일로 계산
