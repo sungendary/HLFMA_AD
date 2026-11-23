@@ -14,7 +14,7 @@
 | 인터페이스 | TCP 20Hz (수신 1,109B / 송신 9B), RTSP 카메라, OpenDRIVE 지도 |
 
 
-https://github.com/user-attachments/assets/6d5ad0bb-0357-46de-b801-33793639df9f
+https://github.com/user-attachments/assets/3472397c-3e2f-4184-a9c6-0b1bdd3732f9
 
 
 ## 내 역할
