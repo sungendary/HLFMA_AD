@@ -42,7 +42,8 @@ DRIVE_COLS = ['n', 't', 'ego_x', 'ego_y', 'heading', 'speed', 'seg', 'idx',
               'turn', 'turn_src', 'cw_act', 'cw_dist',
               'dt_act', 'dt_dist',
               'rz_ratio', 'rz_far', 'rz_in', 'fin_lon',
-              'tt_act', 'tt_tcpa', 'tt_dcpa']
+              'tt_act', 'tt_tcpa', 'tt_dcpa',
+              'jy_act', 'jy_dist', 'jy_n']
 OBJECT_COLS = ['n', 't', 'id', 'x', 'y', 'z', 'heading', 'speed',
                'length', 'width', 'height', 'dist', 'is_ped']
 EVENT_COLS = ['t', 'n', 'kind', 'detail', 'ego_x', 'ego_y', 'speed']
@@ -156,7 +157,9 @@ class SessionLog:
                   rz_ratio: float = NAN, rz_far: float = NAN,
                   rz_in: int = 0, fin_lon: float = NAN,
                   tt_act: str = '', tt_tcpa: float = NAN,
-                  tt_dcpa: float = NAN) -> None:
+                  tt_dcpa: float = NAN,
+                  jy_act: str = '', jy_dist: float = NAN,
+                  jy_n: int = 0) -> None:
         """한 프레임의 상태와 그때 보낸 명령을 기록한다.
 
         신호등 전이와 구간 전환은 여기서 자동으로 events.csv에도 남긴다.
@@ -178,7 +181,8 @@ class SessionLog:
                 ob_act, ob_kind, ob_id, ob_dist, ob_lat,
                 turn, turn_src, cw_act, cw_dist,
                 dt_act, dt_dist, rz_ratio, rz_far, rz_in, fin_lon,
-                tt_act, tt_tcpa, tt_dcpa)])
+                tt_act, tt_tcpa, tt_dcpa,
+                jy_act, jy_dist, jy_n)])
 
             for o in frame.objects:
                 self._obj.writerow([_fmt(v) for v in (

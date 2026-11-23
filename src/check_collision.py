@@ -47,7 +47,8 @@ STOP_SPEED = 0.3            # m/s, 이 아래면 멈춘 것으로 본다
 LATE_RESTART_S = 5.0        # s, 항목 8 감점 한계
 STOPLINE_ZONE_M = 30.0      # m, 항목 8은 정지선 30m 이내에서만 걸린다
 
-STOP_KINDS = ('ped_stop_actual', 'ped_stop_predicted', 'veh_stop')
+STOP_KINDS = ('ped_stop_actual', 'ped_stop_predicted', 'veh_stop',
+              'junction_yield', 'ttc_hold')   # 교차 차량 양보도 정차다 (9/27)
 GO_KINDS = ('ped_clear', 'ped_timeout', 'veh_timeout')
 
 

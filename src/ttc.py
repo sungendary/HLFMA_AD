@@ -51,11 +51,30 @@ from __future__ import annotations
 import bisect
 import math
 
+import ctrv
 import obstacles as OB
 from stoplines import FRONT_OVERHANG
 from finish import FINISH_ZONE_M, gate_s
 
-D_CRIT = 2.5                # m, 최근접 거리 임계. ego 반폭 0.95 + 객체 반폭 + 여유
+GAP_CRIT = 0.5              # m, 풋프린트 간격이 이 아래면 충돌 경로로 본다. 예전엔
+                            # 중심 거리(D_CRIT 2.5)였는데 9/12 본대회에서 중심 거리
+                            # 2.7~5m에 실제 접촉이 났다 ― 차체가 비스듬히 놓이면
+                            # 중심 거리는 간격을 말해 주지 않는다
+GAP_SLOPE = 0.25            # m/s, 교차·회전 상대의 판정 간격은 예측 시각에 비례해
+                            # 넓힌다 (τ=4s에서 1.5m). 먼 미래일수록 예측이 틀린다
+GAP_EXIT_ADD = 1.0          # m, 해제 = 전 표본이 판정 간격 + 이 값 밖
+D_CRIT = GAP_CRIT           # 옛 이름 (--ttc-dcrit). 의미가 간격으로 바뀌었다
+EGO_HALF_LEN = 2.4          # m, 차체 중심 -> 앞/뒤 끝 (앞 3.808 / 뒤 1.0)
+EGO_HALF_W = 0.95           # m
+REAR_M = 1.0                # m, 후륜축 -> 뒤범퍼
+CORR_MARGIN_M = 0.5         # m, ego 주행 회랑 = 반폭 + 객체 횡 반폭 + 이 값
+CROSS_MARGIN_M = 1.0        # m, 교차 상대의 회랑 진입점 앞에 앞범퍼를 이만큼 띄운다
+ONCOMING_LAT_M = 2.5        # m, 마주오는 차가 이보다 옆이면 제 차로다
+HOLD_LAT_M = 3.75           # m, 정지 유지(_hold)의 횡거리 한계
+ROAD_YAW_TOL = 0.08         # rad/s, 요레이트가 도로 곡률과 이 안으로 맞으면 "도로를
+ROAD_YAW_FRAC = 0.3         # 따라 도는 것"이다 (+ 곡률분의 이 비율)
+PROJ_SLACK_M = OB.PROJ_SLACK_M
+TRAJ_SPAN = 6               # 점, 등회전 표본을 직전 자리 둘레 이만큼만 투영한다
 T_WARN = 4.0                # s, 이 안의 최근접만 본다
 T_CRIT = 3.0                # s, 이 안이면 정지 프로파일
 T_IMMINENT = 1.0            # s, 이 안이면 하한 없는 정지
@@ -79,13 +98,24 @@ LAT_MAX_M = 35.0            # m, 경로에서 이보다 옆이면 보지 않는�
                             # 교차로 측면 진입은 25~30m에서 시작한다
 
 ENTER_FRAMES = 2            # 연속 이만큼 위험해야 활성
-EXIT_RATIO = 1.5            # 해제 거리 = D_CRIT * 이 값
 ACT_MARGIN_MS = 0.3         # m/s, 상한이 현재 속도보다 이만큼 낮아야 "실제 제한"
+ACT_DECEL = 0.5             # m/s^2, 감속 피드포워드가 이보다 세도 "실제 제한"
+REF_MARGIN_MS = 0.5         # m/s, 진입 속도가 지금보다 이만큼 높을 때만 다시 훑는다
 TTC_MAX_HOLD_S = 10.0       # s, stop을 이만큼 유지하면 교착으로 보고 완화
 RELEASE_FRAMES = 30         # 프레임, 위험이 사라진 채 이만큼 지속돼야 해제 (1.5s).
                             # 0.5s로는 제동으로 풀린 교차 충돌에 다시 가속해 2.2m로 스쳤다
 HOLD_EXTRA_M = 2.0          # m, 정지 유지: 앞차 간격이 MIN_GAP+이 값 안일 때만
 HOLD_LOOK_M = 20.0          # m, 정지 유지 판정 창
+
+# 정지 중 판정 (9/12 본대회). 서 있을 때는 "지금 출발하면 부딪히는가"를 본다
+DEPART_ACCEL = 1.5          # m/s^2, 출발 가속 가정
+HOLD_CLEAR_S = 2.0          # s, 무위험이 이만큼 이어져야 출발
+HOLD_MAX_S = 30.0           # s, 정지 유지 상한. 넘으면 틈에서 출발한다
+HOLD_GAP_S = 2.0            # s, 상한 뒤 출발에 필요한 최소 틈 (가장 이른 위험까지)
+V_PASS = 25.0 / 3.6         # m/s, 출발 뒤 통과 속도 가정 (junction_yield의 접근 상한과 같다)
+HOLD_REARM_S = 5.0          # s, 상한으로 출발한 뒤 이만큼은 다시 잡지 않는다
+V_DEPART = 3.0              # m/s, 이보다 느리면 "가속 중"으로 본다. 출발 직후
+                            # 등속(v≈0) 예측은 우리가 교차점에 닿지 않는다고 계산한다
 
 N_SAMPLES = int(round(T_WARN / TAU_STEP))
 EXTRAP_SAMPLES = 20         # 창 끝에서 이만큼(4s)까지 꼭짓점을 외삽한다
@@ -125,21 +155,23 @@ class TtcCmd:
 class _Tr:
     """최소 트랙. obstacles.Track과 같은 규칙으로 trusted를 낸다."""
 
-    __slots__ = ('id', 'x', 'y', 'n_seen', 'missing', 'trusted')
+    __slots__ = ('id', 'x', 'y', 'n_seen', 'missing', 'trusted', 'hist')
 
-    def __init__(self, oid, x, y):
+    def __init__(self, oid, x, y, heading=0.0):
         self.id = oid
         self.x, self.y = x, y
         self.n_seen = 1
         self.missing = 0
         self.trusted = False
+        self.hist = ctrv.HeadingHist()      # 요레이트 추정용 (등회전 예측)
+        self.hist.push(heading)
 
 
 class _Act:
     """활성(위험) 객체 하나의 래치 상태."""
 
     __slots__ = ('id', 'enter', 'level', 'v_entry', 'stop_since', 'timed_out',
-                 'announced', 'miss', 'last', 'told')
+                 'announced', 'miss', 'last', 'told', 'v_ref')
 
     def __init__(self, oid):
         self.id = oid
@@ -152,6 +184,8 @@ class _Act:
         self.miss = 0               # 후보에서 빠진 연속 프레임 수 (해제 유예)
         self.last = None            # 유예 중 유지할 마지막 (v_lim, a_lim, t_cpa, d_cpa, kind)
         self.told = ''              # 이벤트로 알린 최고 단계
+        self.v_ref = 0.0            # 위험이던 동안의 최고 속도. 해제는 "이 속도로
+                                    # 돌아가도 안전한가"로 본다
 
     @property
     def active(self) -> bool:
@@ -176,6 +210,21 @@ def _wrap(a: float) -> float:
     return (a + math.pi) % (2.0 * math.pi) - math.pi
 
 
+def _road_kappa(path, s: float, span: int = 3) -> float:
+    """경로 s 지점의 부호 곡률 [1/m]. 좌회전이 양수."""
+    pts, sarr = path.pts, path.s
+    n = len(pts)
+    i = max(span, min(n - 1 - span, bisect.bisect_right(sarr, s) - 1))
+    a, b, c = pts[i - span], pts[i], pts[i + span]
+    h1 = math.atan2(b[1] - a[1], b[0] - a[0])
+    h2 = math.atan2(c[1] - b[1], c[0] - b[0])
+    ds = 0.5 * (sarr[i + span] - sarr[i - span])
+    return _wrap(h2 - h1) / ds if ds > 1e-6 else 0.0
+
+
+_proj = OB.project_fix      # 선분 끝에 걸린 투영을 보정한 투영 (obstacles와 공용)
+
+
 def _limit(avail: float, v: float, v_lead: float, floor: float) -> tuple:
     """(속도 상한, 가속도 상한). obstacles._profile에 하한을 얹은 것이다.
 
@@ -190,46 +239,76 @@ def _limit(avail: float, v: float, v_lead: float, floor: float) -> tuple:
     return OB._profile(avail, v, max(v_lead, floor), DECEL)
 
 
-def _cpa(s_e: float, lat_e: float, v: float,
-         s_o: float, lat_o: float, v_along: float, v_lat: float,
-         settle: bool) -> tuple:
-    """경로 좌표계 최근접점. (t_cpa, d_cpa, k). k==0이면 지금이 최근접이다.
+def _sweep(ego: list, obj: list, base: float, crossing: bool) -> tuple:
+    """표본을 훑는다. ego[k] = (s, lat), obj[k] = (s, lat, 종 반폭, 횡 반폭).
 
-    ego: (s_e + v·τ, lat_e·(1-τ/OFF_DECAY_S)). 객체: (s_o + v_along·τ,
-    lat_o + v_lat·τ). settle이면 객체의 lat이 0을 넘지 않는다(차로에 정착).
+    (첫 위반 k 또는 -1, 그 직전 여유, 그때 여유, 여유 최소 k, 최소 여유,
+     그때 간격, 중심 거리 최소 k).
     """
-    best_k, best_d2 = 0, float('inf')
-    d2s = []
-    sign = 1.0 if lat_o >= 0.0 else -1.0
-    for k in range(N_SAMPLES + 1):
-        tau = k * TAU_STEP
-        w = 1.0 - tau / OFF_DECAY_S
-        el = lat_e * w if w > 0.0 else 0.0
-        ol = lat_o + v_lat * tau
-        if settle and ol * sign < 0.0:
-            ol = 0.0
-        ds = s_o + v_along * tau - (s_e + v * tau)
-        dl = ol - el
+    k_first, k_min, k_near = -1, 0, 0
+    d2_min = m_min = m_prev = float('inf')
+    m_before = m_first = g_at = float('inf')
+    for k in range(len(ego)):
+        es, el = ego[k]
+        os_, ol, ext_lon, ext_lat = obj[k]
+        ds, dl = os_ - es, ol - el
         d2 = ds * ds + dl * dl
-        d2s.append(d2)
-        if d2 < best_d2:
-            best_k, best_d2 = k, d2
-    t_cpa = best_k * TAU_STEP
-    n = len(d2s)
-    if best_k > 0:
-        # 이웃 세 점으로 포물선 보간. 직선 도로에서는 d²가 정확히 2차다.
-        # 최근접이 창 끝(k==N)이면 진짜 최근접은 창 밖이다 ― 그대로 두면
-        # "τ=4s의 거리"를 d_cpa로 잘못 보고하고 제동 중에 그 값이 흔들린다.
-        # 꼭짓점을 창 밖으로 외삽해 t_cpa > T_WARN으로 정직하게 낸다
-        kc = min(best_k, n - 2)
-        a, b, c = d2s[kc - 1], d2s[kc], d2s[kc + 1]
-        den = a - 2.0 * b + c
-        if den > 1e-9:
-            off = 0.5 * (a - c) / den
-            off = max(-1.0, min(EXTRAP_SAMPLES, off))
-            t_cpa = (kc + off) * TAU_STEP
-            best_d2 = max(0.0, b - 0.25 * (a - c) * off)
-    return t_cpa, math.sqrt(best_d2), best_k
+        if d2 < d2_min:
+            d2_min, k_near = d2, k
+        g_lon = abs(ds) - ext_lon - EGO_HALF_LEN
+        g_lat = abs(dl) - ext_lat - EGO_HALF_W
+        g = g_lon if g_lon > g_lat else g_lat
+        # 판정 간격은 T_WARN의 값(1.5m)에서 포화한다. 정지 중 hold는 8s까지 보는데
+        # 거기까지 늘리면 2.5m라 옆 차로 교통이 걸린다
+        m = g - (base + GAP_SLOPE * min(k, N_SAMPLES) * TAU_STEP
+                 if crossing else base)
+        if m < m_min:
+            m_min, k_min, g_at = m, k, g
+        if m < 0.0 and k_first < 0:
+            k_first, m_before, m_first = k, m_prev, m
+        m_prev = m
+    return k_first, m_before, m_first, k_min, m_min, g_at, k_near
+
+
+def gap_crit_at(base: float, tau: float, crossing: bool) -> float:
+    """예측 시각 τ의 판정 간격. 교차·회전 상대는 먼 미래일수록 넓게 본다."""
+    return base + GAP_SLOPE * tau if crossing else base
+
+
+def footprint_gap(ds: float, dl: float, dh: float,
+                  length: float, width: float) -> float:
+    """경로 좌표계 풋프린트 간격 (분리축 근사). 음수면 겹친다.
+
+    check_collision.gap_to와 같은 식이다. 거기는 ego 축(월드), 여기는 경로 축이라
+    ds/dl이 곧 종/횡이다. ds·dl은 **차체 중심** 사이, dh는 객체 헤딩 - 경로 방위.
+    """
+    c, sn = abs(math.cos(dh)), abs(math.sin(dh))
+    ext_lon = 0.5 * length * c + 0.5 * width * sn
+    ext_lat = 0.5 * length * sn + 0.5 * width * c
+    return max(abs(ds) - ext_lon - EGO_HALF_LEN, abs(dl) - ext_lat - EGO_HALF_W)
+
+
+class _Cand:
+    """한 프레임의 후보 객체 하나."""
+
+    __slots__ = ('o', 'cls', 't', 'gap', 's_o', 'lat_o', 'v_lead', 'crossing',
+                 'depart', 'danger', 'clear', 's_x', 't_x', 'a_dep', 'w', 'ext')
+
+    def __init__(self, o, cls):
+        self.o, self.cls = o, cls
+        self.t = float('nan')       # 위험이면 첫 위반 시각, 아니면 여유 최소 시각
+        self.gap = float('nan')     # 여유(간격 - 판정 간격)가 최소인 표본의 간격
+        self.s_o = self.lat_o = 0.0
+        self.v_lead = 0.0
+        self.crossing = False       # 교차·회전 상대 (정지 목표·하한·판정 간격이 다르다)
+        self.depart = False         # 출발 가속 가정의 대상
+        self.danger = False         # 창 안에 위반이 있고 아직 다가오는 중
+        self.clear = False          # 전 표본이 해제 간격 밖
+        self.s_x = None             # 예측 궤적이 ego 회랑에 처음 드는 경로 s (객체 앞단)
+        self.t_x = None             # 그 시각 [s]
+        self.a_dep = 0.0
+        self.w = 0.0                # 요레이트 [rad/s]
+        self.ext = 0.0              # 객체의 경로 방향 반길이 (지금 헤딩)
 
 
 class TtcPolicy:
@@ -238,13 +317,15 @@ class TtcPolicy:
     트랙·래치는 월드 좌표라 경로와 무관하다. 경로가 바뀌면 rebind(path)만 한다.
     """
 
-    def __init__(self, path, *, d_crit: float = D_CRIT,
+    def __init__(self, path, *, gap_crit: float = GAP_CRIT,
                  front_overhang: float = FRONT_OVERHANG,
-                 finish_zone: float = FINISH_ZONE_M, on_event=None):
+                 finish_zone: float = FINISH_ZONE_M, on_event=None,
+                 use_ctrv: bool = True):
         self.path = path
-        self.d_crit = d_crit
+        self.gap_crit = gap_crit
         self.front = front_overhang
         self.finish_zone = finish_zone
+        self.use_ctrv = use_ctrv
         self._gate_s = gate_s(path, finish_zone)
         self._on_event = on_event or (lambda kind, detail: None)
         self.reset()
@@ -254,6 +335,20 @@ class TtcPolicy:
         """리스폰 시. 위치가 강제로 옮겨졌으므로 트랙·래치를 전부 버린다."""
         self._tracks: dict = {}
         self._acts: dict = {}       # id -> _Act
+        self._yielding = False
+        self._hold_reset()
+        self._hold_rearm = None     # 상한 출발 뒤 다시 잡기 시작할 시각
+        self._last_t = None
+
+    def _hold_reset(self) -> None:
+        self._hold_on = False       # 정지 중 위험으로 출발을 막고 있다
+        self._hold_enter = 0
+        self._hold_since = None     # 상한 계산용 (양보 중에는 밀린다)
+        self._hold_t0 = None        # 실제로 잡기 시작한 시각 (기록용)
+        self._hold_clear = None     # 무위험이 시작된 시각
+        self._hold_to = False       # 상한을 넘겼다
+        self._hold_far = None       # hold 중 본 가장 먼 충돌 지점의 경로 s
+        self._hold_best = 0.0       # hold 중 본 가장 긴 틈 [s] (가장 이른 위험까지)
 
     def rebind(self, path) -> None:
         """경로 교체 후. 트랙과 래치는 월드 좌표라 그대로 둔다."""
@@ -270,12 +365,13 @@ class TtcPolicy:
                 tr = None               # id 재사용. obstacles가 이벤트를 낸다
                 self._acts.pop(o.id, None)
             if tr is None:
-                self._tracks[o.id] = _Tr(o.id, o.x, o.y)
+                self._tracks[o.id] = _Tr(o.id, o.x, o.y, o.heading)
                 continue
             tr.x, tr.y = o.x, o.y
             tr.n_seen += 1
             tr.missing = 0
             tr.trusted = tr.n_seen >= OB.TRUST_FRAMES
+            tr.hist.push(o.heading)
         for oid in [k for k in self._tracks if k not in seen]:
             tr = self._tracks[oid]
             tr.missing += 1
@@ -285,7 +381,13 @@ class TtcPolicy:
     # -- 본체 -----------------------------------------------------------
     def update(self, idx: int, s_ego: float, v: float,
                ego_x: float, ego_y: float, ego_heading: float,
-               objects, t: float) -> TtcCmd:
+               objects, t: float, yielding: bool = False) -> TtcCmd:
+        """yielding은 교차로 진입 양보 중(junction_yield)이다. 그동안은 정지 상한
+        (TTC_MAX_HOLD_S / HOLD_MAX_S)을 세지 않는다 -- 교차 차량을 기다리는 중에
+        완화하면 그 차들 사이로 기어 들어간다."""
+        self._yielding = yielding
+        dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
+        self._last_t = t
         self._update_tracks(objects)
         cmd = TtcCmd()
         path = self.path
@@ -294,23 +396,97 @@ class TtcPolicy:
                                       ego_x, ego_y)
         if abs(lat_e) > OFF_MAX_M:
             self._acts.clear()
+            self._hold_reset()
             cmd.reason = '경로 밖'
             return cmd
         if v < EGO_MIN_V:
-            # 정지 상태. 예측할 상대 운동이 없다. stop 래치만 "그 객체가 아직
-            # 코앞에 있는가"로 유지하고(안 그러면 서다 가다 톱니가 난다) 나머지는
-            # 버린다. 서 있는 객체의 본 담당은 obstacles다
-            return self._hold(cmd, idx, s_e, ego_heading, objects, t)
-        s_c = s_e + EGO_CENTER_M            # 차체 중심
+            # 정지 상태. 서 있는 객체는 obstacles가 맡으므로 stop 래치만 "그 객체가
+            # 아직 코앞에 있는가"로 유지한다. **가로지르거나 다가오는 이동 객체는
+            # "지금 출발하면 부딪히는가"로 계속 본다** ― 9/12 본대회에서 정지할
+            # 때마다 판정이 꺼져 교차 차량 행렬 속으로 재출발했다
+            cmd = self._hold(cmd, idx, s_e, ego_heading, objects, t)
+            return self._depart(cmd, idx, s_e, lat_e, ego_x, ego_y, ego_heading,
+                                objects, t, dt)
+        self._hold_reset()
+        # 출발 직후(저속)에는 가로지르는 상대에 한해 가속을 가정한다. 상한으로
+        # 출발한 직후(rearm)에는 넣지 않는다 -- 넣으면 다시 서서 교착이 된다
+        if self._hold_rearm is not None and t >= self._hold_rearm:
+            self._hold_rearm = None
+        a_dep = (DEPART_ACCEL if v < V_DEPART and self._hold_rearm is None
+                 else 0.0)
+        cands, best_log = self._scan(idx, s_e, lat_e, v, a_dep, ego_x, ego_y,
+                                     ego_heading, objects, False)
+        return self._decide(cmd, cands, best_log, s_e, v, t)
 
+    def _traj(self, o, w: float, s_o: float, i_lo: int, i_hi: int,
+              n: int = N_SAMPLES) -> list:
+        """등회전 예측 점열을 경로 좌표계로. [(s, lat, 헤딩 - 경로 방위)].
+
+        표본마다 전 창을 투영하면 비싸다. 직전 표본의 자리 둘레만 본다 ―
+        0.2초에 움직이는 거리는 몇 m다.
+        """
+        path = self.path
+        pts, sarr = path.pts, path.s
+        top = max(i_lo + 1, min(i_hi, len(pts) - 1))
+        i = max(i_lo, min(top, bisect.bisect_right(sarr, s_o) - 1))
+        out = []
+        for k in range(n + 1):
+            x, y, h = ctrv.point(o.x, o.y, o.heading, o.speed, w, k * TAU_STEP)
+            best, bi = None, i
+            for j in range(max(i_lo, i - TRAJ_SPAN), min(top, i + TRAJ_SPAN) + 1):
+                px, py = pts[j]
+                d2 = (px - x) * (px - x) + (py - y) * (py - y)
+                if best is None or d2 < best:
+                    best, bi = d2, j
+            s, lat, th = _proj(path, max(i_lo, bi - 1), min(top, bi + 1), x, y)
+            out.append((s, lat, _wrap(h - th)))
+            i = bi
+        return out
+
+    def _scan(self, idx: int, s_e: float, lat_e: float, v: float, a_dep: float,
+              ego_x: float, ego_y: float, ego_heading: float, objects,
+              depart_only: bool, n: int = N_SAMPLES) -> tuple:
+        """후보를 뽑는다. (id -> _Cand, 로깅용 가장 이른 후보).
+
+        n은 표본 수(시간창 = n x TAU_STEP). 정지 중 hold만 T_WARN보다 길게 본다 ―
+        그때 ego의 출발 가속은 V_PASS에서 포화시킨다.
+
+        a_dep(출발 가속 가정)은 가로지르거나 다가오는 **이동** 객체에만 쓴다.
+        depart_only면 정지 중이라 그런 객체만 본다 (정지 객체·같은 방향 앞차는
+        _hold의 몫).
+        """
+        path = self.path
+        s_c = s_e + EGO_CENTER_M            # 차체 중심
         ch, sh = math.cos(ego_heading), math.sin(ego_heading)
-        horizon = v * T_WARN + PREFILTER_M
+        t_win = n * TAU_STEP
+        long_win = n > N_SAMPLES
+        t_cap = (max(0.0, V_PASS - v) / a_dep) if (long_win and a_dep > 0.0) \
+            else float('inf')
+
+        def dep(tau):
+            if tau <= t_cap:
+                return v * tau + 0.5 * a_dep * tau * tau
+            return (v * t_cap + 0.5 * a_dep * t_cap * t_cap
+                    + max(v, V_PASS) * (tau - t_cap))
+
+        horizon = v * t_win + PREFILTER_M
+        if a_dep > 0.0:
+            horizon = dep(t_win) + PREFILTER_M
         i_lo, i_hi = OB._window(path, idx, BEHIND_M + 3.0, horizon)
-        cands = {}          # id -> (o, cls, t_cpa, d_cpa, s_o, lat_o, v_lead, crit)
-        best_log = None     # 로깅용 최소 t_cpa 후보 (활성 아니어도)
+        # ego 예측. 등속 / 출발 가속 두 벌을 프레임당 한 번만 만든다
+        ego_cv, ego_dep = [], []
+        for k in range(n + 1):
+            tau = k * TAU_STEP
+            wd = 1.0 - tau / OFF_DECAY_S
+            el = lat_e * wd if wd > 0.0 else 0.0
+            ego_cv.append((s_c + v * tau, el))
+            ego_dep.append((s_c + dep(tau), el))
+        base = self.gap_crit
+        cands = {}
+        best_log = None
         for o in objects:
             dx, dy = o.x - ego_x, o.y - ego_y
-            if math.hypot(dx, dy) > horizon + abs(o.speed) * T_WARN:
+            if math.hypot(dx, dy) > horizon + abs(o.speed) * t_win:
                 continue
             tr = self._tracks.get(o.id)
             if tr is None or not tr.trusted:
@@ -318,43 +494,142 @@ class TtcPolicy:
             if dx * ch + dy * sh < -BEHIND_M:
                 continue
             cls = OB.classify(o)
-            s_o, lat_o, th_p = OB._project(path, i_lo, i_hi, o.x, o.y)
+            s_o, lat_o, th_p = _proj(path, i_lo, i_hi, o.x, o.y)
             if cls == OB.OBSTACLE and s_o >= self._gate_s:
                 continue            # 종료 라바콘. obstacles와 같은 기준
             if abs(lat_o) > LAT_MAX_M:
                 continue            # 다른 도로
             if s_o >= path.length - 1.0:
                 continue            # 경로 끝 너머 -- 마지막 점에 붙어 유령이 된다
-            crit = self.d_crit
-            if abs(o.speed) < STATIONARY_MS and cls == OB.VEHICLE:
-                crit = min(crit, OB.VEH_LANE_M)     # obstacles가 무시하면 우리도
+            moving = abs(o.speed) >= STATIONARY_MS
+            if not moving and cls == OB.VEHICLE and abs(lat_o) >= OB.VEH_LANE_M:
+                continue            # obstacles가 무시하는 주차 차량은 우리도 무시
             dh = _wrap(o.heading - th_p)
             cos_dh = math.cos(dh)
-            # 가로지르는 차는 중심 거리로 재면 안 된다 -- 차체 길이(4.4m)가 옆으로
-            # 놓여 있다. 헤딩 차만큼 반길이를 임계에 더한다 (직각이면 +2.2m).
-            # sim에서 교차 차량이 0.38m 스쳐 지나갔다
-            crit += 0.5 * o.length * abs(math.sin(dh))
-            if cos_dh < ONCOMING_COS and abs(lat_o) >= crit:
-                continue            # 제 차로로 마주오는 차
+            # 등회전은 차량에만 쓴다. 보행자의 헤딩은 걸음마다 흔들린다
+            w = (tr.hist.rate(o.speed)
+                 if (self.use_ctrv and moving and cls == OB.VEHICLE) else 0.0)
             v_along = o.speed * cos_dh
             v_lat = o.speed * math.sin(dh)
+            if w != 0.0:
+                # 굽은 도로를 따라 도는 차는 회전 차량이 아니다. 경로 좌표계 외삽이
+                # 이미 곡률을 따라간다 ― 거기에 등회전까지 얹으면 굽은 길의 대향차가
+                # 우리 차로로 꺾어 들어온다고 계산된다 (sim rg2_pt2_oncoming).
+                # 같은 길을 가는 차의 요레이트는 (경로 방향 속도) x (경로 곡률)이다
+                w_road = v_along * _road_kappa(path, s_o)
+                if abs(w - w_road) <= ROAD_YAW_TOL + ROAD_YAW_FRAC * abs(w_road):
+                    w = 0.0
+            if cos_dh < ONCOMING_COS and w == 0.0 \
+                    and abs(lat_o) >= ONCOMING_LAT_M:
+                continue            # 제 차로로 마주오는 차
+            # 같은 방향으로 나란히 가거나 멀어지는 것, 서 있는 것은 출발 가정의
+            # 대상이 아니다
+            depart = moving and (abs(dh) >= MERGE_RAD or w != 0.0
+                                 or lat_o * v_lat < 0.0)
+            if depart_only and not depart:
+                continue
+            # 교차·회전 상대. 마주오는 차(120도 이상)는 제 차로를 따라오는 것이라
+            # 교차가 아니다
+            crossing = moving and (w != 0.0 or (abs(dh) >= MERGE_RAD
+                                                and cos_dh >= ONCOMING_COS))
             settle = abs(dh) < MERGE_RAD and lat_o * v_lat < 0.0
-            t_cpa, d_cpa, k = _cpa(s_c, lat_e, v, s_o, lat_o, v_along, v_lat,
-                                   settle)
-            if k == 0:
-                continue            # 지금이 최근접 = 멀어지는 중
-            cands[o.id] = (o, cls, t_cpa, d_cpa, s_o, lat_o, max(0.0, v_along),
-                           crit)
-            if best_log is None or t_cpa < best_log[2]:
-                best_log = cands[o.id]
+            ego = ego_dep if (depart and a_dep > 0.0) else ego_cv
+            traj = self._traj(o, w, s_o, i_lo, i_hi, n) if w != 0.0 else None
+            hl, hw = 0.5 * o.length, 0.5 * o.width
+            c0, s0 = abs(cos_dh), abs(math.sin(dh))
+            ext_now = hl * c0 + hw * s0
+            # 객체 궤적 (경로 좌표계 위치 + 그 헤딩의 종/횡 반폭). ego 속도와 무관
+            sign = 1.0 if lat_o >= 0.0 else -1.0
+            obj = []
+            s_x = t_x = None
+            for k in range(n + 1):
+                tau = k * TAU_STEP
+                if traj is None:
+                    os_ = s_o + v_along * tau
+                    ol = lat_o + v_lat * tau
+                    if settle and ol * sign < 0.0:
+                        ol = 0.0
+                    ext_lon, ext_lat = ext_now, hl * s0 + hw * c0
+                else:
+                    os_, ol, dhk = traj[k]
+                    ck, sk = abs(math.cos(dhk)), abs(math.sin(dhk))
+                    ext_lon = hl * ck + hw * sk
+                    ext_lat = hl * sk + hw * ck
+                obj.append((os_, ol, ext_lon, ext_lat))
+                if crossing and s_x is None and os_ - ext_lon > s_e - REAR_M \
+                        and abs(ol) < EGO_HALF_W + ext_lat + CORR_MARGIN_M:
+                    s_x, t_x = os_ - ext_lon, tau
+            (k_first, m_before, m_first, k_min, m_min, g_at,
+             k_near) = _sweep(ego, obj, base, crossing)
+            # 활성 래치는 **위험이던 때의 속도로 돌아가도 안전한가**로 해제를 본다.
+            # 지금 속도만 보면 감속 -> 위반이 창 밖 -> 해제 -> 재가속 -> 다시 위험의
+            # 톱니가 난다
+            act = self._acts.get(o.id)
+            ref_clear = True
+            if act is not None and act.active and act.v_ref > v + REF_MARGIN_MS:
+                ego_ref = [(s_c + act.v_ref * k * TAU_STEP, ego[k][1])
+                           for k in range(n + 1)]
+                r = _sweep(ego_ref, obj, base, crossing)
+                ref_clear = r[4] >= GAP_EXIT_ADD or r[6] == 0
+                if k_near == 0 and r[6] != 0:
+                    k_near, k_first = r[6], -1      # 후보로 남기되 위험은 아니다
+            if k_near == 0:
+                continue            # 중심 거리가 지금 최소 = 멀어지는 중
+            c = _Cand(o, cls)
+            c.s_o, c.lat_o = s_o, lat_o
+            c.crossing, c.depart, c.w = crossing, depart, w
+            c.a_dep = a_dep if (depart and a_dep > 0.0) else 0.0
+            c.v_lead = 0.0 if crossing else max(0.0, v_along)
+            c.gap = g_at
+            c.clear = m_min >= GAP_EXIT_ADD and ref_clear
+            c.s_x, c.t_x = s_x, t_x
+            c.ext = ext_now
+            if k_first >= 0:
+                c.danger = True
+                if k_first == 0:
+                    c.t = 0.0
+                else:
+                    # 표본 사이에서 여유가 0을 지나는 시각 (선형 보간)
+                    den = m_before - m_first
+                    frac = m_before / den if den > 1e-9 else 1.0
+                    c.t = (k_first - 1 + max(0.0, min(1.0, frac))) * TAU_STEP
+            else:
+                c.t = k_min * TAU_STEP
+            cands[o.id] = c
+            if c.danger and (best_log is None or not best_log.danger
+                             or c.t < best_log.t):
+                best_log = c
+            elif best_log is None or (not best_log.danger and c.gap < best_log.gap):
+                best_log = c
+        return cands, best_log
 
+    def _avail(self, c: '_Cand', s_e: float, v: float) -> float:
+        """후륜축이 더 갈 수 있는 거리.
+
+        교차·회전 상대는 **예측 궤적이 ego 회랑에 처음 드는 자리** 앞에 선다.
+        객체의 지금 종거리로 재면 옆에서 꺾여 들어오는 상대에 여유가 크게 잡혀
+        그 궤적 안까지 들어간다 (9/12 본대회). 앞차 추종은 예전 그대로
+        앞차 뒤범퍼 MIN_GAP 앞이다.
+        """
+        o = c.o
+        if c.crossing and c.s_x is not None:
+            return c.s_x - self.front - CROSS_MARGIN_M - s_e
+        half_l = c.ext
+        avail_now = (c.s_o - half_l) - (s_e + self.front) - MIN_GAP
+        travel = v * c.t + 0.5 * c.a_dep * c.t * c.t
+        avail_hit = travel + self.gap_crit - MIN_GAP
+        return min(avail_now, avail_hit)
+
+    def _decide(self, cmd: TtcCmd, cands: dict, best_log, s_e: float, v: float,
+                t: float) -> TtcCmd:
+        """주행 중. 후보로 래치를 갱신하고 상한을 낸다."""
         # 래치 갱신. 해제는 "후보에서 빠졌거나 확실히 벗어난 채 RELEASE_FRAMES
-        # 지속"이다 ― 제동으로 t_cpa가 늘어난 것이나 한 프레임 닫힘이 멈춘 것으로
-        # 풀면 핑퐁이 난다
+        # 지속"이다 ― 제동으로 위반이 창 밖으로 밀린 것이나 한 프레임 닫힘이 멈춘
+        # 것으로 풀면 핑퐁이 난다
         for oid in list(self._acts):
             a = self._acts[oid]
             c = cands.get(oid)
-            if c is None or c[3] >= c[7] * EXIT_RATIO or c[2] > T_RELEASE:
+            if c is None or c.clear:
                 if not a.active:
                     del self._acts[oid]     # 확인 중이었는데 빠졌다
                     continue
@@ -364,33 +639,49 @@ class TtcPolicy:
                 continue
             a.miss = 0
         for oid, c in cands.items():
-            if c[3] < c[7] and 0.0 < c[2] <= T_WARN:
+            if c.danger:
                 a = self._acts.get(oid)
                 if a is None:
                     a = self._acts[oid] = _Act(oid)
                 a.enter += 1
+                if v > a.v_ref:
+                    a.v_ref = v
 
-        # 활성 객체마다 상한을 내고 min(). 유예 중(miss>0)인 것은 **마지막
-        # 상한을 유지한다** ― 풀어 버리면 재가속 -> 다시 위험 -> 제동의 토글이 난다
+        # 활성 객체마다 상한을 내고 min(). 유예 중(miss>0)이거나 위반이 창 밖으로
+        # 밀린 것은 **마지막 상한을 유지한다** ― 풀어 버리면 재가속 -> 다시 위험 ->
+        # 제동의 토글이 난다
         worst = None
         for oid, a in self._acts.items():
             if not a.active:
                 continue
-            if a.miss > 0:
-                if a.last is not None:
-                    v_lim, a_lim, t_cpa, d_cpa, cls, sa = a.last
-                    key = (v_lim, t_cpa)
-                    if worst is None or key < worst[0]:
-                        worst = (key, oid, cls, t_cpa, d_cpa, a.level, v_lim,
-                                 a_lim, sa)
+            c = cands.get(oid)
+            if a.miss > 0 or c is None or not c.danger:
+                if a.last is None:
+                    continue
+                v_lim, a_lim, t_cpa, d_cpa, cls, sa = a.last
+                if c is not None and a.miss == 0 and not a.timed_out \
+                        and a.level in ('brake', 'stop'):
+                    # 위반이 창 밖으로 밀렸지만 아직 벗어나지 않았다. 마지막 상한을
+                    # 얼려 두면 앞차가 떠난 뒤에도 그 속도에 묶인다 -- 지금 기하로
+                    # 다시 낸다 (앞차면 추종 법칙, 교차 상대면 회랑 진입점 앞 정지)
+                    if c.crossing and c.s_x is not None:
+                        avail = c.s_x - self.front - CROSS_MARGIN_M - s_e
+                        v_lim, a_lim = _limit(avail, v, 0.0, 0.0)
+                    elif not c.crossing:
+                        avail = (c.s_o - c.ext) - (s_e + self.front) - MIN_GAP
+                        v_lim, a_lim = _limit(
+                            avail, v, c.v_lead,
+                            0.0 if a.level == 'stop' else V_FLOOR)
+                    sa = max(0.0, avail) if (c.crossing and c.s_x is not None) \
+                        or not c.crossing else sa
+                    a.last = (v_lim, a_lim, t_cpa, d_cpa, cls, sa)
+                key = (v_lim, t_cpa)
+                if worst is None or key < worst[0]:
+                    worst = (key, oid, cls, t_cpa, d_cpa, a.level, v_lim,
+                             a_lim, sa)
                 continue
-            o, cls, t_cpa, d_cpa, s_o, lat_o, v_lead, _crit = cands[oid]
-            dh = _wrap(o.heading - ego_heading)
-            half_l = (0.5 * o.length * abs(math.cos(dh))
-                      + 0.5 * o.width * abs(math.sin(dh)))
-            avail_now = (s_o - half_l) - (s_e + self.front) - MIN_GAP
-            avail_cpa = v * t_cpa - (self.front - EGO_CENTER_M) - half_l - MIN_GAP
-            avail = min(avail_now, avail_cpa)
+            o, cls, t_cpa, d_cpa = c.o, c.cls, c.t, c.gap
+            avail = self._avail(c, s_e, v)
             if t_cpa <= T_IMMINENT:
                 level = 'stop'
             elif t_cpa <= T_CRIT:
@@ -399,16 +690,27 @@ class TtcPolicy:
                 level = 'warn'
             if LEVELS[level] < LEVELS[a.level]:
                 level = a.level         # 활성 중에는 내려가지 않는다
+            # 교차·회전 상대에는 하한이 없다. 10km/h로 기어 들어가는 자리가 바로
+            # 상대의 궤적이다. 앞차 추종의 하한은 그대로 둔다
+            floor = 0.0 if c.crossing else V_FLOOR
             if level == 'stop':
                 v_lim, a_lim = _limit(avail, v, 0.0, 0.0)
             elif level == 'brake':
-                v_lim, a_lim = _limit(avail, v, v_lead, V_FLOOR)
+                v_lim, a_lim = _limit(avail, v, c.v_lead, floor)
             else:
                 if a.level != 'warn':
                     a.v_entry = v
-                v_lim = max(WARN_FRAC * a.v_entry, V_FLOOR)
-                a_lim = float('inf')
-            effective = v_lim < v - ACT_MARGIN_MS
+                if c.crossing:
+                    pv, pa = _limit(avail, v, 0.0, 0.0)
+                    v_lim = min(WARN_FRAC * a.v_entry, pv)
+                    a_lim = pa if pv <= WARN_FRAC * a.v_entry else float('inf')
+                else:
+                    v_lim = max(WARN_FRAC * a.v_entry, V_FLOOR)
+                    a_lim = float('inf')
+            # 상한이 속도 아래이거나 감속 피드포워드가 걸려 있으면 실제 제한이다.
+            # 피드포워드가 속도를 프로파일에 붙여 끌고 내려오면 v_lim과 v의 차가
+            # 끝까지 ACT_MARGIN_MS를 안 넘는다 (45 -> 16km/h로 줄이고도 이벤트 0)
+            effective = v_lim < v - ACT_MARGIN_MS or a_lim < -ACT_DECEL
             if level == 'stop' and v_lim <= 0.01:
                 if a.stop_since is None:
                     a.stop_since = t
@@ -419,7 +721,7 @@ class TtcPolicy:
             if not a.timed_out and (
                     level in ('brake', 'stop')
                     or (abs(o.speed) < STATIONARY_MS
-                        and abs(lat_o) <= OB.VEH_LANE_M)):
+                        and abs(c.lat_o) <= OB.VEH_LANE_M)):
                 sa = max(0.0, avail)
             if a.timed_out:
                 v_lim, a_lim = _limit(avail, v, V_FLOOR, V_FLOOR)
@@ -431,9 +733,11 @@ class TtcPolicy:
                     self._on_event(
                         f'ttc_{level}',
                         f'id={oid} {cls} t_cpa={t_cpa:.1f}s d_cpa={d_cpa:.2f}m '
-                        f'앞 {s_o - s_e:.1f}m lat={lat_o:+.1f}m '
+                        f'앞 {c.s_o - s_e:.1f}m lat={c.lat_o:+.1f}m '
                         f'v_obj={o.speed * 3.6:.0f}km/h '
-                        f'v {v * 3.6:.1f} -> <={v_lim * 3.6:.1f}km/h')
+                        + (f'회전 {c.w:+.2f}rad/s ' if c.w else '')
+                        + (f'교차 정지여유 {avail:.1f}m ' if c.crossing else '')
+                        + f'v {v * 3.6:.1f} -> <={v_lim * 3.6:.1f}km/h')
                     a.announced = True
                     a.told = level
             a.level = level
@@ -448,11 +752,10 @@ class TtcPolicy:
             cmd.stop_avail = sa
             cmd.action, cmd.kind, cmd.obj_id = shown, cls, oid
             cmd.t_cpa, cmd.d_cpa = t_cpa, d_cpa
-            cmd.reason = f'{cls} id={oid} t_cpa={t_cpa:.1f}s d_cpa={d_cpa:.1f}m'
+            cmd.reason = f'{cls} id={oid} t={t_cpa:.1f}s 간격={d_cpa:.1f}m'
         elif best_log is not None:
-            o, cls, t_cpa, d_cpa = best_log[:4]
-            cmd.kind, cmd.obj_id = cls, o.id
-            cmd.t_cpa, cmd.d_cpa = t_cpa, d_cpa
+            cmd.kind, cmd.obj_id = best_log.cls, best_log.o.id
+            cmd.t_cpa, cmd.d_cpa = best_log.t, best_log.gap
         return cmd
 
     def _hold(self, cmd: TtcCmd, idx: int, s_e: float, ego_heading: float,
@@ -467,12 +770,18 @@ class TtcPolicy:
             o = by_id.get(oid)
             if o is None:
                 continue
-            s_o, lat_o, _th = OB._project(self.path, i_lo, i_hi, o.x, o.y)
+            s_o, lat_o, _th = _proj(self.path, i_lo, i_hi, o.x, o.y)
             dh = _wrap(o.heading - ego_heading)
             half_l = (0.5 * o.length * abs(math.cos(dh))
                       + 0.5 * o.width * abs(math.sin(dh)))
             gap = (s_o - half_l) - (s_e + self.front)
-            if abs(lat_o) >= self.d_crit * EXIT_RATIO or gap > MIN_GAP + HOLD_EXTRA_M \
+            # 정지 차량은 _scan과 같은 기준(obstacles의 차로폭)으로 놓는다. 우회로
+            # 경로가 바뀌면 막던 차가 횡 3m 옆이 되는데, 넓은 기준으로 잡고 있으면
+            # 우회 출발이 정지 상한(10s)까지 묶인다 (sim rgj_pt2_many6)
+            lat_max = (OB.VEH_LANE_M
+                       if (abs(o.speed) < STATIONARY_MS
+                           and OB.classify(o) == OB.VEHICLE) else HOLD_LAT_M)
+            if abs(lat_o) >= lat_max or gap > MIN_GAP + HOLD_EXTRA_M \
                     or gap < -half_l:
                 continue
             keep.add(oid)
@@ -493,9 +802,114 @@ class TtcPolicy:
                 self._release(oid)
         return cmd
 
+    def _depart(self, cmd: TtcCmd, idx: int, s_e: float, lat_e: float,
+                ego_x: float, ego_y: float, ego_heading: float, objects,
+                t: float, dt: float) -> TtcCmd:
+        """정지 중. 1.5m/s²로 출발한다고 보고 위험이면 출발을 막는다(hold).
+
+        래치는 객체가 아니라 **정책에** 건다. 행렬이 지나가는 동안 대상 id가
+        계속 바뀌는데 객체마다 걸면 차 사이마다 풀린다. 무위험이
+        HOLD_CLEAR_S 이어져야 해제한다.
+
+        **hold가 걸린 뒤의 시간창은 T_WARN(4s)이 아니라 ego가 충돌 지점을 빠져나가는
+        시간 기준이다** (junction_yield와 같은 ctrv.horizon). 4s로는 4.9s 간격 행렬의
+        차 사이마다 "무위험 2s"가 성립해 풀렸다 다시 걸렸다. 교차로를 모르므로
+        통과 거리는 hold 중 본 가장 먼 충돌 지점(회랑 진입점 + 상대 차체)으로 잰다.
+        진입 판정은 4s 그대로다.
+        """
+        n = N_SAMPLES
+        tc = 0.0
+        if self._hold_on and self._hold_far is not None:
+            tc = ctrv.t_clear(0.0, max(0.0, self._hold_far + REAR_M - s_e),
+                              V_PASS, DEPART_ACCEL)
+            n = max(N_SAMPLES, int(round(ctrv.horizon(tc) / TAU_STEP)))
+        cands, _log = self._scan(idx, s_e, lat_e, 0.0, DEPART_ACCEL, ego_x,
+                                 ego_y, ego_heading, objects, True, n)
+        danger = sorted(((c.t, oid) for oid, c in cands.items() if c.danger))
+        if self._hold_on and self._hold_far is not None:
+            # 걸린 뒤에는 junction_yield와 같은 잣대다: 시간창 안에 그 충돌 지점으로
+            # 들어오는 교차 상대가 하나라도 있으면 위협이다. "우리가 지나간 뒤에
+            # 온다"는 계산(간격 훑기)에 기대면 통과 시간의 여유(1.5s)가 없다
+            seen = {oid for _t, oid in danger}
+            danger = sorted(danger + [
+                (c.t_x, oid) for oid, c in cands.items()
+                if oid not in seen and c.crossing and c.s_x is not None
+                and c.s_x <= self._hold_far])
+        for _t, oid in danger:
+            c = cands[oid]
+            if not c.danger:
+                continue
+            far = (c.s_x if c.s_x is not None else c.s_o - c.ext) + 2.0 * c.ext
+            if self._hold_far is None or far > self._hold_far:
+                self._hold_far = far
+        if danger and danger[0][0] > self._hold_best:
+            self._hold_best = danger[0][0]
+        # 상한 뒤 출발에 필요한 틈. 통과 시간만큼 비면 좋지만, 행렬 간격이 그보다
+        # 짧으면 영영 못 간다 ― 그때는 본 것 중 가장 긴 틈의 80%로 낮춘다
+        need_gap = max(HOLD_GAP_S, min(tc, 0.8 * self._hold_best))
+        if self._hold_rearm is not None and t >= self._hold_rearm:
+            self._hold_rearm = None
+        if not self._hold_on:
+            self._hold_enter = self._hold_enter + 1 if danger else 0
+            if self._hold_enter < ENTER_FRAMES or self._hold_rearm is not None:
+                return cmd
+            self._hold_on = True
+            self._hold_since = self._hold_t0 = t
+            self._hold_clear = None
+            self._hold_to = False
+            c = cands[danger[0][1]]
+            self._on_event(
+                'ttc_hold',
+                f'id={c.o.id} {c.cls} 정지 중 ― 지금 출발하면 t_cpa={c.t:.1f}s '
+                f'd_cpa={c.gap:.2f}m (앞 {c.s_o - s_e:.1f}m lat={c.lat_o:+.1f}m '
+                f'v_obj={c.o.speed * 3.6:.0f}km/h'
+                + (f' 회전 {c.w:+.2f}rad/s' if c.w else '')
+                + f', 위험 {len(danger)}대) ― 출발 보류')
+        if danger:
+            self._hold_clear = None
+        else:
+            if self._hold_clear is None:
+                self._hold_clear = t
+            if t - self._hold_clear >= HOLD_CLEAR_S:
+                self._on_event('ttc_hold_clear',
+                               f'시간창 {n * TAU_STEP:.1f}s 안 무위험 '
+                               f'{HOLD_CLEAR_S:.0f}s ― 정지 '
+                               f'{t - self._hold_t0:.1f}s 뒤 출발')
+                self._hold_reset()
+                return cmd
+        if self._yielding:
+            self._hold_since += dt      # 교차로 양보 중에는 상한을 세지 않는다
+        elif t - self._hold_since > HOLD_MAX_S:
+            if not self._hold_to:
+                self._hold_to = True
+                self._on_event(
+                    'ttc_hold_timeout',
+                    f'정지 유지 {HOLD_MAX_S:.0f}s 초과 ― 가장 이른 위험까지 '
+                    f'{need_gap:.1f}s 이상 비면 출발한다')
+            if danger and danger[0][0] >= need_gap:
+                self._on_event('ttc_hold_clear',
+                               f'상한 뒤 틈 {danger[0][0]:.1f}s ― 출발')
+                self._hold_reset()
+                self._hold_rearm = t + HOLD_REARM_S
+                return cmd
+        cmd.v_limit = 0.0
+        cmd.action = 'hold'
+        cmd.stop_avail = 0.0
+        if danger:
+            c = cands[danger[0][1]]
+            cmd.kind, cmd.obj_id = c.cls, c.o.id
+            cmd.t_cpa, cmd.d_cpa = danger[0][0], c.gap
+            cmd.reason = f'출발 보류 ― {c.cls} id={c.o.id} t={danger[0][0]:.1f}s'
+        else:
+            cmd.reason = f'출발 보류 ― 무위험 {t - self._hold_clear:.1f}s'
+        return cmd
+
     def _check_timeout(self, a: '_Act', cls: str, t: float,
                        t_cpa: float, d_cpa: float) -> None:
         if a.timed_out or a.stop_since is None:
+            return
+        if self._yielding:
+            a.stop_since = t        # 양보 중에는 세지 않는다
             return
         if t - a.stop_since > TTC_MAX_HOLD_S:
             a.timed_out = True
@@ -513,14 +927,20 @@ class TtcPolicy:
 
 def summary(policy: TtcPolicy) -> list:
     return [
-        f'  예측: ego는 경로 위 s+v·τ, 객체는 경로 좌표계 (along, lat) 외삽. '
-        f'τ 0~{T_WARN:.0f}s {TAU_STEP:.1f}s 간격, 횡오프셋 {OFF_DECAY_S:.0f}s 수렴, '
-        f'경로 ±{math.degrees(MERGE_RAD):.0f}° 헤딩은 차로에 정착(끼어들기)',
-        f'  위험: d_cpa<{policy.d_crit:.1f}m (정지 차량은 {OB.VEH_LANE_M:.1f}m), '
-        f't_cpa<={T_WARN:.0f}s. warn>{T_CRIT:.0f}s ({WARN_FRAC:.0%}) / '
-        f'brake<={T_CRIT:.0f}s (하한 {V_FLOOR * 3.6:.0f}km/h) / stop<={T_IMMINENT:.0f}s',
+        f'  예측: ego는 경로 위 s+v·τ (저속·정지 중 교차 상대에는 '
+        f'{DEPART_ACCEL:.1f}m/s² 출발 가정), 객체는 경로 좌표계 (along, lat) 외삽, '
+        f'요레이트 {ctrv.YAW_MIN:.2f}rad/s 이상이면 등회전'
+        + ('' if policy.use_ctrv else ' (꺼짐)') + '. '
+        f'τ 0~{T_WARN:.0f}s {TAU_STEP:.1f}s 간격',
+        f'  위험: 풋프린트 간격<{policy.gap_crit:.1f}m (교차·회전 상대는 '
+        f'+{GAP_SLOPE:.2f}·τ, 정지 차량은 횡 {OB.VEH_LANE_M:.1f}m 안만). '
+        f'warn>{T_CRIT:.0f}s ({WARN_FRAC:.0%}) / '
+        f'brake<={T_CRIT:.0f}s (앞차 추종 하한 {V_FLOOR * 3.6:.0f}km/h, 교차는 하한 '
+        f'없음·정지점은 회랑 진입점 {CROSS_MARGIN_M:.0f}m 앞) / stop<={T_IMMINENT:.0f}s',
+        f'  정지 중: 교차 상대에 출발 보류(hold), 무위험 {HOLD_CLEAR_S:.0f}s 뒤 해제, '
+        f'상한 {HOLD_MAX_S:.0f}s',
         f'  게이트: trusted 트랙만, 뒤 {BEHIND_M:.0f}m 제외, 제 차로 대향차 제외, '
-        f'진입 {ENTER_FRAMES}프레임 / 해제 x{EXIT_RATIO:.1f}, '
+        f'진입 {ENTER_FRAMES}프레임 / 해제 +{GAP_EXIT_ADD:.1f}m, '
         f'stop {TTC_MAX_HOLD_S:.0f}s 뒤 완화',
     ]
 
@@ -779,11 +1199,122 @@ def _selftest() -> int:
     check('추월 후 끼어들기: 옆에서 달릴 때는 무반응', not early,
           f'{[(r[0], r[3]) for r in early[:3]]}')
 
-    # 8. ego 정지 -> none
+    # 8. ego 정지 + 정지 객체 -> none (서 있는 객체는 obstacles의 몫)
     pol = TtcPolicy(path)
-    for k in range(2):
+    for k in range(4):
         cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, [Fake(8, 3.0, 0.0, dims=CAR)], k * 0.05)
-    check('ego 정지: 무반응', cmd.action == 'none' and cmd.v_limit == float('inf'))
+    check('ego 정지 + 정지 객체: 무반응',
+          cmd.action == 'none' and cmd.v_limit == float('inf'))
+    # 8b. ego 정지 + 같은 방향 앞차 출발 -> none
+    pol = TtcPolicy(path)
+    for k in range(40):
+        cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0,
+                         [Fake(8, 9.0 + 2.0 * k * 0.05, 0.0, speed=2.0, dims=CAR)],
+                         k * 0.05)
+    check('ego 정지 + 출발하는 앞차: 무반응', cmd.action == 'none', f'{cmd}')
+    # 8c. ego 정지 + 앞을 가로지르는 차 -> hold, 지나간 뒤 2초에 해제
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+    seq = []
+    for k in range(200):
+        t = k * 0.05
+        y = -30.0 + 8.33 * t
+        objs = ([Fake(8, 10.0, y, speed=8.33, heading=math.pi / 2, dims=CAR)]
+                if y < 40.0 else [])
+        cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, objs, t)
+        seq.append((t, cmd.action, cmd.v_limit))
+    held = [r for r in seq if r[1] == 'hold']
+    check('ego 정지 + 교차 차량: hold', bool(held) and all(r[2] == 0.0 for r in held)
+          and 'ttc_hold' in ev, f'{len(held)}프레임 {",".join(ev)}')
+    # 해제 = "지금 출발해도 안 부딪힌다"가 2초 이어진 시점. 그때 실제로 출발시켜
+    # 풋프린트 간격을 잰다
+    t_rel = held[-1][0] + 0.05 if held else 0.0
+    gmin = float('inf')
+    for k in range(120):
+        tau = k * 0.05
+        ex = 0.5 * DEPART_ACCEL * tau * tau + EGO_CENTER_M
+        y = -30.0 + 8.33 * (t_rel + tau)
+        gmin = min(gmin, max(abs(10.0 - ex) - 0.905 - 2.4, abs(y) - 2.195 - 0.95))
+    check('ego 정지 + 교차 차량: 2s 이상 잡고, 해제 뒤 출발해도 간격 유지',
+          held and t_rel - held[0][0] >= HOLD_CLEAR_S and gmin > 0.5
+          and 'ttc_hold_clear' in ev,
+          f'hold {held[0][0] if held else 0:.2f}~{t_rel:.2f}s, 출발 시 최소 간격 {gmin:.2f}m')
+    # 8d. 행렬 5대 (3s 간격) -> id가 바뀌어도 hold가 끊기지 않는다
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+    seq = []
+    for k in range(500):
+        t = k * 0.05
+        objs = []
+        for i in range(5):
+            y = -30.0 + 8.33 * (t - 3.0 * i)
+            if -30.0 <= y < 40.0:
+                objs.append(Fake(80 + i, 10.0, y, speed=8.33,
+                                 heading=math.pi / 2, dims=CAR))
+        cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, objs, t)
+        seq.append((t, cmd.action, cmd.obj_id))
+    on = [r[0] for r in seq if r[1] == 'hold']
+    gaps = [b - a for a, b in zip(on, on[1:]) if b - a > 0.06]
+    ids = {r[2] for r in seq if r[1] == 'hold' and r[2] >= 0}
+    check('행렬 5대: hold가 id 교체에도 끊기지 않는다',
+          on and not gaps and len(ids) >= 4 and ev.count('ttc_hold') == 1,
+          f'hold {on[0] if on else 0:.1f}~{on[-1] if on else 0:.1f}s, 끊김 {len(gaps)}, '
+          f'id {sorted(ids)}, {",".join(ev)}')
+    # 8d2. 행렬 간격 4.9s (9/12 본대회) -> 차 사이에서 풀리지 않는다. 4s 고정
+    #      시간창이면 차 사이마다 "무위험 2s"가 성립했다. 간격 10s면 틈에 풀린다
+    for gap_s, want in ((4.9, 1), (10.0, 3)):
+        ev = []
+        pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+        t_last = 0.0
+        for k in range(1100):
+            t = k * 0.05
+            objs = []
+            for i in range(3 if gap_s > 5.0 else 5):
+                y = -30.0 + 8.33 * (t - gap_s * i)
+                if -30.0 <= y < 40.0:
+                    objs.append(Fake(80 + i, 10.0, y, speed=8.33,
+                                     heading=math.pi / 2, dims=CAR))
+                    if y < 5.0:
+                        t_last = t
+            pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, objs, t)
+        check(f'행렬 간격 {gap_s:.1f}s: ttc_hold_clear {want}회'
+              + (' (마지막 차 뒤에만)' if want == 1 else ' (틈마다)'),
+              ev.count('ttc_hold_clear') == want and ev.count('ttc_hold') == want,
+              ','.join(ev))
+    # 8e. 끝나지 않는 행렬 -> 상한 뒤 틈에서 출발
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+    seq = []
+    for k in range(900):
+        t = k * 0.05
+        objs = []
+        for i in range(16):
+            y = -30.0 + 8.33 * (t - 3.0 * i)
+            if -30.0 <= y < 40.0:
+                objs.append(Fake(80 + i, 10.0, y, speed=8.33,
+                                 heading=math.pi / 2, dims=CAR))
+        cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, objs, t)
+        seq.append((t, cmd.action))
+        if cmd.action != 'hold' and t > HOLD_MAX_S:
+            break
+    check('끝나지 않는 행렬: ttc_hold_timeout 뒤 틈 출발',
+          'ttc_hold_timeout' in ev and seq[-1][1] != 'hold'
+          and HOLD_MAX_S < seq[-1][0] < HOLD_MAX_S + 6.0,
+          f't={seq[-1][0]:.1f} {",".join(ev)}')
+    # 8f. 교차로 양보 중에는 상한을 세지 않는다
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+    for k in range(800):
+        t = k * 0.05
+        objs = []
+        for i in range(16):
+            y = -30.0 + 8.33 * (t - 3.0 * i)
+            if -30.0 <= y < 40.0:
+                objs.append(Fake(80 + i, 10.0, y, speed=8.33,
+                                 heading=math.pi / 2, dims=CAR))
+        cmd = pol.update(0, 0.0, 0.0, 0.0, 0.0, 0.0, objs, t, yielding=True)
+    check('양보 중: hold 상한 동결', 'ttc_hold_timeout' not in ev
+          and cmd.action == 'hold', f'{cmd.action} {",".join(ev)}')
 
     # 9. trusted 아닌 트랙(첫 프레임)은 제외, 2프레임부터 판정
     pol = TtcPolicy(path)
@@ -798,9 +1329,10 @@ def _selftest() -> int:
     ev = []
     pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
     def wobble(t, x):
-        lat = 2.4 if int(t / 0.1) % 2 == 0 else 2.6
-        return [Fake(10, x + 20.0, lat, speed=12.5 - 4.0, dims=CAR)]
-    log, _ = OB._drive(pol, path, wobble, n=200)
+        # 풋프린트 간격 0.45 / 0.65m ― 판정 간격(0.5) 양쪽을 오간다
+        lat = 2.3 if int(t / 0.1) % 2 == 0 else 2.5
+        return [Fake(10, 20.0 + 8.5 * t, lat, speed=8.5, dims=CAR)]
+    log, _ = OB._drive(pol, path, wobble, n=400)
     n_on = sum(1 for k in ev if k in ('ttc_warn', 'ttc_brake', 'ttc_stop'))
     check('히스테리시스: 점등 1회 이하', n_on <= 1, f'{ev}')
 
@@ -931,17 +1463,182 @@ def _selftest() -> int:
     check('stop_avail: 이동 객체(느린 앞차)의 warn은 nan',
           warns and all(r[3] != r[3] for r in warns), f'{len(warns)}프레임')
 
+    # 18. 회전 차량 (0.4rad/s) ― 등회전 예측은 직선 외삽보다 간격을 작게 본다.
+    #     9/12 본대회: 남하하던 차가 꺾어 우리 옆 대향 차로로 들어왔다
+    def turner(t, y_end):
+        w = -0.4
+        r = 8.33 / abs(w)
+        h = -math.pi / 2 + w * t
+        # 남쪽을 보고 (40, y_end + r)에서 출발해 우회전, (40 - r, y_end)에서 서쪽을 본다
+        cx, cy = 40.0 - r, y_end + r
+        return Fake(18, cx + r * math.cos(h + math.pi / 2),
+                    cy + r * math.sin(h + math.pi / 2), speed=8.33, heading=h,
+                    dims=CAR)
+    res = {}
+    for name, use in (('ctrv', True), ('line', False)):
+        pol = TtcPolicy(path, use_ctrv=use)
+        for k in range(8):
+            o = turner(k * 0.05, 2.0)
+            pol._update_tracks([o])
+        cands, _b = pol._scan(0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 0.0, [o], False)
+        res[name] = cands.get(18)
+    cc, cl = res['ctrv'], res['line']
+    check('회전 차량: 요레이트 추정 -0.4rad/s',
+          cc is not None and abs(cc.w + 0.4) < 0.03, f'{cc.w if cc else None}')
+    check('회전 차량: 등회전 예측 간격 < 직선 외삽 간격',
+          cc is not None and cc.danger
+          and (cl is None or (not cl.danger and cl.gap > cc.gap + 3.0)),
+          f'등회전 {cc.gap if cc else None:.2f}m 위험={cc.danger if cc else None}, '
+          f'직선 {"후보 아님" if cl is None else f"{cl.gap:.2f}m 위험={cl.danger}"}')
+    # 18b. 요레이트 튐 방어
+    hh = ctrv.HeadingHist()
+    for h in (0.0, 0.02, 0.04, 1.2):
+        hh.push(h)
+    check('요레이트: 헤딩 튐이면 이력을 버린다', hh.rate(8.0) == 0.0 and len(hh.h) == 1,
+          f'{hh.rate(8.0)} {hh.h}')
+    hh = ctrv.HeadingHist()
+    for k in range(6):
+        hh.push(0.5 + 0.001 * (-1) ** k)
+    check('요레이트: 잡음 수준이면 직선', hh.rate(8.0) == 0.0, f'{hh.rate(8.0)}')
+    hh = ctrv.HeadingHist()
+    for k in range(6):
+        hh.push(3.1 + 0.02 * k)         # pi를 넘어간다
+    check('요레이트: wrap을 넘어도 연속', abs(hh.rate(8.0) - 0.4) < 1e-6,
+          f'{hh.rate(8.0)}')
+
+    # 19. 교차 상대의 정지 목표 ― 회랑 진입점 앞에 서고 하한(10km/h)이 없다
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append((k, d)))
+    trace = []
+    def slow_cross(t, x):
+        lat = -12.0 + 3.0 * t
+        trace.append((t, x, lat))
+        return [Fake(19, 40.0, lat, speed=3.0, heading=math.pi / 2, dims=CAR)]
+    log, end = OB._drive(pol, path, slow_cross, n=400)
+    band = 0.95 + 2.195 + 0.5
+    inside = [r for r in trace if abs(r[2]) < band]
+    bmax = max(r[1] + FRONT_OVERHANG for r in inside)
+    check('교차 상대: 회랑 진입점 앞에 선다 (앞범퍼 <= 진입점)',
+          bmax <= 40.0 - 0.905 + 0.3, f'차가 회랑 안일 때 앞범퍼 최대 {bmax:.2f}m '
+          f'(진입점 {40.0 - 0.905:.2f})')
+    vmin = min(r[2] for r in log)
+    check('교차 상대: 하한 없음 (10km/h 아래로 내려간다)', vmin < V_FLOOR - 0.5,
+          f'최저 {vmin * 3.6:.1f}km/h')
+    check('교차 상대: 지나간 뒤 출발', end > 60.0, f'{end:.1f}m')
+    # 앞차 추종의 하한은 그대로다
+    pol = TtcPolicy(path)
+    log, _ = OB._drive(pol, path,
+                       lambda t, x: [Fake(19, 60.0 + 4.0 * t, 0.0, speed=4.0, dims=CAR)],
+                       n=120)
+    br = [r[6] for r in log if r[3] == 'brake']
+    check('앞차 추종: brake 하한 유지', not br or min(br) >= min(V_FLOOR, 4.0) - 1e-6,
+          f'{len(br)}프레임 최저 {min(br) * 3.6 if br else 0:.1f}km/h')
+
+    # 20. 판정 간격은 예측 시각에 비례한다 (교차만). 간격 1.2m가 τ=4s면 위험,
+    #     τ=0.4s면 아니다
+    BIKE = (2.0, 0.8, 1.5)
+    def probe(v_ego, x_obj, lat0, v_obj):
+        pol = TtcPolicy(path)
+        for k in range(3):
+            o = Fake(20, x_obj, lat0 + v_obj * 0.05 * (k - 2), speed=v_obj,
+                     heading=math.pi / 2, dims=BIKE)
+            pol._update_tracks([o])
+        cands, _b = pol._scan(0, 0.0, 0.0, v_ego, 0.0, 0.0, 0.0, 0.0, [o], False)
+        return cands.get(20)
+    far = probe(10.0, 1.4 + 40.0 + 2.4 + 0.4 + 1.2, -32.0, 8.0)
+    near = probe(2.0, 1.4 + 0.8 + 2.4 + 0.4 + 1.2, -3.2, 8.0)
+    check('판정 간격: τ=4s의 간격 1.2m는 위험',
+          far is not None and far.danger and far.t > 3.5,
+          f'{None if far is None else (far.danger, round(far.t, 2), round(far.gap, 2))}')
+    check('판정 간격: τ=0.4s의 간격 1.2m는 위험 아님',
+          near is None or not near.danger,
+          f'{None if near is None else (near.danger, round(near.t, 2), round(near.gap, 2))}')
+    # 21. 옆 차로 동행차 (간격 1.4m, 교차 아님) ― 전 구간 무반응
+    pol = TtcPolicy(path)
+    log, _ = OB._drive(pol, path,
+                       lambda t, x: [Fake(21, x + 6.0, 3.3, speed=12.5, dims=CAR)], n=200)
+    check('옆 차로 동행차(간격 1.4m): 무반응', acts(log) == {'none'},
+          f'{sorted(acts(log))}')
+    g = footprint_gap(10.0, 0.0, 0.0, 4.39, 1.81)
+    check('풋프린트 간격: 앞 10m 승용차 = 10 - 2.195 - 2.4',
+          abs(g - (10.0 - 2.195 - 2.4)) < 1e-9, f'{g:.3f}')
+
+    # 21b. 굽은 도로의 대향차 ― 도로를 따라 도는 것이지 회전 차량이 아니다
+    arc = _Arc(radius=60.0)
+    def onc_arc(t, s):
+        so = 110.0 - 12.5 * t
+        px, py = _point_at(arc, so)
+        qx, qy = _point_at(arc, so + 1.0)
+        th = math.atan2(qy - py, qx - px)
+        return [Fake(24, px - math.sin(th) * 3.5, py + math.cos(th) * 3.5,
+                     speed=12.5, heading=th + math.pi, dims=CAR)]
+    pol = TtcPolicy(arc)
+    log, _ = _drive_path(pol, arc, onc_arc, n=160)
+    check('곡선: 옆 차로 대향차 무반응 (요레이트가 도로 곡률과 같다)',
+          acts(log) == {'none'}, f'{sorted(acts(log))}')
+    check('도로 곡률: 반경 60m 좌회전 = +1/60',
+          abs(_road_kappa(arc, 50.0) - 1.0 / 60.0) < 1e-3,
+          f'{_road_kappa(arc, 50.0):.5f}')
+
+    # 22. 선분 끝에 걸린 투영 ― 창 끝 너머 40m의 객체가 "코앞"으로 찍히면 안 된다
+    s_p, lat_p, _t = _proj(path, 0, 10, 50.0, 1.0)
+    check('끝에 걸린 투영: 실제 거리를 횡거리로', abs(lat_p) > 35.0,
+          f's={s_p:.1f} lat={lat_p:.1f}')
+    s_p, lat_p, _t = _proj(path, 0, 60, 50.0, 1.0)
+    check('정상 투영: 그대로', abs(s_p - 50.0) < 1e-6 and abs(lat_p - 1.0) < 1e-6,
+          f's={s_p:.1f} lat={lat_p:.1f}')
+    # 23. 정지 유지 중 경로가 바뀌어 막던 차가 횡 3m 옆이 되면 곧바로 놓는다
+    ev = []
+    pol = TtcPolicy(path, on_event=lambda k, d: ev.append(k))
+    car = Fake(23, 60.0, 0.0, dims=CAR)
+    log, end = OB._drive(pol, path, lambda t, x: [car], n=200)
+    held = pol.update(int(end), end, 0.0, end, 0.0, 0.0, [car], 10.0)
+    side = Fake(23, 60.0, 3.0, dims=CAR)
+    for k in range(3):
+        moved = pol.update(int(end), end, 0.0, end, 0.0, 0.0, [side], 10.05 + 0.05 * k)
+    check('정지 유지: 횡 3m로 비켜난 정지 차량은 놓는다',
+          held.action == 'stop' and moved.action == 'none'
+          and moved.v_limit == float('inf'), f'{held.action} -> {moved.action}')
+
     # 17. 비용 ― 30객체 최악에서 프레임당 2ms 미만
     pol = TtcPolicy(path)
     many = [Fake(100 + k, 20.0 + 2.0 * k, (-1) ** k * 3.0, speed=5.0,
                  heading=0.3, dims=CAR) for k in range(30)]
     for k in range(3):
         pol.update(0, 0.0, 12.5, 0.0, 0.0, 0.0, many, k * 0.05)
-    t0 = _time.perf_counter()
-    for k in range(200):
-        pol.update(0, 0.0, 12.5, 0.0, 0.0, 0.0, many, 1.0 + k * 0.05)
-    per = (_time.perf_counter() - t0) / 200 * 1000.0
-    check('비용: 30객체 프레임당 2ms 미만', per < 2.0, f'{per:.3f}ms')
+    per = float('inf')
+    for _rep in range(5):           # 최솟값을 쓴다 -- 한 번 재면 잡음이 0.5ms다
+        t0 = _time.perf_counter()
+        for k in range(200):
+            pol.update(0, 0.0, 12.5, 0.0, 0.0, 0.0, many, 1.0 + k * 0.05)
+        per = min(per, (_time.perf_counter() - t0) / 200 * 1000.0)
+    check('비용: 30객체 프레임당 3.5ms 미만', per < 3.5, f'{per:.3f}ms')
+    # 17b. 전부 회전 중인 30객체 (등회전 투영이 붙는 최악)
+    pol = TtcPolicy(path)
+    def spin(k):
+        return [Fake(100 + i, 20.0 + 2.0 * i, (-1) ** i * 6.0, speed=8.0,
+                     heading=0.3 + 0.02 * k, dims=CAR) for i in range(30)]
+    for k in range(6):
+        pol.update(0, 0.0, 12.5, 0.0, 0.0, 0.0, spin(k), k * 0.05)
+    frames = [spin(6 + k % 3) for k in range(3)]
+    per = float('inf')
+    for _rep in range(3):           # 최솟값 (위와 같은 이유)
+        t0 = _time.perf_counter()
+        for k in range(50):
+            pol._scan(0, 0.0, 0.0, 12.5, 0.0, 0.0, 0.0, 0.0, frames[0], False)
+        per = min(per, (_time.perf_counter() - t0) / 50 * 1000.0)
+    check('비용: 회전 중 30객체 프레임당 10ms 미만 (20Hz 예산 50ms)', per < 10.0,
+          f'{per:.3f}ms')
+    # 17c. 정지 중 hold의 긴 시간창(8s, 표본 41개)으로 같은 30객체
+    per = float('inf')
+    for _rep in range(3):
+        t0 = _time.perf_counter()
+        for k in range(30):
+            pol._scan(0, 0.0, 0.0, 0.0, DEPART_ACCEL, 0.0, 0.0, 0.0, frames[0],
+                      True, 40)
+        per = min(per, (_time.perf_counter() - t0) / 30 * 1000.0)
+    check('비용: 정지 중 8s 시간창, 회전 30객체 프레임당 20ms 미만', per < 20.0,
+          f'{per:.3f}ms')
 
     print()
     if fails:

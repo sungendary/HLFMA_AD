@@ -47,6 +47,7 @@ OBSTACLE, PEDESTRIAN, VEHICLE = 'obstacle', 'pedestrian', 'vehicle'
 
 LOOKAHEAD_M = 60.0          # m, 이 안의 객체만 본다 (수신 반경 80m 안쪽)
 BEHIND_M = 5.0              # m, 이만큼 지난 객체는 버린다
+PROJ_SLACK_M = 1.0          # m, 발까지 거리가 |lat|보다 이만큼 크면 끝에 걸린 투영
 PREFILTER_M = 20.0          # m, 직선거리 프리필터 여유. 커브에서 경로거리가
                             # 직선거리보다 길어지는 몫
 
@@ -139,9 +140,30 @@ def _project(path, i_lo: int, i_hi: int, x: float, y: float) -> tuple:
     하나 늘어 이득이 상쇄됐다 (30슬롯 최악에서 A/B 두 번 모두 유의차 없음).
     창을 좁게 잡는 것만으로 충분하다.
     """
+    return _project_foot(path, i_lo, i_hi, x, y)[:3]
+
+
+def project_fix(path, i_lo: int, i_hi: int, x: float, y: float) -> tuple:
+    """_project + **선분 끝에 걸린 투영의 보정**.
+
+    수직투영은 선분 안에 발이 떨어질 때만 (s, lat)이 위치를 말해 준다. 객체가 창
+    끝 너머나 경로의 꺾인 이음매 바깥에 있으면 발이 끝점에 고정되고, lat은 그
+    선분 방향에 수직인 성분만 남는다 ― 38m 떨어진 차가 "0.3m 앞, 횡 1.5m"로
+    찍혔다 (sim rgj_pt2_cross, 경로 구간 이음매의 짧은 선분). 발까지의 실제
+    거리가 |lat|보다 PROJ_SLACK_M 넘게 크면 그 거리를 횡거리로 쓴다.
+    """
+    s, lat, th, d = _project_foot(path, i_lo, i_hi, x, y)
+    if d > abs(lat) + PROJ_SLACK_M:
+        lat = d if lat >= 0.0 else -d
+    return s, lat, th
+
+
+def _project_foot(path, i_lo: int, i_hi: int, x: float, y: float) -> tuple:
+    """(경로 누적거리, 부호 횡거리, 선분 방위, 발까지의 직선거리)."""
     pts, sarr = path.pts, path.s
     best_d2 = None
-    best = (sarr[i_lo], 0.0, 0.0)
+    best = (sarr[i_lo], 0.0, 0.0,
+            math.hypot(x - pts[i_lo][0], y - pts[i_lo][1]))
     for i in range(i_lo, max(i_lo + 1, i_hi)):
         ax, ay = pts[i]
         bx, by = pts[i + 1]
@@ -157,7 +179,8 @@ def _project(path, i_lo: int, i_hi: int, x: float, y: float) -> tuple:
             th = math.atan2(dy, dx)
             lat = -math.sin(th) * (x - qx) + math.cos(th) * (y - qy)
             best_d2 = d2
-            best = (sarr[i] + u * (sarr[i + 1] - sarr[i]), lat, th)
+            best = (sarr[i] + u * (sarr[i + 1] - sarr[i]), lat, th,
+                    math.sqrt(d2))
     return best
 
 
@@ -388,7 +411,7 @@ class ObstaclePolicy:
             # 프리필터. 여기서 대부분이 걸러져 투영은 몇 개만 돈다
             if math.hypot(o.x - ego_x, o.y - ego_y) > self.lookahead + PREFILTER_M:
                 continue
-            s_obj, lat, th = _project(self.path, i_lo, i_hi, o.x, o.y)
+            s_obj, lat, th = project_fix(self.path, i_lo, i_hi, o.x, o.y)
             d = s_obj - s_ego
             cls = classify(o)
 
@@ -1184,6 +1207,29 @@ def _selftest() -> int:
           3 in b._hold and b.on_road is not None)
     b.adopt(None)
     check('adopt(None): 무해', 2 in b._tracks and b._hold_since is None)
+
+    # 10. 선분 끝에 걸린 투영 -- 30m 앞에서 좌로 꺾이는 경로의 직선 연장선 위
+    #     30m 떨어진 차가 "30m 앞 차로 안"으로 찍히면 안 된다
+    bend = _Straight()
+    bend.pts = ([(i * 0.5, 0.0) for i in range(61)]
+                + [(30.0, j * 0.5) for j in range(1, 201)])
+    bend.s = [i * 0.5 for i in range(len(bend.pts))]
+    bend.length = bend.s[-1]
+    lo, hi = _window(bend, 0, 5.0, 70.0)
+    s_r, lat_r, _t = _project(bend, lo, hi, 60.0, -0.5)
+    s_f, lat_f, _t = project_fix(bend, lo, hi, 60.0, -0.5)
+    check('끝에 걸린 투영: 보정 전은 차로 안, 보정 후는 실제 거리',
+          abs(lat_r) < 1.0 and abs(lat_f) > 29.0 and lat_f < 0.0,
+          f'전 s={s_r:.1f} lat={lat_r:+.1f} / 후 s={s_f:.1f} lat={lat_f:+.1f}')
+    check('정상 투영: 보정이 건드리지 않는다',
+          project_fix(bend, lo, hi, 20.0, 1.5) == _project(bend, lo, hi, 20.0, 1.5),
+          f'{project_fix(bend, lo, hi, 20.0, 1.5)}')
+    pol = ObstaclePolicy(bend)
+    far = _Fake(11, 60.0, -0.5, dims=CAR)
+    for k in range(5):
+        cmd = pol.update(0, 0.0, 10.0, 0.0, 0.0, 0.0, [far], 0.05 * k)
+    check('끝에 걸린 차량: 정지·추종 없음', cmd.action == 'none',
+          f'{cmd.action} v<={cmd.v_limit:.1f}')
 
     print()
     if fails:

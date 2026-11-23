@@ -48,6 +48,7 @@ from session_log import SessionLog, default_dir
 import crosswalks
 import detour
 import finish
+import junction_yield
 import obstacles
 import redzone
 import stoplines
@@ -244,7 +245,7 @@ def load_path(csv_path: str, segments: list[str],
     return Path(pts, n_real=n_real), bounds
 
 
-def _stop_target(s_ego: float, sig, obs, tt) -> float:
+def _stop_target(s_ego: float, sig, obs, tt, jy=None) -> float:
     """sig/obs/ttc가 겨냥한 후륜축 정지 지점 중 가까운 쪽. 아무도 없으면 nan.
 
     stop_avail은 "지금부터 몇 m 더 가서 설 작정인가"라서 s_ego를 더하면 경로
@@ -253,7 +254,8 @@ def _stop_target(s_ego: float, sig, obs, tt) -> float:
     횡단보도 위였는데 crosswalks는 그 정지 의사를 몰랐다.
     """
     best = float('nan')
-    for avail in (sig.stop_avail, obs.stop_avail, tt.stop_avail):
+    for avail in (sig.stop_avail, obs.stop_avail, tt.stop_avail,
+                  float('nan') if jy is None else jy.stop_avail):
         if avail != avail:                      # nan = 정지 의사 없음
             continue
         s = s_ego + max(0.0, avail)
@@ -311,7 +313,10 @@ def run(args) -> None:
         'obs_lookahead_m': args.obs_lookahead,
         'obs_max_block_s': args.obs_max_block,
         'ttc': not args.no_ttc,
-        'ttc_dcrit_m': args.ttc_dcrit,
+        'ttc_gap_m': args.ttc_gap,
+        'ttc_ctrv': not args.no_ttc_ctrv,
+        'junction_yield': not args.no_junction_yield,
+        'yield_max_s': args.yield_max_s,
         'turn_signal': not args.no_turn_signal,
         'turn_lead_s': args.turn_lead,
         'crosswalk': (not args.no_crosswalk) and bool(ev_path),
@@ -342,6 +347,32 @@ def run(args) -> None:
         print(f'[pp] [{kind}] {detail}')
         log.event(kind, detail, t=ev_ctx['t'],
                   ego_x=ev_ctx['x'], ego_y=ev_ctx['y'], speed=ev_ctx['v'])
+
+    # 교차로 진입 양보 (junction_yield). 교차로 소속·내부 차로 점열은 경로와
+    # 무관하므로 한 번만 읽고 build_policies(우회 워커 스레드 포함)가 같이 쓴다.
+    jy_data = {'jroads': {}, 'area': {}}
+    if args.no_junction_yield:
+        print('[pp] 교차로 진입 양보 비활성 (--no-junction-yield)')
+    else:
+        try:
+            data_dir_jy = os.path.normpath(os.path.join(
+                os.path.dirname(os.path.abspath(__file__)), '..', 'data'))
+            jr = junction_yield.load_junction_roads(
+                os.path.join(data_dir_jy, junction_yield.JROADS_CSV))
+            if not jr:
+                print(f'[pp]   *** {junction_yield.JROADS_CSV} 가 없다 ― 엣지 CSV 폴백. '
+                      'python junction_yield.py --build 로 만들 것 ***')
+                jr = junction_yield.fallback_junction_roads(
+                    args.graph_edges
+                    or os.path.join(data_dir_jy, 'xodr_graph_edges.csv'))
+            jy_data['jroads'] = jr
+            jy_data['area'] = junction_yield.load_area_points(
+                args.lanes or os.path.join(data_dir_jy, 'xodr_lanes.csv'), jr)
+        except Exception as exc:        # 못 읽어도 주행은 계속한다
+            print(f'[pp] 교차로 진입 양보 비활성: {exc!r}')
+            log.note('junction_yield', False)
+            log.note('junction_yield_off_reason', repr(exc))
+            jy_data = {'jroads': {}, 'area': {}}
 
     def build_policies(wp_csv: str, ev_csv: str, segments: list,
                        verbose: bool = False) -> dict:
@@ -384,7 +415,7 @@ def run(args) -> None:
 
         out = {'path': path, 'bounds': bounds, 'end_heading': eh,
                'sig': None, 'obs': None, 'turn': None, 'xw': None,
-               'fin': None, 'finish': None,
+               'fin': None, 'finish': None, 'jy': None,
                'n_tz': 0, 'n_xw': 0, 'n_sl': 0,
                'wp_csv': wp_csv, 'ev_csv': ev_csv, 'segments': list(segments)}
 
@@ -464,6 +495,23 @@ def run(args) -> None:
             say('[pp] 횡단보도 정차 금지 비활성 (--no-crosswalk)')
         else:
             say('[pp] 횡단보도 정차 금지 비활성 (이벤트 CSV 없음)')
+
+        # 교차로 진입 양보 (평가항목 14). 비신호 교차로와 비보호 좌회전에서
+        # 교차 차량이 있으면 입구 밖에 선다. 신호 유무는 정지선으로 가르므로
+        # --no-signal과 무관하게 이벤트 CSV를 읽는다.
+        if jy_data['jroads']:
+            sls = (out['sig'].stoplines if out['sig'] is not None
+                   else (stoplines.load_for_path(path, ev_csv)[0] if ev_csv else []))
+            jz, jy_warn = junction_yield.load_for_path(
+                path, wp_csv, segments, jy_data['jroads'], jy_data['area'], sls)
+            for w in jy_warn:
+                say(f'[pp]   *** {w} ***')
+            out['jy'] = junction_yield.JunctionYieldPolicy(
+                path, jz, front_overhang=args.front_overhang,
+                max_hold=args.yield_max_s, on_event=_policy_event)
+            say(f'[pp] 교차로 진입 양보 활성 ― 교차로 {len(jz)}곳')
+            for line in junction_yield.summary(out['jy']):
+                say('[pp]' + line)
         return out
 
     bundle = build_policies(args.waypoints, ev_path, args.segments, verbose=True)
@@ -472,6 +520,9 @@ def run(args) -> None:
     policy, obs_policy = bundle['sig'], bundle['obs']
     turn_policy, xw_policy = bundle['turn'], bundle['xw']
     fin_policy = bundle['fin']
+    jy_policy = bundle['jy']
+    if jy_policy is not None:
+        log.note('junction_zones', junction_yield.zones_meta(jy_policy))
     seg_starts = [start for _n, start in bounds]
 
     def seg_at(i: int) -> str:
@@ -560,7 +611,11 @@ def run(args) -> None:
     if args.no_ttc:
         print('[pp] TTC 충돌 예측 비활성 (--no-ttc)')
     else:
-        ttc_policy = ttc.TtcPolicy(path, d_crit=args.ttc_dcrit,
+        if args.ttc_dcrit is not None:
+            print('[pp]   *** --ttc-dcrit은 더 이상 쓰지 않는다 (중심 거리 -> 풋프린트 '
+                  f'간격). --ttc-gap {args.ttc_gap:.2f}m를 쓴다 ***')
+        ttc_policy = ttc.TtcPolicy(path, gap_crit=args.ttc_gap,
+                                   use_ctrv=not args.no_ttc_ctrv,
                                    front_overhang=args.front_overhang,
                                    finish_zone=args.finish_zone,
                                    on_event=_policy_event)
@@ -632,6 +687,7 @@ def run(args) -> None:
             rz = redzone.RedzoneCmd()
             fin = finish.FinishCmd()
             tt = ttc.TtcCmd()
+            jy = junction_yield.YieldCmd()
 
             # **ego(0,0)은 시뮬레이션 종료 신호다.** 완주 후 VTD가 ego(0,0),
             # heading 0, 객체 0을 보낸다. 리스폰 감지(5m 점프)로 흘리면 전역
@@ -704,6 +760,8 @@ def run(args) -> None:
                     if rz_policy is not None:
                         rz_policy.reset()       # 히스테리시스 카운터를 버린다
                     fin_policy.reset()          # 종료선 통과 래치를 버린다
+                    if jy_policy is not None:
+                        jy_policy.reset()       # 양보 래치·트랙을 버린다
                 prev_frame = frame
 
                 # 우회 재탐색 결과. **프레임 맨 위에서 갈아 끼운다** — 한
@@ -730,6 +788,13 @@ def run(args) -> None:
                         # 끝 30m 앞까지 가능하고 라바콘 탐색은 130m 전부터 열린다)
                         nb['fin'].adopt(fin_policy)
                         fin_policy = nb['fin']
+                        # 양보 중에 경로가 바뀌어도 양보는 이어진다
+                        if nb['jy'] is not None:
+                            nb['jy'].adopt(jy_policy)
+                        jy_policy = nb['jy']
+                        if jy_policy is not None:
+                            log.note('junction_zones',
+                                     junction_yield.zones_meta(jy_policy))
                         end_heading = path.end_heading()
                         det_policy.rebind(path, plan.rows, plan.zones, bounds,
                                           stoplines=(policy.stoplines
@@ -817,6 +882,16 @@ def run(args) -> None:
                                             frame.ego_heading, frame.objects, t)
                     v_cmd = min(v_cmd, obs.v_limit)
 
+                # 교차로 진입 양보. 입력이 objects와 받은 신호 상태뿐이라 stoplines에
+                # 의존하지 않는다. yielding은 아래 ttc·stoplines·crosswalks·detour의
+                # 교착 타이머를 얼린다 ― 교차 차량을 기다리는 것은 막힘이 아니다.
+                if jy_policy is not None:
+                    jy = jy_policy.update(idx, path.s[idx], v,
+                                          frame.ego_x, frame.ego_y,
+                                          frame.ego_heading, frame.objects,
+                                          frame.tl_state, t)
+                    v_cmd = min(v_cmd, jy.v_limit)
+
                 # TTC 충돌 예측 (항목 14 강화). obstacles가 "지금 경로 위에 있는
                 # 것"을 보는 데 반해 이것은 4초 안의 상대 운동을 본다. 같은 sqrt
                 # 프로파일이라 min()으로 합쳐진다. 신호·우회는 이 값을 쓰지 않는다.
@@ -825,7 +900,8 @@ def run(args) -> None:
                 if ttc_policy is not None:
                     tt = ttc_policy.update(idx, path.s[idx], v,
                                            frame.ego_x, frame.ego_y,
-                                           frame.ego_heading, frame.objects, t)
+                                           frame.ego_heading, frame.objects, t,
+                                           yielding=jy.yielding)
                     v_cmd = min(v_cmd, tt.v_limit)
 
                 # 신호등. 정지 프로파일이 경로 끝 감속과 같은 sqrt 형태라
@@ -833,7 +909,9 @@ def run(args) -> None:
                 # 끝단 조향 인계(rem < ld)와는 무관하다.
                 if policy is not None:
                     sig = policy.update(path.s[idx], v, frame.tl_id,
-                                        frame.tl_state, t, blocked=obs.blocking)
+                                        frame.tl_state, t,
+                                        blocked=(obs.blocking or jy.yielding),
+                                        yielding=jy.yielding)
                     v_cmd = min(v_cmd, sig.v_limit)
 
                 # 횡단보도(항목 12)는 **신호·객체 뒤에** 돈다. 그 둘이 겨냥한
@@ -841,8 +919,10 @@ def run(args) -> None:
                 if xw_policy is not None:
                     xw = xw_policy.update(
                         path.s[idx], v, t,
-                        stop_s=_stop_target(path.s[idx], sig, obs, tt),
-                        tl_stop_ahead=(sig.stopping and sig.dist > 0.0),
+                        stop_s=_stop_target(path.s[idx], sig, obs, tt, jy),
+                        # 양보 정지는 신호 정지와 같은 취급 ― 탈출로 밀지 않는다
+                        tl_stop_ahead=((sig.stopping and sig.dist > 0.0)
+                                       or jy.yielding),
                         front_clear=(None if obs_policy is None
                                      else obs.front_clear),
                         # 보행자 때문에 서 있는 동안은 탈출하지 않는다 (항목 10 우선)
@@ -869,7 +949,7 @@ def run(args) -> None:
                         sig_green=(sig.state in stoplines.GO_STATES),
                         sig_state=sig.state, sig_dist=sig.dist,
                         obs=(None if obs_policy is None else obs),
-                        finished=finished)
+                        finished=finished, yielding=jy.yielding)
                     # 최후 안전망. xw.escape와 같은 성격이라 같은 방식으로
                     # 합류한다. 아래 finished 처리가 이것보다 뒤라 완주가 이긴다.
                     if det.v_floor > v_cmd:
@@ -899,7 +979,8 @@ def run(args) -> None:
                     accel = min(accel, -1.5)
                 # 신호 정지는 속도 상한만으로는 프로파일을 못 따라간다.
                 # P 제어의 정상상태 오차만큼 위로 달려 정지선을 넘는다.
-                accel = min(accel, sig.accel_limit, xw.accel_limit)
+                accel = min(accel, sig.accel_limit, xw.accel_limit,
+                            jy.accel_limit)
                 # obs.accel_limit은 막은 객체를 향한 감속 피드포워드라
                 # 최후 안전망의 v_floor를 그대로 무력화한다. 그때만 뺀다.
                 if not det.forcing:
@@ -927,6 +1008,7 @@ def run(args) -> None:
                 rz = redzone.RedzoneCmd(action='error')
                 fin = finish.FinishCmd(action='error')
                 tt = ttc.TtcCmd(action='error')
+                jy = junction_yield.YieldCmd(action='error')
 
             if not client.send_control(steer, accel, turn.signal):
                 print('\n[pp] 송신 실패. 재연결...')
@@ -948,7 +1030,8 @@ def run(args) -> None:
                           dt_act=det.action, dt_dist=det.dist,
                           rz_ratio=rz.ratio, rz_far=rz.ratio_far,
                           rz_in=rz.in_code, fin_lon=fin.lon,
-                          tt_act=tt.action, tt_tcpa=tt.t_cpa, tt_dcpa=tt.d_cpa)
+                          tt_act=tt.action, tt_tcpa=tt.t_cpa, tt_dcpa=tt.d_cpa,
+                          jy_act=jy.action, jy_dist=jy.dist, jy_n=jy.n)
 
             print(f'[{n:5d}] ego({frame.ego_x:8.2f},{frame.ego_y:9.2f}) '
                   f'h={math.degrees(frame.ego_heading):+7.1f}° '
@@ -965,6 +1048,8 @@ def run(args) -> None:
                           f'{obs.dist:5.1f}m{obs.lat:+5.1f}')
                   + ('' if tt.action in ('none', 'error')
                      else f' | TT:{tt.action:5s}{tt.t_cpa:4.1f}s{tt.d_cpa:4.1f}m')
+                  + ('' if jy.action in ('none', 'error')
+                     else f' | JY:{jy.action:8s}{jy.dist:6.1f}m n={jy.n}')
                   + ('' if xw.action in ('none', 'error')
                      else f' | XW:{xw.action:6s}{xw.dist:6.1f}m')
                   + ('' if det.action in ('none', 'error')
@@ -1039,8 +1124,18 @@ def main() -> None:
                     help='보행자 대기 상한 [s]. 넘으면 교착으로 보고 기어간다')
     ap.add_argument('--no-ttc', action='store_true',
                     help='TTC 충돌 예측을 끈다 (회귀 비교용)')
-    ap.add_argument('--ttc-dcrit', type=float, default=ttc.D_CRIT,
-                    help='TTC 최근접 거리 임계 [m]. 이 안이면 충돌 경로로 본다')
+    ap.add_argument('--ttc-gap', type=float, default=ttc.GAP_CRIT,
+                    help='TTC 풋프린트 간격 임계 [m]. 예측 간격이 이 아래면 충돌 '
+                         '경로로 본다 (교차·회전 상대는 예측 시각에 비례해 넓힌다)')
+    ap.add_argument('--ttc-dcrit', type=float, default=None,
+                    help='(폐기) 예전 중심 거리 임계. 주면 경고하고 무시한다')
+    ap.add_argument('--no-ttc-ctrv', action='store_true',
+                    help='TTC 등회전 예측을 끄고 직선 외삽만 쓴다 (회귀 비교용)')
+    ap.add_argument('--no-junction-yield', action='store_true',
+                    help='교차로 진입 양보를 끈다 (회귀 비교용)')
+    ap.add_argument('--yield-max-s', type=float,
+                    default=junction_yield.YIELD_MAX_S,
+                    help='교차로 양보 상한 [s]. 넘으면 가장 긴 틈에서 출발한다')
     ap.add_argument('--no-turn-signal', action='store_true',
                     help='방향지시등을 끈다 (회귀 비교용)')
     ap.add_argument('--turn-lead', type=float, default=turnsignal.LEAD_S,

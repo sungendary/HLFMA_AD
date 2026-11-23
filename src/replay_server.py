@@ -183,10 +183,19 @@ def build_sim(args):
     sched.force = args.tl_force
     if args.tl_seed is not None:
         sched.randomize(args.tl_seed)
+    if args.tl_green:
+        sched.set_green(args.tl_green)
+    if args.tl_offset is not None:
+        sched.set_offset(args.tl_offset)
     src = sim_world.SignalSource(sl_list, sched, acquire_m=args.tl_acquire)
 
-    track = sim_world.ObjectTrack.from_session(
-        args.objects_from or args.tl_from, path, args.objects)
+    if args.obj_anchor:
+        # --objects보다 우선한다. 사고 재현용: ego가 멈춰도 NPC는 시간순으로 간다
+        track = sim_world.ObjectTrack.from_anchor(
+            args.objects_from or args.tl_from, path, args.obj_anchor)
+    else:
+        track = sim_world.ObjectTrack.from_session(
+            args.objects_from or args.tl_from, path, args.objects)
 
     # 합성 정지 객체. 녹화 로그에는 경로를 막는 정지 차량이 하나도 없어
     # 우회를 검증할 방법이 이것뿐이다.
@@ -201,7 +210,9 @@ def build_sim(args):
           + (f' (강제 {args.tl_force})' if args.tl_force else ''))
     for line in sched.describe():
         print('[sim]' + line)
-    print(f'[sim] 객체 재생 모드={track.mode} 프레임={len(track.blocks)}')
+    print(f'[sim] 객체 재생 모드={track.mode} 프레임={len(track.blocks)}'
+          + (f' ― ego s>={track.anchor_s:.1f}m에서 녹화 n={track.anchor_i + 1}부터 '
+             f'시간순' if track.mode == 'anchor' else ''))
     for o in injected:
         i = path.nearest(o.x, o.y)
         print(f'[sim] 주입 id={o.id} {o.mode} s={path.s[i]:.1f}m '
@@ -234,6 +245,8 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
     sim_t = 0.0
     done_since = None
     end_frames = 0          # 종료선 통과 뒤 보낼 ego(0,0) 프레임 수
+    track.reset()
+    anchored = False
 
     # --end-at x,y: 종료선을 실제 경로 끝이 아니라 이 점(끝 접선 방향 반평면)으로
     end_at = None
@@ -265,7 +278,14 @@ def serve_sim(conn: socket.socket, ctx, args) -> None:
         tl_id, tl_state = src.sample(s_ego, sim_t)
         for o in injected:
             o.advance(FRAME_DT, s_ego, path)    # 이동 객체 (static이면 무시)
-        blob = sim_world.overlay(track.at(s_ego, sim_t), injected, ego)
+        rec = track.at(s_ego, sim_t)
+        if track.mode == 'anchor':
+            rec = sim_world.in_range(rec, ego)
+            if not anchored and track._t0 is not None:
+                anchored = True
+                print(f'[sim] anchor 발동 ― sim {sim_t:.1f}초, s={s_ego:.1f}m, '
+                      f'v={ego.v * 3.6:.1f}km/h, 녹화 n={track.anchor_i + 1}부터')
+        blob = sim_world.overlay(rec, injected, ego)
         try:
             conn.sendall(sim_world.pack_frame(ego, blob, tl_id, tl_state))
         except OSError:
@@ -354,8 +374,13 @@ def main() -> None:
                      help='신호 위상표를 뽑을 세션 디렉터리')
     sim.add_argument('--tl-seed', type=int, default=None,
                      help='ctrl별 위상 오프셋을 이 시드로 흔든다')
-    sim.add_argument('--tl-force', choices=('red', 'green'), default='',
-                     help='모든 신호를 고정한다 (최악 시험)')
+    sim.add_argument('--tl-force', choices=('red', 'green', 'green3'), default='',
+                     help='모든 신호를 고정한다 (최악 시험). green은 GREEN+LEFT(5), '
+                          'green3은 화살표 없는 GREEN(3) ― 비보호 좌회전 시험')
+    sim.add_argument('--tl-green', type=int, choices=(3, 5), default=0,
+                     help='주기표의 녹색 계열 state를 이 값으로 바꾼다 (지속시간은 그대로)')
+    sim.add_argument('--tl-offset', type=float, default=None,
+                     help='모든 ctrl의 위상 오프셋 [s]. --tl-seed 대신 전환 시각을 맞출 때')
     sim.add_argument('--tl-acquire', type=float,
                      default=sim_world.DEFAULT_ACQUIRE_M,
                      help='신호를 보고하기 시작하는 거리 [m]')
@@ -370,6 +395,11 @@ def main() -> None:
                           '(start= 도달 시 hdg= 절대 / rhdg= 접선 상대 방향 직선)')
     sim.add_argument('--objects', choices=('s', 't', 'none'), default='s',
                      help='objects[] 재생 색인: s=진행거리 t=시간 none=없음')
+    sim.add_argument('--obj-anchor', default='', metavar='s=,n=',
+                     help='sim ego가 경로 s에 닿으면 녹화 세션의 프레임 n(drive.csv의 n)'
+                          '부터 objects를 시간순으로 재생한다. ego가 멈춰도 NPC는 '
+                          '계속 간다. s=auto면 녹화 프레임 n의 ego 위치를 경로에 '
+                          '투영한다. --objects보다 우선한다')
     sim.add_argument('--objects-from', default='',
                      help='객체를 뽑을 세션. 생략하면 --tl-from과 같다')
     sim.add_argument('--wheelbase', type=float, default=sim_world.WHEELBASE)

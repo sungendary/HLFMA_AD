@@ -1000,7 +1000,8 @@ class DetourPolicy:
                ego_y: float, objects, t: float, *, sig_stopping: bool = False,
                sig_green: bool = False, obs=None,
                finished: bool = False, sig_state: int = 0,
-               sig_dist: float = float('nan')) -> DetourCmd:
+               sig_dist: float = float('nan'),
+               yielding: bool = False) -> DetourCmd:
         """sig_green은 **stoplines.GO_STATES = {3 녹색, 5 녹색+좌회전}**이다.
         sig_state는 받은 신호 상태 원값, sig_dist는 stoplines가 겨냥한 정지선까지의
         후륜축 거리(정지 명령 중이 아니면 nan). 둘 다 맥락 판단(_classify)에만 쓴다.
@@ -1018,6 +1019,11 @@ class DetourPolicy:
         dt = 0.0 if self._last_t is None else max(0.0, t - self._last_t)
         self._last_t = t
         sig_wait = sig_stopping and not sig_green
+        if yielding:
+            # 교차로 진입 양보 중 (junction_yield). 적색 대기와 같은 취급이다 --
+            # 확인 타이머와 최후 안전망 누적을 얼린다. 교차 차량이 지나가길
+            # 기다리는 것을 막힘으로 오판해 밀고 들어가면 그게 9/12 사고다
+            sig_wait, sig_green, sig_dist = True, False, float('nan')
 
         cands, moving, wide = self._candidates(idx, s_ego, ego_x, ego_y, objects)
         self._track(cands, moving, wide, dt, t)
@@ -1034,7 +1040,7 @@ class DetourPolicy:
                 b.acc += dt
 
         cmd = DetourCmd()
-        self._last_resort(v, dt, sig_wait, obs, finished, cmd)
+        self._last_resort(v, dt, sig_wait, obs, finished, cmd, yielding)
         if self._ld_on:
             cmd.ld_min = DETOUR_LD_M
             self._ld_check(idx, ego_x, ego_y, t)
@@ -1081,7 +1087,7 @@ class DetourPolicy:
         for o in objects:
             if math.hypot(o.x - ego_x, o.y - ego_y) > ahead + OB.PREFILTER_M:
                 continue
-            s_obj, lat, _th = OB._project(self.path, i_lo, i_hi, o.x, o.y)
+            s_obj, lat, _th = OB.project_fix(self.path, i_lo, i_hi, o.x, o.y)
             d = s_obj - s_ego
             if d <= 0.0 or d > ahead:
                 continue
@@ -1469,7 +1475,8 @@ class DetourPolicy:
 
     # -- 최후 안전망 ----------------------------------------------------
     def _last_resort(self, v: float, dt: float, sig_wait: bool, obs,
-                     finished: bool, cmd: DetourCmd) -> None:
+                     finished: bool, cmd: DetourCmd,
+                     yielding: bool = False) -> None:
         """우회로 못 푸는 교착에서 저속으로 밀고 통과한다.
 
         해제는 **그 객체를 지났을 때**다. 속도가 붙었는지로 잡으면 스스로를
@@ -1486,6 +1493,12 @@ class DetourPolicy:
                 self._on_event('last_resort_clear',
                                f'id={self._lr_id} 통과 ― 정상 복귀')
                 self._lr_id, self._lr_acc = -1, 0.0
+                return
+            if yielding:
+                # 래치는 두고 이 프레임만 밀지 않는다. 양보가 풀리면 이어서 민다
+                cmd.action = 'watch'
+                cmd.obj_id, cmd.dist, cmd.kind = b.id, b.d, b.kind
+                cmd.reason = '최후 안전망 보류 (교차로 양보 중)'
                 return
             cmd.action = 'last_resort'
             cmd.v_floor = LAST_RESORT_V
@@ -1858,6 +1871,29 @@ def _selftest() -> int:
     check('적색 해제 후: 이어서 발동', 'last_resort_pass' in rec.kinds(),
           f'누적 {pol._lr_acc:.1f}s')
 
+    # 8d. 교차로 진입 양보 중(junction_yield)도 적색 대기와 같다 -- 누적 동결,
+    #     이미 래치된 안전망은 그동안 밀지 않고 양보가 풀리면 이어서 민다
+    _p, pol, rec = _mk(planner=_StubPlanner(ok=False))
+    o = lambda t, s: [_Fake(1, 8.0, 0.0)]
+    _l, _s, t1 = _run(pol, o, n=120, obs=obs)
+    hold = pol._lr_acc
+    _l, _s, t2 = _run(pol, o, n=400, obs=obs, t0=t1, yielding=True)
+    check('양보 중: 누적 동결', abs(pol._lr_acc - hold) < 1e-9,
+          f'{hold:.2f} -> {pol._lr_acc:.2f}')
+    check('양보 중: 발동 안 함', 'last_resort_pass' not in rec.kinds())
+    _l, s3, t3 = _run(pol, o, n=int((LAST_RESORT_S - hold) / 0.05) + 4, obs=obs,
+                      t0=t2)
+    check('양보 해제 후: 이어서 발동', 'last_resort_pass' in rec.kinds(),
+          f'누적 {pol._lr_acc:.1f}s')
+    log, s4, t4 = _run(pol, o, n=60, obs=obs, t0=t3, s0=s3, yielding=True)
+    check('래치된 안전망: 양보 중에는 밀지 않는다',
+          all(r[4] == 0.0 for r in log) and abs(s4 - s3) < 1e-9
+          and pol._lr_id == 1, f'{s3:.2f} -> {s4:.2f}m, 래치 id={pol._lr_id}')
+    log, s5, _t = _run(pol, o, n=60, obs=obs, t0=t4, s0=s4)
+    check('래치된 안전망: 양보가 풀리면 이어서 민다',
+          any(abs(r[4] - LAST_RESORT_V) < 1e-6 for r in log) and s5 > s4 + 1.0,
+          f'{s4:.2f} -> {s5:.2f}m')
+
     # 8b. 게이트를 하나씩 깨면 발동하지 않는다
     for name, kw, ctor in (
             ('신호 정지 중', {'sig_stopping': True, 'obs': obs}, {}),
@@ -2219,6 +2255,21 @@ def _selftest() -> int:
         check(f'안전망 게이트: obs가 id={oid}를 볼 때 {"발동" if want else "미발동"}',
               ('last_resort_pass' in rec.kinds()) == want,
               ','.join(sorted(set(rec.kinds()))))
+
+    # 15. 선분 끝에 걸린 투영 -- 꺾이는 경로의 직선 연장선 위 30m 밖 정지 차량은
+    #     회랑 후보가 아니다 (obstacles.project_fix)
+    _p, pol, rec = _mk()
+    bend = _Straight()
+    bend.pts = ([(i * 0.5, 0.0) for i in range(61)]
+                + [(30.0, j * 0.5) for j in range(1, 201)])
+    bend.s = [i * 0.5 for i in range(len(bend.pts))]
+    bend.length = bend.s[-1]
+    pol.path = bend
+    c_out, _mv, c_wide = pol._candidates(0, 0.0, 0.0, 0.0, [_Fake(1, 60.0, -0.5)])
+    check('끝에 걸린 투영: 회랑 후보 아님', 1 not in c_out and 1 not in c_wide,
+          f'{c_out} {c_wide}')
+    c_out, _mv, _w = pol._candidates(0, 0.0, 0.0, 0.0, [_Fake(1, 20.0, -0.5)])
+    check('정상 투영: 회랑 후보', 1 in c_out, f'{c_out}')
 
     # 12. 실제 경로 -- 계획 단계 실측과 일치해야 한다
     data = _data_dir()

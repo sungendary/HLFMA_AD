@@ -336,7 +336,8 @@ class SignalPolicy:
 
     # -- 본체 -----------------------------------------------------------
     def update(self, s_ego: float, v: float, tl_id: int, tl_state: int,
-               t: float, blocked: bool = False) -> SignalCmd:
+               t: float, blocked: bool = False,
+               yielding: bool = False) -> SignalCmd:
         """blocked는 "전방에 차량·보행자가 있어 못 간다"는 뜻이다.
 
         충돌 회피(obstacles.py)가 넘긴다. 기본값이 False라 예전 호출은 그대로
@@ -345,8 +346,13 @@ class SignalPolicy:
           · 항목 8(녹색 정지선 30m 이내 5초 정차)은 전방 객체가 있으면 면책이다
           · MAX_HOLD_S를 세지 않는다. 안 그러면 보행자에 막혀 적색 앞에 45초
             서 있을 때 정지선을 놓아 버리고, 보행자가 비키는 순간 적색을 통과한다
+
+        yielding은 교차로 진입 양보(junction_yield)로 **이미 서려고 감속 중**이라는
+        뜻이다. 그동안은 황색 딜레마 통과와 "정지선을 넘었으니 통과"를 내지 않는다.
+        내면 정지선을 놓아 버려(_release) 양보가 풀린 뒤 적색에 세울 것이 없다.
         """
         self._blocked = blocked
+        pass_ok = not yielding      # 통과 탈출구를 써도 되는가
         # 지나간 정지선을 정리한다. 범퍼가 넘어갔으면 끝이다.
         for sl in self.stoplines:
             if id(sl) not in self._done and sl.s - s_ego < -BEHIND_M:
@@ -375,7 +381,7 @@ class SignalPolicy:
             return self._go(sl, tl_state, tl_id, d, v, t, '녹색')
 
         if tl_state == RED:
-            if bumper <= 0.0 and v > PASS_THROUGH_MS:
+            if pass_ok and bumper <= 0.0 and v > PASS_THROUGH_MS:
                 # 이미 정지선을 넘었고 아직 달리고 있다. 교차로 한가운데서
                 # 제동하면 더 나쁘다. 다만 **거의 멈춘 상태라면 풀지 않는다** —
                 # 그러면 정지 직전에 제동이 풀려 적색으로 튀어나간다
@@ -390,7 +396,7 @@ class SignalPolicy:
             return self._stop(sl, tl_state, tl_id, d, avail, v, t, '적색')
 
         if tl_state == YELLOW:
-            if v > PASS_THROUGH_MS and (bumper <= 0.0 or bumper < need):
+            if pass_ok and v > PASS_THROUGH_MS and (bumper <= 0.0 or bumper < need):
                 # 딜레마존 (docstring 4번). 정지하면 정지선을 침범한다
                 self._announce((id(sl), 'dilemma'), 'tl_yellow_go',
                                f'ctrl={sl.ctrl_str()} 황색 {d:.1f}m '
@@ -408,7 +414,7 @@ class SignalPolicy:
                            f'기동={sl.maneuver} {d:.1f}m. 사전테스트에 없던 상태다')
             if sl.maneuver == 'left':
                 return self._go(sl, tl_state, tl_id, d, v, t, '좌회전 신호 + 좌회전 기동')
-            if bumper <= 0.0 and v > PASS_THROUGH_MS:
+            if pass_ok and bumper <= 0.0 and v > PASS_THROUGH_MS:
                 self._release(sl)
                 return SignalCmd(state=tl_state, ctrl=tl_id, dist=d,
                                  action='go', reason='정지선 통과 후 좌회전 신호')
@@ -419,13 +425,14 @@ class SignalPolicy:
             self._announce((id(sl), FLASHING), 'tl_unknown_state',
                            f'state=6(FLASHING) 최초 관측 ― ctrl={sl.ctrl_str()} '
                            f'{d:.1f}m. 적/황 점멸을 구분할 수 없어 일시정지한다')
-            return self._flashing(sl, tl_state, tl_id, d, avail, bumper, v, t)
+            return self._flashing(sl, tl_state, tl_id, d, avail, bumper, v, t,
+                                  pass_ok)
 
         # 명세에 없는 값. 정지가 안전하다
         self._announce((id(sl), tl_state), 'tl_unknown_state',
                        f'명세에 없는 state={tl_state} ― ctrl={sl.ctrl_str()} '
                        f'{d:.1f}m. 정지로 처리한다')
-        if bumper <= 0.0 and v > PASS_THROUGH_MS:
+        if pass_ok and bumper <= 0.0 and v > PASS_THROUGH_MS:
             self._release(sl)
             return SignalCmd(state=tl_state, ctrl=tl_id, dist=d, action='go',
                              reason=f'미지 state={tl_state}, 정지선 통과 후')
@@ -528,7 +535,8 @@ class SignalPolicy:
         return SignalCmd(v_limit, 'stop', state, tl_id, d, reason, accel_limit,
                          stop_avail=avail)
 
-    def _flashing(self, sl, state, tl_id, d, avail, bumper, v, t) -> SignalCmd:
+    def _flashing(self, sl, state, tl_id, d, avail, bumper, v, t,
+                  pass_ok: bool = True) -> SignalCmd:
         """항목 9 ― 적색점멸은 정지선 2m 이내 0.5초 이상 정지가 요건이다.
 
         적/황 점멸을 9910으로는 구분할 수 없다. 황색점멸이었다면 불필요한
@@ -536,7 +544,7 @@ class SignalPolicy:
         """
         if id(sl) in self._pause_done:
             return self._go(sl, state, tl_id, d, v, t, '점멸 ― 일시정지 완료')
-        if bumper <= 0.0 and v > PASS_THROUGH_MS:
+        if pass_ok and bumper <= 0.0 and v > PASS_THROUGH_MS:
             self._announce((id(sl), 'pause_late'), 'tl_pause',
                            f'ctrl={sl.ctrl_str()} 점멸 ― 정지선을 {-bumper:.1f}m 넘었다. '
                            f'일시정지 못 함 (항목 9 위험)')

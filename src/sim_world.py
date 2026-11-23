@@ -141,6 +141,17 @@ class TLSchedule:
             ]
         return cls(cycles)
 
+    def set_green(self, state: int) -> None:
+        """주기표의 녹색 계열(3/5)을 state로 바꾼다. 지속시간은 그대로."""
+        for c, cyc in self.cycles.items():
+            self.cycles[c] = [(state if s in (GREEN, GREEN_LEFT) else s, d)
+                              for s, d in cyc]
+
+    def set_offset(self, offset: float) -> None:
+        """모든 ctrl의 위상 오프셋을 같은 값으로. 전환 시각을 맞춰 시험할 때 쓴다."""
+        for c in self.cycles:
+            self.offsets[c] = offset
+
     def randomize(self, seed: int) -> None:
         """ctrl마다 위상 오프셋을 흔든다. 같은 코스를 다른 신호로 시험한다."""
         rng = random.Random(seed)
@@ -154,6 +165,8 @@ class TLSchedule:
             return RED
         if self.force == 'green':
             return GREEN_LEFT
+        if self.force == 'green3':
+            return GREEN            # 좌회전 화살표 없는 녹색 (비보호 좌회전 시험)
         cyc = self.cycles.get(ctrl)
         if not cyc:
             return GREEN_LEFT
@@ -212,12 +225,68 @@ class ObjectTrack:
             우리가 멈추면 객체도 멈추므로 보수적이다 (기본값)
       't' ― 경과 시간으로 색인한다. NPC 움직임은 사실적이지만 우리가 멈추면
             위치 대응이 깨진다
+      'anchor' ― sim ego가 경로 anchor_s에 닿은 순간부터 녹화 프레임 anchor_n을
+            **시간순으로** 흘린다. 닿기 전에는 빈 블록이다. 우리가 멈춰도 NPC는
+            계속 간다 ― 실제와 같다. 특정 사고(교차로 행렬)를 재현할 때 쓴다
     """
 
     def __init__(self, blocks: list, keys: list, mode: str = 's'):
         self.blocks = blocks        # list[bytes] 각 1080B
         self.keys = keys            # 오름차순 색인값 (진행거리 또는 시간)
         self.mode = mode
+        self.anchor_s = 0.0
+        self.anchor_i = 0           # 0-based 프레임 (drive.csv의 n - 1)
+        self._t0 = None
+
+    def reset(self) -> None:
+        """연결마다. track은 재사용되므로 anchor 발동 시각을 지운다."""
+        self._t0 = None
+
+    @classmethod
+    def from_anchor(cls, session: str, path, spec: str) -> 'ObjectTrack':
+        """s=<m|auto>,n=<프레임> -> anchor 모드 트랙.
+
+        n은 drive.csv / objects.csv의 n(1부터)이다. s=auto면 녹화 프레임 n의
+        ego 위치를 sim 경로에 투영해 s를 구한다 ― 세그먼트 부분집합을 써도
+        역산이 필요 없다.
+        """
+        kv = {}
+        for part in spec.split(','):
+            part = part.strip()
+            if not part:
+                continue
+            if '=' not in part:
+                raise SystemExit(f'--obj-anchor 형식 오류: {part!r} (s=1436.9,n=3240)')
+            k, val = part.split('=', 1)
+            kv[k.strip()] = val.strip()
+        if 'n' not in kv:
+            raise SystemExit(f'--obj-anchor 에는 n= 이 필요하다: {spec!r}')
+        if not session:
+            raise SystemExit('--obj-anchor 에는 --objects-from (또는 --tl-from)이 필요하다')
+        with open(os.path.join(session, 'frames.bin'), 'rb') as fh:
+            blob = fh.read()
+        total = len(blob) // FRAME_SIZE
+        i_n = int(float(kv['n'])) - 1
+        if not 0 <= i_n < total:
+            raise SystemExit(f'--obj-anchor n={kv["n"]} 이 범위 밖이다 (1~{total})')
+        blocks = [blob[i * FRAME_SIZE + EGO.size:
+                       i * FRAME_SIZE + EGO.size + OBJ_BLOCK]
+                  for i in range(total)]
+        tr = cls(blocks, [], 'anchor')
+        tr.anchor_i = i_n
+        s_txt = kv.get('s', 'auto')
+        if s_txt == 'auto':
+            x, y = EGO.unpack_from(blob, i_n * FRAME_SIZE)[:2]
+            j = path.nearest(x, y)
+            resid = math.hypot(path.pts[j][0] - x, path.pts[j][1] - y)
+            if resid > 6.0:
+                raise SystemExit(
+                    f'--obj-anchor s=auto: 녹화 프레임 n={i_n + 1}의 ego '
+                    f'({x:.1f},{y:.1f})가 sim 경로에서 {resid:.1f}m 떨어져 있다')
+            tr.anchor_s = path.s[j]
+        else:
+            tr.anchor_s = float(s_txt)
+        return tr
 
     @classmethod
     def from_session(cls, session: str, path, mode: str = 's') -> 'ObjectTrack':
@@ -248,6 +317,13 @@ class ObjectTrack:
     def at(self, s_ego: float, t: float) -> bytes:
         if not self.blocks:
             return EMPTY_OBJECTS
+        if self.mode == 'anchor':
+            if self._t0 is None:
+                if s_ego < self.anchor_s:
+                    return EMPTY_OBJECTS
+                self._t0 = t
+            i = self.anchor_i + int(round((t - self._t0) / FRAME_DT))
+            return self.blocks[min(i, len(self.blocks) - 1)]
         key = t if self.mode == 't' else s_ego
         lo, hi = 0, len(self.keys) - 1
         while lo < hi:
@@ -430,6 +506,23 @@ class Injected:
         return (f'<Injected {self.id} {self.mode} ({self.x:.1f},{self.y:.1f}) '
                 f'{self.length:.2f}x{self.width:.2f}x{self.height:.2f} '
                 f'v={self.speed:.1f}>')
+
+
+def in_range(block: bytes, ego) -> bytes:
+    """녹화 블록에서 sim ego 80m 밖 객체를 비운다.
+
+    녹화 객체는 **녹화 ego** 기준 80m로 걸러져 있다. anchor 재생에서는 sim ego의
+    위치가 그것과 다르므로 실제 VTD가 주지 않았을 객체가 섞인다.
+    """
+    buf = None
+    for k in range(OBJECT_SLOTS):
+        off = k * OBJ.size
+        oid, ox, oy = OBJ.unpack_from(block, off)[:3]
+        if oid and math.hypot(ox - ego.x, oy - ego.y) > OBJ_RANGE_M:
+            if buf is None:
+                buf = bytearray(block)
+            buf[off:off + OBJ.size] = b'\x00' * OBJ.size
+    return block if buf is None else bytes(buf)
 
 
 def overlay(block: bytes, objs: list, ego) -> bytes:
