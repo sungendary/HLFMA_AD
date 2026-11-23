@@ -13,8 +13,8 @@
 | 환경 | VTD 2025.2 (Ubuntu 24.04) ↔ 제어기 PC (Windows), 이더넷 직결 |
 | 인터페이스 | TCP 20Hz (수신 1,109B / 송신 9B), RTSP 카메라, OpenDRIVE 지도 |
 
-
-https://github.com/user-attachments/assets/c426c995-df1f-41a5-b45b-c86241faf346
+### 주행 영상
+https://github.com/user-attachments/assets/7ef4ddb0-3b78-41c4-832a-d0472dcb5e15
 
 
 ## 내 역할
