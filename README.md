@@ -5,6 +5,8 @@
 
 **결과: 본대회 완주, 🏆최우수상** [📄상장 보러가기](https://github.com/sungendary/sungendary.github.io/blob/master/files/hlfma_grandprize_2026.pdf)
 
+<img width="794" height="1122" alt="HL_FMA_2026_수상팀발표_포스터" src="https://github.com/user-attachments/assets/64fb805a-2b62-4920-a584-9baf4636d99d" />
+
 | | |
 |---|---|
 | 기간 | 2026.08.23 ~ 09.12 (약 3주) + 대회 후 사고 분석·개선 |
